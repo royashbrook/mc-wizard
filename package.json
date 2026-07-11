@@ -1,0 +1,30 @@
+{
+  "name": "mc-wizard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/server.mjs",
+    "start:ai": "node --env-file-if-exists=.env scripts/local-ai-bridge.mjs",
+    "hooks:install": "git config core.hooksPath .githooks",
+    "dev": "node --env-file-if-exists=.env --watch src/server.mjs",
+    "ask": "node --env-file-if-exists=.env scripts/ask.mjs",
+    "bootstrap:bds": "sh scripts/bootstrap-bedrock.sh",
+    "enable:beta": "python3 scripts/enable-beta-apis.py",
+    "install:pack": "node --env-file-if-exists=.env scripts/install-pack.mjs",
+    "container:bds": "sh scripts/run-bedrock-container.sh",
+    "container:delete": "container delete mc-wizard-bedrock",
+    "container:logs": "container logs -f mc-wizard-bedrock",
+    "container:stop": "container stop --time 60 mc-wizard-bedrock",
+    "sync:docs": "node scripts/sync-docs.mjs",
+    "test": "node --test",
+    "test:e2e:bds": "sh scripts/run-e2e-container.sh",
+    "test:e2e:logs": "container logs -f mc-wizard-bedrock 2>&1 | node scripts/wait-e2e.mjs"
+  },
+  "engines": {
+    "node": ">=22.9.0"
+  },
+  "dependencies": {
+    "mtok-bridge": "^0.2.0"
+  }
+}

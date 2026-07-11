@@ -1,0 +1,36 @@
+services:
+  bedrock:
+    image: docker.io/itzg/minecraft-bedrock-server@sha256:45c8f292b289659c0be469b2eaaebfc1fbfefdf5c060a0df5ed53fe9e2e7c563
+    platform: linux/amd64
+    restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      EULA: "TRUE"
+      VERSION: "1.26.33.2"
+      SERVER_NAME: "MC Wizard"
+      LEVEL_NAME: "mc-wizard"
+      GAMEMODE: "creative"
+      FORCE_GAMEMODE: "true"
+      DIFFICULTY: "peaceful"
+      ALLOW_CHEATS: "true"
+      ONLINE_MODE: "true"
+      ENABLE_LAN_VISIBILITY: "true"
+      SERVER_PORT: "19132"
+
+      ALLOW_LIST: "false"
+      CONTENT_LOG_FILE_ENABLED: "true"
+      CONTENT_LOG_CONSOLE_OUTPUT_ENABLED: "true"
+
+      # Copies pack files only; README's install:pack step activates/configures them.
+      MC_PACK: "/packs/mc-wizard"
+      FORCE_PACK_COPY: "true"
+      FORCE_WORLD_COPY: "false"
+    ports:
+      - "${MC_WIZARD_LAN_IP:?Set the Mac LAN IPv4}:19132:19132/udp"
+    volumes:
+      - ./runtime/bedrock:/data
+      - ./bedrock:/packs/mc-wizard:ro
+    stdin_open: true
+    tty: true
+    stop_grace_period: 1m

@@ -1,0 +1,37 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "MC Wizard",
+    "description": "A Bedrock AI guide and safe demo builder",
+    "uuid": "48450204-0c54-4c3b-855a-c76eda67275d",
+    "version": [0, 1, 0],
+    "min_engine_version": [1, 26, 30]
+  },
+  "modules": [
+    {
+      "type": "script",
+      "language": "javascript",
+      "uuid": "4e8790fe-18dc-46d1-aa31-ec78a924b717",
+      "version": [0, 1, 0],
+      "entry": "scripts/main.js"
+    }
+  ],
+  "dependencies": [
+    {
+      "module_name": "@minecraft/server",
+      "version": "2.9.0-beta"
+    },
+    {
+      "module_name": "@minecraft/server-net",
+      "version": "1.0.0-beta"
+    },
+    {
+      "module_name": "@minecraft/server-admin",
+      "version": "1.0.0-beta"
+    },
+    {
+      "module_name": "@minecraft/server-gametest",
+      "version": "1.0.0-beta"
+    }
+  ]
+}

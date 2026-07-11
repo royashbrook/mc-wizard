@@ -1,0 +1,18 @@
+#!/bin/sh
+set -eu
+
+message_file=$1
+issue=$(awk 'match($0, /#[0-9]+/) { print substr($0, RSTART + 1, RLENGTH - 1); exit }' "$message_file")
+if [ -z "$issue" ]; then
+  echo "commit rejected: include an issue reference such as Refs #123" >&2
+  exit 1
+fi
+if ! command -v gh >/dev/null 2>&1; then
+  echo "commit rejected: gh is required to verify issue #$issue" >&2
+  exit 1
+fi
+repo=$(gh repo view --json nameWithOwner --jq .nameWithOwner)
+if ! gh issue view "$issue" --repo "$repo" >/dev/null 2>&1; then
+  echo "commit rejected: #$issue is not an issue in $repo" >&2
+  exit 1
+fi

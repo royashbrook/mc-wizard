@@ -1,0 +1,17 @@
+{
+  "allowed_modules": [
+    "@minecraft/server",
+    "@minecraft/server-admin",
+    "@minecraft/server-net",
+    "@minecraft/server-gametest"
+  ],
+  "module_permissions": {
+    "@minecraft/server-net": {
+      "allowed_uris": [
+        "http://host.docker.internal:3000/"
+      ],
+      "max_body_bytes": 1048576,
+      "max_concurrent_requests": 4
+    }
+  }
+}
