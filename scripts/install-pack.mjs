@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const PACK_ID = "48450204-0c54-4c3b-855a-c76eda67275d";
+const RESOURCE_PACK_ID = "5dd80b07-b583-4bb3-979c-41c25ce274d8";
 const MODULE_ID = "4e8790fe-18dc-46d1-aa31-ec78a924b717";
 const VERSION = [0, 1, 0];
 
@@ -45,10 +46,16 @@ if (!loopbackBrain && (token === "dev-only-change-me" || token.length < 24)) {
   throw new Error("Refusing a default or short bridge token for a non-loopback brain URL; use at least 24 characters");
 }
 const packTarget = path.join(serverRoot, "behavior_packs", "mc_wizard");
+const resourcePackTarget = path.join(serverRoot, "resource_packs", "mc_wizard");
 const configTarget = path.join(serverRoot, "config", MODULE_ID);
 await mkdir(path.dirname(packTarget), { recursive: true });
 await mkdir(configTarget, { recursive: true });
 await cp(path.join(ROOT, "bedrock", "behavior_packs", "mc_wizard"), packTarget, {
+  recursive: true,
+  force: true,
+});
+await mkdir(path.dirname(resourcePackTarget), { recursive: true });
+await cp(path.join(ROOT, "bedrock", "resource_packs", "mc_wizard"), resourcePackTarget, {
   recursive: true,
   force: true,
 });
@@ -64,6 +71,18 @@ const existing = worldPacks.find((pack) => pack.pack_id === PACK_ID);
 if (existing) existing.version = VERSION;
 else worldPacks.push({ pack_id: PACK_ID, version: VERSION });
 await writeFile(worldPacksFile, `${JSON.stringify(worldPacks, null, 2)}\n`);
+
+const worldResourcePacksFile = path.join(worldRoot, "world_resource_packs.json");
+let worldResourcePacks = [];
+try {
+  worldResourcePacks = JSON.parse(await readFile(worldResourcePacksFile, "utf8"));
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+const existingResourcePack = worldResourcePacks.find((pack) => pack.pack_id === RESOURCE_PACK_ID);
+if (existingResourcePack) existingResourcePack.version = VERSION;
+else worldResourcePacks.push({ pack_id: RESOURCE_PACK_ID, version: VERSION });
+await writeFile(worldResourcePacksFile, `${JSON.stringify(worldResourcePacks, null, 2)}\n`);
 
 await writeFile(path.join(configTarget, "permissions.json"), `${JSON.stringify({
   allowed_modules: [
@@ -91,7 +110,7 @@ await writeFile(path.join(configTarget, "secrets.json"), `${JSON.stringify({
 }, null, 2)}\n`);
 
 console.log(`Installed MC Wizard in ${serverRoot}`);
-console.log(`Activated pack for world: ${worldName}`);
+console.log(`Activated behavior and costume resource packs for world: ${worldName}`);
 console.log(`Brain endpoint: ${brainUrl}`);
 if (token === "dev-only-change-me") console.warn("Using the development bridge token; change it before exposing the service.");
 console.warn("The world must already have the Beta APIs experiment enabled.");

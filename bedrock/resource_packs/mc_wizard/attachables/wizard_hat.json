@@ -1,0 +1,12 @@
+{
+  "format_version": "1.10.0",
+  "minecraft:attachable": {
+    "description": {
+      "identifier": "mcwizard:hat",
+      "materials": { "default": "entity_alphatest" },
+      "textures": { "default": "textures/entity/wizard_hat" },
+      "geometry": { "default": "geometry.mcwizard_hat" },
+      "render_controllers": ["controller.render.default"]
+    }
+  }
+}

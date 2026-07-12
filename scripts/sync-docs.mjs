@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, readdir, rm, stat, writeFile } from "node:fs/promises";
+import { cp, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const CACHE = path.join(ROOT, ".cache");
-const CREATOR_REPO = path.join(CACHE, "minecraft-creator");
+const CREATOR_REPO = path.join(CACHE, "sources", "minecraft-creator");
+const RELEASES = path.join(CACHE, "releases");
 const CHANGELOGS = [
   ["stable", "360001186971"],
   ["preview", "360001185332"],
@@ -87,8 +88,8 @@ async function fetchArticles(section) {
   return articles;
 }
 
-async function syncChangelog(channel, section) {
-  const destination = path.join(CACHE, "patch-notes", channel);
+async function syncChangelog(channel, section, releaseRoot) {
+  const destination = path.join(releaseRoot, "patch-notes", channel);
   await mkdir(destination, { recursive: true });
   const articles = await fetchArticles(section);
   const current = new Set();
@@ -116,6 +117,36 @@ async function syncChangelog(channel, section) {
   return articles.length;
 }
 
+async function evaluateRelease(releaseRoot) {
+  const { loadCorpus } = await import("../src/rag.mjs");
+  const corpus = await loadCorpus({ roots: [
+    { dir: path.join(ROOT, "knowledge"), kind: "mechanic-card" },
+    ...["Documents", "Commands", "Reference", "ScriptAPI"].map((folder) => ({
+      dir: path.join(releaseRoot, "minecraft-creator", "creator", folder),
+      kind: "official-doc",
+    })),
+    { dir: path.join(releaseRoot, "patch-notes"), kind: "patch-note" },
+  ] });
+  const checks = [
+    ["how does a redstone comparator work", /comparator/i],
+    ["how do I get a command block", /command/i],
+    ["how does a t flip flop remember", /flip|bulb/i],
+  ];
+  for (const [query, expected] of checks) {
+    const results = corpus.search(query);
+    if (!results.length || !expected.test(`${results[0].title} ${results[0].text}`)) {
+      throw new Error(`retrieval evaluation failed before promotion: ${query}`);
+    }
+  }
+  const { createWizard } = await import("../src/wizard.mjs");
+  const wizard = createWizard({ corpus, env: {} });
+  const greeting = await wizard.ask({ player: "release-eval", question: "hi", mode: "wizard" });
+  if (!/hi|hello|hey|welcome/i.test(greeting.answer) || greeting.sources?.length) {
+    throw new Error("dialogue evaluation failed before promotion: greeting");
+  }
+  return { chunks: corpus.size, retrievalChecks: checks.length, dialogueChecks: 1 };
+}
+
 async function main() {
   await mkdir(CACHE, { recursive: true });
   if (await exists(path.join(CREATOR_REPO, ".git"))) {
@@ -124,14 +155,39 @@ async function main() {
     await run("git", ["clone", "--depth", "1", "--filter=blob:none", "https://github.com/MicrosoftDocs/minecraft-creator.git", CREATOR_REPO]);
   }
   const creatorCommit = await run("git", ["-C", CREATOR_REPO, "rev-parse", "HEAD"], { capture: true });
+  await mkdir(RELEASES, { recursive: true });
+  const staging = path.join(RELEASES, `.staging-${process.pid}`);
+  await rm(staging, { recursive: true, force: true });
+  await mkdir(path.join(staging, "minecraft-creator", "creator"), { recursive: true });
+  for (const folder of ["Documents", "Commands", "Reference", "ScriptAPI"]) {
+    const source = path.join(CREATOR_REPO, "creator", folder);
+    if (await exists(source)) await cp(source, path.join(staging, "minecraft-creator", "creator", folder), { recursive: true });
+  }
   const counts = {};
-  for (const [channel, section] of CHANGELOGS) counts[channel] = await syncChangelog(channel, section);
-  await writeFile(path.join(CACHE, "sync-manifest.json"), JSON.stringify({
+  for (const [channel, section] of CHANGELOGS) counts[channel] = await syncChangelog(channel, section, staging);
+  const evaluation = await evaluateRelease(staging);
+  const revision = `${creatorCommit.slice(0, 12)}-${Date.now()}`;
+  const release = path.join(RELEASES, revision);
+  const manifest = {
     syncedAt: new Date().toISOString(),
+    revision,
     creatorCommit,
     releaseNotes: counts,
-  }, null, 2));
-  console.log(`[sync] minecraft-creator: ${creatorCommit}`);
+    channels: ["stable", "preview"],
+    edition: "bedrock",
+    evaluation,
+    attribution: {
+      documentation: "Microsoft Minecraft Creator documentation; CC BY 4.0 (code samples MIT)",
+      changelogs: "Minecraft Feedback release notes; cached privately and linked to original articles",
+    },
+  };
+  await writeFile(path.join(staging, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  await rename(staging, release);
+  const activeTemp = path.join(CACHE, `active-release.${process.pid}.json`);
+  await writeFile(activeTemp, `${JSON.stringify({ revision, release: path.relative(CACHE, release) }, null, 2)}\n`);
+  await rename(activeTemp, path.join(CACHE, "active-release.json"));
+  await writeFile(path.join(CACHE, "sync-manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
+  console.log(`[sync] promoted ${revision}: ${evaluation.chunks} chunks`);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) await main();

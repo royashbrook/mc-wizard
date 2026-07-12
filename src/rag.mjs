@@ -10,7 +10,7 @@ const STOP_WORDS = new Set([
   "to", "was", "what", "when", "with", "work", "you", "your",
 ]);
 
-const DEFAULT_ROOTS = [
+const BASE_ROOTS = [
   ["knowledge", "mechanic-card"],
   [".cache/minecraft-creator/creator/Documents", "official-doc"],
   [".cache/minecraft-creator/creator/Commands", "official-doc"],
@@ -18,6 +18,25 @@ const DEFAULT_ROOTS = [
   [".cache/minecraft-creator/creator/ScriptAPI", "official-doc"],
   [".cache/patch-notes", "patch-note"],
 ].map(([relative, kind]) => ({ dir: path.join(PROJECT_ROOT, relative), kind }));
+
+async function defaultRoots() {
+  try {
+    const active = JSON.parse(await readFile(path.join(PROJECT_ROOT, ".cache", "active-release.json"), "utf8"));
+    if (!/^[a-zA-Z0-9._/-]+$/.test(active.release) || active.release.includes("..")) throw new Error("invalid active release path");
+    const release = path.join(PROJECT_ROOT, ".cache", active.release);
+    return [
+      { dir: path.join(PROJECT_ROOT, "knowledge"), kind: "mechanic-card" },
+      ...["Documents", "Commands", "Reference", "ScriptAPI"].map((folder) => ({
+        dir: path.join(release, "minecraft-creator", "creator", folder),
+        kind: "official-doc",
+      })),
+      { dir: path.join(release, "patch-notes"), kind: "patch-note" },
+    ];
+  } catch (error) {
+    if (error.code !== "ENOENT" && !/invalid active release/.test(error.message)) throw error;
+    return BASE_ROOTS;
+  }
+}
 
 function normalizeWord(value) {
   let word = value.replace(/'s$/, "");
@@ -54,8 +73,8 @@ function titleFrom(markdown, file) {
 
 function sourceFor(file, metadata, creatorRef) {
   if (metadata.source) return metadata.source;
-  const marker = `${path.sep}.cache${path.sep}minecraft-creator${path.sep}`;
-  const index = file.indexOf(marker);
+  const marker = `${path.sep}minecraft-creator${path.sep}`;
+  const index = file.lastIndexOf(marker);
   if (index !== -1) {
     const relative = file.slice(index + marker.length).split(path.sep).join("/");
     return `https://github.com/MicrosoftDocs/minecraft-creator/blob/${creatorRef}/${relative}`;
@@ -114,7 +133,8 @@ async function markdownFiles(root) {
   return files;
 }
 
-export async function loadCorpus({ roots = DEFAULT_ROOTS } = {}) {
+export async function loadCorpus({ roots } = {}) {
+  roots ||= await defaultRoots();
   const chunks = [];
   let creatorRef = "main";
   try {

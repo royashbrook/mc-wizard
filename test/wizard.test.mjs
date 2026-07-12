@@ -1,14 +1,24 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { before, test } from "node:test";
 import { loadCorpus } from "../src/rag.mjs";
 import { startServer, validateAskBody } from "../src/server.mjs";
+import { createFileSessionStore } from "../src/sessions.mjs";
+import { safeCommandRefusal, unsafeCommandAnswer } from "../src/command-safety.mjs";
 import { classifyAction, createWizard } from "../src/wizard.mjs";
 import {
   calculatorResult,
   createCalculatorBlueprint,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/calculator.js";
 import { bookPages, bookTitle } from "../bedrock/behavior_packs/mc_wizard/scripts/book.js";
+import {
+  expectedPlacementStates,
+  planBounds,
+  validateBuildPlan,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/build-plan.js";
+import { COMMAND_LESSONS } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import { htmlToMarkdown } from "../scripts/sync-docs.mjs";
 import {
   DEFAULT_TIMEOUT_MS,
@@ -24,9 +34,14 @@ let packScript;
 let e2eScript;
 let containerScript;
 let localBridgeScript;
+let e2eRunnerScript;
+let installPackScript;
+let resourceManifest;
+let syncDocsScript;
+let supervisorScript;
 
 before(async () => {
-  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText] = await Promise.all([
+  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText] = await Promise.all([
     loadCorpus(),
     readFile(new URL("../bedrock/behavior_packs/mc_wizard/manifest.json", import.meta.url), "utf8"),
     readFile(new URL("../bedrock/config/4e8790fe-18dc-46d1-aa31-ec78a924b717/permissions.json", import.meta.url), "utf8"),
@@ -34,6 +49,11 @@ before(async () => {
     readFile(new URL("../bedrock/behavior_packs/mc_wizard/scripts/e2e.js", import.meta.url), "utf8"),
     readFile(new URL("../scripts/run-bedrock-container.sh", import.meta.url), "utf8"),
     readFile(new URL("../scripts/local-ai-bridge.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/run-e2e-container.sh", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/install-pack.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../bedrock/resource_packs/mc_wizard/manifest.json", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/sync-docs.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/supervisor.mjs", import.meta.url), "utf8"),
   ]);
   corpus = loadedCorpus;
   packManifest = JSON.parse(manifestText);
@@ -42,6 +62,11 @@ before(async () => {
   e2eScript = e2eText;
   containerScript = containerText;
   localBridgeScript = localBridgeText;
+  e2eRunnerScript = e2eRunnerText;
+  installPackScript = installPackText;
+  resourceManifest = JSON.parse(resourceManifestText);
+  syncDocsScript = syncDocsText;
+  supervisorScript = supervisorText;
   wizard = createWizard({ corpus, env: {} });
 });
 
@@ -56,6 +81,10 @@ test("drives the real wizard path with a headless test player", () => {
   assert.match(e2eScript, /direct-harness-fallback/);
   assert.match(e2eScript, /async function setLever/);
   assert.match(e2eScript, /getState\("open_bit"\)/);
+  assert.match(e2eScript, /book-delivery/);
+  assert.match(e2eScript, /validated-custom-plan/);
+  assert.match(e2eScript, /pillar_axis/);
+  assert.match(e2eScript, /transaction-undo/);
   assert.match(e2eScript, /tickingarea add circle/);
   assert.match(e2eScript, /tickingarea remove/);
   assert.match(e2eScript, /MC_WIZARD_E2E/);
@@ -69,6 +98,17 @@ test("drives the real wizard path with a headless test player", () => {
   assert.equal(DEFAULT_TIMEOUT_MS, 600_000);
 });
 
+test("bootstraps every E2E run in an isolated disposable world", () => {
+  assert.match(e2eRunnerScript, /runtime\/e2e\/\$RUN_ID/);
+  assert.match(e2eRunnerScript, /mc-wizard-e2e-bootstrap-\$RUN_ID/);
+  assert.match(e2eRunnerScript, /enable-beta-apis\.py/);
+  assert.match(e2eRunnerScript, /E2E_LOG_FILE="\$ROOT\/runtime\/e2e-last\.log"/);
+  assert.match(e2eRunnerScript, /Failed E2E world retained/);
+  assert.match(e2eRunnerScript, /rm -rf "\$DATA"/);
+  assert.doesNotMatch(e2eRunnerScript, /DATA="\$ROOT\/runtime\/bedrock"/);
+  assert.doesNotMatch(e2eRunnerScript, /container inspect mc-wizard-bedrock/);
+});
+
 test("embodies the guide as an official simulated player", () => {
   assert.ok(packManifest.dependencies.some((dependency) => (
     dependency.module_name === "@minecraft/server-gametest"
@@ -79,7 +119,8 @@ test("embodies the guide as an official simulated player", () => {
   assert.match(packScript, /navigateToEntity/);
   assert.match(packScript, /\.chat\(/);
   assert.match(packScript, /useItemOnBlock/);
-  assert.match(packScript, /if \(!placed\) throw/);
+  assert.match(packScript, /if \(!placed\)/);
+  assert.match(packScript, /after \$\{attempts\} attempts/);
   assert.doesNotMatch(packScript, /\.setType\(/);
   assert.doesNotMatch(packScript, /tryTeleport/);
   assert.match(packScript, /isWizardPlayer\(event\.sender\)/);
@@ -87,17 +128,71 @@ test("embodies the guide as an official simulated player", () => {
   assert.match(packScript, /wizard\.setItem\(item, 0, true\)/);
 });
 
-test("flies into player reach for every placement and verifies scaffold removal", () => {
+test("ships and equips a visible wizard costume with a vanilla fallback", () => {
+  assert.equal(resourceManifest.header.uuid, "5dd80b07-b583-4bb3-979c-41c25ce274d8");
+  assert.ok(packManifest.dependencies.some((dependency) => dependency.uuid === resourceManifest.header.uuid));
+  assert.match(installPackScript, /resource_packs/);
+  assert.match(installPackScript, /world_resource_packs\.json/);
+  assert.match(packScript, /EquipmentSlot\.Head/);
+  assert.match(packScript, /EquipmentSlot\.Chest/);
+  assert.match(packScript, /mcwizard:hat/);
+  assert.match(packScript, /mcwizard:robe/);
+  assert.match(packScript, /minecraft:leather_helmet/);
+  assert.match(packScript, /minecraft:leather_chestplate/);
+});
+
+test("prepares fixed command-block lessons and rejects unsafe generated commands", () => {
+  assert.match(packScript, /function buildCommandLesson/);
+  assert.match(packScript, /minecraft:command_block/);
+  assert.match(packScript, /minecraft:stone_button/);
+  assert.match(packScript, /Impulse, Unconditional, Needs Redstone/);
+  assert.equal(unsafeCommandAnswer("Try /say hello"), false);
+  assert.equal(unsafeCommandAnswer("Try /kill @a"), true);
+  assert.equal(unsafeCommandAnswer("Use a repeating command block"), true);
+  assert.match(safeCommandRefusal(), /shared world/i);
+  assert.equal(COMMAND_LESSONS.give_self.command, "/give @p[r=5] minecraft:torch 16");
+  assert.match(COMMAND_LESSONS.give_self.explanation, /cannot use @s/i);
+});
+
+test("promotes versioned documentation only after retrieval and dialogue evaluation", () => {
+  assert.match(syncDocsScript, /\.staging-/);
+  assert.match(syncDocsScript, /evaluateRelease\(staging\)/);
+  assert.match(syncDocsScript, /retrieval evaluation failed before promotion/);
+  assert.match(syncDocsScript, /dialogue evaluation failed before promotion/);
+  assert.match(syncDocsScript, /active-release\.json/);
+  assert.match(syncDocsScript, /await rename\(activeTemp/);
+  assert.match(syncDocsScript, /CC BY 4\.0/);
+  assert.match(syncDocsScript, /channels: \["stable", "preview"\]/);
+});
+
+test("supervises Bedrock, brain, provider, and corpus without secrets in status", () => {
+  assert.match(supervisorScript, /Math\.min\(30_000/);
+  assert.match(supervisorScript, /container", \["exec", "mc-wizard-bedrock", "true"\]/);
+  assert.match(supervisorScript, /corpusChunks/);
+  assert.match(supervisorScript, /providerName/);
+  assert.doesNotMatch(supervisorScript, /BRIDGE_TOKEN.*console|AI_API_KEY.*console/);
+  assert.match(supervisorScript, /container", \["stop", "--time", "60"/);
+});
+
+test("navigates into player reach for every placement and verifies scaffold removal", () => {
   assert.match(packScript, /BUILD_REACH_SQUARED/);
-  assert.match(packScript, /positionWizardForBuild\(dimension, target, support\)/);
+  assert.match(packScript, /positionWizardForBuild\(dimension, target, support/);
   const positioning = packScript.slice(
     packScript.indexOf("function positionWizardForBuild"),
     packScript.indexOf("function placeAsWizard"),
   );
-  assert.match(positioning, /wizard\.fly\(\)/);
-  assert.match(positioning, /moveToLocation/);
+  assert.match(packScript, /wizard\.navigateToLocation/);
+  assert.match(packScript, /wizard\.moveToLocation/);
+  assert.match(packScript, /wizard\.jump\(\)/);
   assert.doesNotMatch(positioning, /tryTeleport/);
-  assert.match(packScript, /stepComplete === false \? index : index \+ 1/);
+  assert.match(packScript, /function playerCopyableCalculatorSupport/);
+  assert.match(packScript, /function playerAccessibleCalculatorOrder/);
+  assert.match(packScript, /dimension\.getBlock\(location\)\?\.isSolid/);
+  assert.match(packScript, /stepComplete === false \|\| stepComplete === "placement-retry"/);
+  assert.match(packScript, /placementRetries\.has\(retryKey\)/);
+  assert.match(packScript, /forceMove/);
+  assert.match(packScript, /preparedPlacements\.add\(retryKey\)/);
+  assert.match(packScript, /stepComplete === "placement-prepare"/);
   assert.match(packScript, /scaffold did not clear/);
   assert.match(packScript, /finalBlocks\.set\(locationKey, \{ location, typeId: "minecraft:air" \}\)/);
 });
@@ -228,6 +323,51 @@ test("plans a bounded two-bit redstone calculator and all 16 sums", () => {
       assert.equal(Number.parseInt(result.bits.join(""), 2), a + b);
     }
   }
+});
+
+test("validates bounded support-ordered custom plans and directional logs", () => {
+  const plan = validateBuildPlan({
+    title: "Tiny arch",
+    blocks: [
+      { target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:oak_planks" },
+      { target: [0, 1, 1], support: [0, 0, 1], itemId: "minecraft:oak_log" },
+      { target: [1, 1, 1], support: [0, 1, 1], itemId: "minecraft:oak_log" },
+    ],
+  });
+  assert.deepEqual(planBounds(plan), { min: [0, 0, 1], max: [1, 1, 1] });
+  assert.deepEqual(expectedPlacementStates("minecraft:oak_log", [0, 0, 1], [0, 1, 1]), { pillar_axis: "y" });
+  assert.deepEqual(expectedPlacementStates("minecraft:oak_log", [0, 1, 1], [1, 1, 1]), { pillar_axis: "x" });
+  assert.throws(() => validateBuildPlan({
+    blocks: [{ target: [0, 1, 1], support: [0, 0, 1], itemId: "minecraft:oak_planks" }],
+  }), /earlier planned block/);
+  assert.throws(() => validateBuildPlan({
+    blocks: [{ target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:tnt" }],
+  }), /not allowed/);
+  assert.throws(() => validateBuildPlan({
+    blocks: [{ target: [9, 0, 1], support: [9, -1, 1], itemId: "minecraft:stone" }],
+  }), /outside the build bounds/);
+  assert.throws(() => validateBuildPlan({
+    blocks: [
+      { target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:stone" },
+      { target: [1, 0, 1], support: [0, 0, 1], itemId: "minecraft:redstone" },
+    ],
+  }), /requires support directly below/);
+});
+
+test("executes custom plans through player placement with journaled rollback and undo", () => {
+  assert.match(packScript, /function buildValidatedPlan\(player, value\)/);
+  assert.match(packScript, /validateBuildPlan\(value\)/);
+  assert.match(packScript, /placeAsWizard\(/);
+  assert.match(packScript, /expectedPlacementStates/);
+  assert.match(packScript, /mcwizard:active_transaction/);
+  assert.match(packScript, /world\.setDynamicProperty\(TRANSACTION_JOURNAL/);
+  assert.match(packScript, /function rollbackTransaction/);
+  assert.match(packScript, /function recoverInterruptedTransaction/);
+  assert.match(packScript, /function undoLastBuild/);
+  assert.match(packScript, /protected spawn area/);
+  assert.match(packScript, /protected by a recent MC Wizard build/);
+  assert.match(packScript, /action\?\.type === "build_plan"/);
+  assert.doesNotMatch(packScript, /tryTeleport/);
 });
 
 test("returns an offline answer with sources and a typed action", async () => {
@@ -372,4 +512,43 @@ test("lets the model select only registered Wizard skills and carries session hi
   assert.equal(followup.action, null);
   assert.match(requests[0].messages[0].content, /build_two_bit_calculator/);
   assert.match(requests[1].messages[1].content, /I’ll build the calculator now/);
+});
+
+test("persists bounded separate sessions without plaintext player identity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-session-"));
+  const filePath = join(directory, "sessions.json");
+  let clock = 1_000_000;
+  try {
+    const store = await createFileSessionStore({
+      filePath,
+      salt: "test-session-salt-long-enough",
+      maxTurns: 2,
+      ttlMs: 1_000,
+      now: () => clock,
+    });
+    await store.set("SecretGamertag", "wizard", [
+      { question: "one", answer: "1" },
+      { question: "two", answer: "2" },
+      { question: "three", answer: "3" },
+    ]);
+    await store.set("SecretGamertag", "general", [{ question: "hello", answer: "hi" }]);
+    assert.deepEqual(store.get("SecretGamertag", "wizard").map((turn) => turn.question), ["two", "three"]);
+    assert.equal(store.get("SecretGamertag", "general")[0].answer, "hi");
+    assert.doesNotMatch(await readFile(filePath, "utf8"), /SecretGamertag/);
+
+    const reloaded = await createFileSessionStore({
+      filePath,
+      salt: "test-session-salt-long-enough",
+      maxTurns: 2,
+      ttlMs: 1_000,
+      now: () => clock,
+    });
+    assert.equal(reloaded.get("SecretGamertag", "wizard").length, 2);
+    assert.equal(await reloaded.delete("SecretGamertag", "wizard"), true);
+    assert.deepEqual(reloaded.get("SecretGamertag", "wizard"), []);
+    clock += 2_000;
+    assert.deepEqual(reloaded.get("SecretGamertag", "general"), []);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
