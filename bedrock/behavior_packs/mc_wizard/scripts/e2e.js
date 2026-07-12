@@ -440,14 +440,35 @@ function runCustomPlanCheck(kid, origin, transport, fail) {
             return;
           }
           report("CHECK", "action-first-workshop", "player teleported to a clear grass build pad");
-          report(
-            "PASS",
-            "two-bit-redstone-calculator",
-            `request via ${transport}; book delivery, transaction undo, custom orientation, workshop relocation, one lever click, and all 16 player-powered sums verified`,
+          chatCallbacks.buildValidatedPlan(kid, {
+            title: "Workshop epsilon proof",
+            blocks: [{ target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:stone" }],
+          });
+          const workshopBlockPlaced = () => {
+            for (let x = feet.x - 10; x <= feet.x + 10; x += 1) {
+              for (let z = feet.z - 10; z <= feet.z + 10; z += 1) {
+                if (kid.dimension.getBlock({ x, y: feet.y, z })?.typeId === "minecraft:stone") return true;
+              }
+            }
+            return false;
+          };
+          poll(
+            () => chatCallbacks.hasCommittedBuild(kid.id) && workshopBlockPlaced(),
+            600,
+            () => {
+              report("CHECK", "workshop-build", "player placement succeeded from the 255.999 standing coordinate");
+              report(
+                "PASS",
+                "two-bit-redstone-calculator",
+                `request via ${transport}; book delivery, transaction undo, custom orientation, workshop relocation and placement, one lever click, and all 16 player-powered sums verified`,
+              );
+              try {
+                kid.disconnect();
+              } catch {}
+            },
+            "the wizard to place a block on the prepared workshop",
+            fail,
           );
-          try {
-            kid.disconnect();
-          } catch {}
           }, 20);
         }).catch((error) => fail(`the action-first workshop rejected: ${error}`));
       }, 20);

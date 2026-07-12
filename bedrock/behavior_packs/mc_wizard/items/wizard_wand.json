@@ -1,0 +1,15 @@
+{
+  "format_version": "1.20.50",
+  "minecraft:item": {
+    "description": {
+      "identifier": "mcwizard:wand",
+      "menu_category": { "category": "equipment" }
+    },
+    "components": {
+      "minecraft:display_name": { "value": "MC Wizard's Wand" },
+      "minecraft:icon": "mcwizard_wand",
+      "minecraft:hand_equipped": true,
+      "minecraft:max_stack_size": 1
+    }
+  }
+}

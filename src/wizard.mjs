@@ -46,7 +46,27 @@ function isOrdinaryConversation(question) {
   const text = question.trim();
   return /^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
     || /^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
-    || /\b(?:who are you|what can you do|tell me (?:a )?joke|how are you|what do you think|weather)\b/i.test(text);
+    || /\b(?:are you ready|you ready|who are you|what can you do|tell me (?:a )?joke|how are you|what do you think|weather)\b/i.test(text);
+}
+
+export function instantConversationAnswer(question) {
+  const text = question.trim();
+  if (/^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)) {
+    return "Hi! I’m right here. What should we build or learn today?";
+  }
+  if (/^(?:are you ready|you ready|ready)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)) {
+    return "Ready! Tell me what you want to try, and I’ll start with you.";
+  }
+  if (/^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)) {
+    return "You’re welcome! I’m ready for the next idea.";
+  }
+  if (/\b(?:tell me (?:a )?joke|minecraft joke)\b/i.test(text)) {
+    return "Why did the creeper cross the road? To get to the other ssssside!";
+  }
+  if (/\b(?:who are you|what can you do)\b/i.test(text)) {
+    return "I’m MC Wizard. I can teach Bedrock redstone and commands, debug builds, or build a small demo while you watch.";
+  }
+  return undefined;
 }
 
 export function classifyAction(question) {
@@ -259,6 +279,7 @@ export function createWizard({
     async ask({ question, player = "anonymous", mode: requestMode = "wizard" }) {
       const tuning = { aiEnabled: true, ...await settings() };
       const general = requestMode === "general";
+      const instantAnswer = general ? undefined : instantConversationAnswer(question);
       const history = sessions.get(player, requestMode);
       const includePreview = /\b(beta|preview|experimental)\b/i.test(question);
       const conversational = !general && isOrdinaryConversation(question);
@@ -271,13 +292,13 @@ export function createWizard({
       const relevanceFloor = (rankedHits[0]?.score || 0) * 0.5;
       const hits = rankedHits.filter((hit) => hit.score >= relevanceFloor);
       const action = general ? null : classifyAction(question);
-      let answer = general
+      let answer = instantAnswer || (general
         ? "The general AI provider is offline. Ask an adult to start the local model bridge."
-        : localAnswer(question, hits, action);
+        : localAnswer(question, hits, action));
       let selectedAction = action;
       let title = general ? bookTitle(question) : undefined;
-      let responseMode = "offline";
-      if (provider.enabled && tuning.aiEnabled) {
+      let responseMode = instantAnswer ? "local-instant" : "offline";
+      if (!instantAnswer && provider.enabled && tuning.aiEnabled) {
         try {
           let providerAnswer = await askProvider({ provider, fetchImpl, question, hits, history, player, env, general, tuning });
           let envelope = general ? generalEnvelope(providerAnswer, question) : wizardEnvelope(providerAnswer);

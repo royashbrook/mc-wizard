@@ -69,7 +69,7 @@ Open [http://127.0.0.1:3001](http://127.0.0.1:3001) on the server Mac. The desk 
 
 - live Bedrock, brain, and provider health;
 - quick world controls plus a one-line Bedrock console input;
-- recent container logs;
+- recent container logs that refresh every four seconds and follow new output automatically;
 - a separate browser dialogue session for testing Wizard and general AI replies; and
 - hot-loaded prompt addenda, AI enable/disable, and output-token limits.
 
@@ -114,7 +114,9 @@ For the local subscription-backed bridge used by this spike, start this first:
 npm run start:ai
 ```
 
-`mtok-bridge` provides the OpenAI-compatible transport. Its upstream is the authenticated local Claude CLI running with `--safe-mode`, an empty tool list, and no session persistence. It receives only the model prompt: it cannot read files, run commands, load project customizations, or act in Minecraft. Then start the brain with `npm start`.
+`mtok-bridge` provides the OpenAI-compatible transport. Its upstream is the authenticated local Claude CLI running with `--safe-mode`, an empty tool list, and no session persistence. It receives only the model prompt: it cannot read files, run commands, load project customizations, or act in Minecraft. The bridge allows one request at a time and stops a stuck local model after 18 seconds by default. Then start the brain with `npm start`.
+
+Greetings, readiness checks, thanks, and jokes receive immediate local Wizard replies. Deeper questions get a natural acknowledgement and progress updates while the model works. Joining the server starts a fresh dialogue session, and late replies from an older request are discarded, so a previous build request cannot resume after reconnecting. The Bedrock log message `Running AutoCompaction...` is database maintenance; it is not an AI request or conversation compaction.
 
 In game, `ai <question>` always means this general model route. It requires the `ai` keyword even when the player is alone or beside the Wizard, skips Minecraft RAG and Wizard actions, and prefixes short replies with `[Claude]`. Replies over 700 characters are placed in a signed book at the player's feet. Ordinary chat and `wiz`/`wizard` continue through the Minecraft-specialist route.
 
@@ -299,7 +301,7 @@ Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not 
 
 ## Known limits of this spike
 
-- The live iPad test verified the visible player entity, chat, AI books, and basic mechanics. The new costume silhouette and the T-flip-flop's real-client copper-bulb transition still need a quick iPad visual check.
+- The live iPad test verified the visible player entity, chat, AI books, and basic mechanics. The fitted costume, custom wand, and T-flip-flop's real-client copper-bulb transition still need a quick iPad visual check. The current Script API can read a simulated player's skin but cannot assign one, so the costume uses fitted attachables rather than a replacement player skin.
 - The T flip-flop, calculator, command lessons, and validated plans are transactional and undoable. They require bounded clear areas, reject occupied/protected overlaps, and roll back on failure or disconnect.
 - The current documented Script API cannot safely program arbitrary command-block text. Prepared lesson definitions make the Wizard physically place the command block and button, then tell the child exactly what to paste; they deliberately do not `/structure load` a prebuilt result.
 - Official Microsoft documentation is not a complete gameplay encyclopedia. Fill gaps with versioned, self-authored mechanic cards backed by reproducible Bedrock tests. Do not ingest the community wiki by default without accepting its attribution, noncommercial, and share-alike requirements.

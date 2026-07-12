@@ -6,6 +6,8 @@ const host = "127.0.0.1";
 const port = Number(process.env.MTOK_PORT) || 8790;
 const provider = process.env.MTOK_PROVIDER || "claude";
 const model = process.env.MTOK_MODEL || provider;
+const timeoutMs = Math.min(Math.max(Number(process.env.MTOK_TIMEOUT_MS) || 18_000, 5_000), 30_000);
+let inFlight = 0;
 const upstream = provider === "ollama"
   ? httpUpstream({ baseUrl: process.env.MTOK_UPSTREAM || "http://127.0.0.1:11434/v1" })
   : claudeUpstream;
@@ -20,6 +22,7 @@ function claudeUpstream(payload) {
     .map((message) => `${message.role === "assistant" ? "Assistant" : "Player"}: ${message.content}`)
     .join("\n\n");
   return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
     const child = spawn("claude", [
       "-p",
       "--safe-mode",
@@ -30,14 +33,20 @@ function claudeUpstream(payload) {
     ], { cwd: "/private/tmp", env: process.env, stdio: ["pipe", "pipe", "pipe"] });
     let output = "";
     let errorOutput = "";
-    const timeout = setTimeout(() => child.kill("SIGTERM"), 120_000);
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+    }, timeoutMs);
     child.stdout.on("data", (chunk) => { output = (output + chunk).slice(0, 64 * 1024); });
     child.stderr.on("data", (chunk) => { errorOutput = (errorOutput + chunk).slice(-2_000); });
     child.on("error", reject);
     child.on("close", (code) => {
       clearTimeout(timeout);
+      console.log(`[mc-wizard] claude request finished in ${Date.now() - startedAt}ms; code=${code}`);
       if (code !== 0) {
-        reject(new Error(errorOutput.trim() || `Claude exited ${code}`));
+        reject(new Error(timedOut ? `Claude timed out after ${timeoutMs}ms` : errorOutput.trim() || `Claude exited ${code}`));
         return;
       }
       resolve({
@@ -60,6 +69,11 @@ const server = createServer(async (request, response) => {
     response.writeHead(404).end();
     return;
   }
+  if (inFlight >= 1) {
+    response.writeHead(429, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: "local model is already thinking" }));
+    return;
+  }
 
   const chunks = [];
   let size = 0;
@@ -78,9 +92,14 @@ const server = createServer(async (request, response) => {
     response.writeHead(400).end();
     return;
   }
-  const result = await serveChat({ body, models: [model], upstream });
-  response.writeHead(result.status, { "content-type": "application/json" });
-  response.end(JSON.stringify(result.json));
+  inFlight += 1;
+  try {
+    const result = await serveChat({ body, models: [model], upstream });
+    response.writeHead(result.status, { "content-type": "application/json" });
+    response.end(JSON.stringify(result.json));
+  } finally {
+    inFlight -= 1;
+  }
 });
 
 server.listen(port, host, () => {

@@ -55,6 +55,7 @@ const lastBuildTick = new Map();
 const greetedPlayers = new Set();
 const engineAddressedMessageCounts = new Map();
 const queuedBuilds = new Map();
+const pendingQuestions = new Map();
 const lastUndo = new Map();
 const placementRetries = new Map();
 const preparedPlacements = new Set();
@@ -71,6 +72,7 @@ let wizardSpeaking = false;
 let buildInProgress = false;
 let activeBuildToken;
 let nextBuildToken = 0;
+let nextQuestionToken = 0;
 let buildMovement;
 let activeTransaction;
 
@@ -161,10 +163,14 @@ function blockIsOpen(dimension, location) {
   return SAFE_SPACE.has(dimension.getBlock(location)?.typeId);
 }
 
+function standingBlockY(location) {
+  return Math.floor(location.y + 0.01);
+}
+
 function arrivalPosition(player) {
   const base = {
     x: Math.floor(player.location.x),
-    y: Math.floor(player.location.y),
+    y: standingBlockY(player.location),
     z: Math.floor(player.location.z),
   };
   for (const [x, z] of [[2, 0], [-2, 0], [0, 2], [0, -2], [3, 1], [-3, -1]]) {
@@ -180,12 +186,13 @@ function arrivalPosition(player) {
   return undefined;
 }
 
-function equipWizard(itemId = "minecraft:blaze_rod") {
+function equipWizard(itemId = "mcwizard:wand") {
   if (!wizardIsValid()) return;
   try {
     wizard.setItem(new ItemStack(itemId, 1), 0, true);
   } catch (error) {
     console.warn(`[MC Wizard] could not equip ${itemId}: ${error}`);
+    if (itemId !== "minecraft:stick") equipWizard("minecraft:stick");
   }
 }
 
@@ -193,7 +200,7 @@ function dressWizard() {
   if (!wizardIsValid()) return;
   const equippable = wizard.getComponent("minecraft:equippable");
   if (!equippable) {
-    console.warn("[MC Wizard] equippable component unavailable; name tag and blaze rod remain visible");
+    console.warn("[MC Wizard] equippable component unavailable; name tag and wand remain visible");
     return;
   }
   try {
@@ -532,7 +539,7 @@ function findClearSite(player, forward, right) {
   const location = player.location;
   const base = {
     x: Math.floor(location.x) + forward.x * 5,
-    y: Math.floor(location.y),
+    y: standingBlockY(location),
     z: Math.floor(location.z) + forward.z * 5,
   };
   const occupied = [
@@ -1219,7 +1226,7 @@ function customLocation(origin, forward, right, [x, y, z]) {
 function findCustomSite(player, plan, forward, right) {
   const origin = {
     x: Math.floor(player.location.x) + forward.x * 6,
-    y: Math.floor(player.location.y),
+    y: standingBlockY(player.location),
     z: Math.floor(player.location.z) + forward.z * 6,
   };
   const bounds = planBounds(plan);
@@ -1376,7 +1383,7 @@ async function buildCommandLesson(player, id) {
 function findCalculatorSite(player, forward, right) {
   const origin = {
     x: Math.floor(player.location.x) + forward.x * 18 - right.x * 5,
-    y: Math.floor(player.location.y),
+    y: standingBlockY(player.location),
     z: Math.floor(player.location.z) + forward.z * 18 - right.z * 5,
   };
   for (let x = -1; x <= 11; x += 1) {
@@ -1535,7 +1542,9 @@ function applyResponse(playerId, payload, question) {
     deliverModelAnswer(player, payload, question);
     return;
   }
-  console.warn("[MC Wizard] applying response action=" + (payload.action?.id || "none"));
+  console.warn("[MC Wizard] applying response action=" + (payload.action
+    ? `${payload.action.type}:${payload.action.id || payload.action.plan?.title || "unnamed"}`
+    : "none"));
   bringWizardTo(player);
   speak(player, payload.answer || "I found no answer.");
 
@@ -1558,8 +1567,24 @@ function applyResponse(playerId, payload, question) {
 async function askBackend(playerId, question, mode = "wizard") {
   const player = playerById(playerId);
   if (!player) return;
+  const key = `${playerId}:${mode}`;
+  const token = ++nextQuestionToken;
+  pendingQuestions.set(key, token);
   if (mode === "general") player.sendMessage("§b[AI]§r Thinking…");
-  else bringWizardTo(player);
+  else {
+    bringWizardTo(player);
+    speak(player, "Let me think about that. I’ll stay right here while I work it out.");
+    for (const [ticks, message] of [
+      [160, "I’m still thinking. You can keep building while I work."],
+      [360, "That’s taking too long. I’ll use my best local answer if the model doesn’t return soon."],
+    ]) {
+      system.runTimeout(() => {
+        if (pendingQuestions.get(key) !== token) return;
+        const current = playerById(playerId);
+        if (current) speak(current, message);
+      }, ticks);
+    }
+  }
 
   try {
     const request = new HttpRequest(WIZARD_URL)
@@ -1572,10 +1597,19 @@ async function askBackend(playerId, question, mode = "wizard") {
       throw new Error(`brain returned HTTP ${response.status}`);
     }
     const payload = JSON.parse(response.body);
-    system.run(() => applyResponse(playerId, payload, question));
+    system.run(() => {
+      if (pendingQuestions.get(key) !== token) {
+        console.warn(`[MC Wizard] discarded stale ${mode} response for ${player.name}`);
+        return;
+      }
+      pendingQuestions.delete(key);
+      applyResponse(playerId, payload, question);
+    });
   } catch (error) {
     console.warn(`[MC Wizard] ${error}`);
     system.run(() => {
+      if (pendingQuestions.get(key) !== token) return;
+      pendingQuestions.delete(key);
       const current = playerById(playerId);
       if (!current) return;
       if (mode === "general") current.sendMessage("§b[AI]§r I can’t reach the model right now.");
@@ -1584,7 +1618,45 @@ async function askBackend(playerId, question, mode = "wizard") {
   }
 }
 
+function cancelPendingQuestion(player, mode = "wizard") {
+  pendingQuestions.delete(`${player.id}:${mode}`);
+}
+
+async function clearBackendSession(playerName, mode) {
+  try {
+    const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/session"))
+      .setMethod(HttpRequestMethod.Delete)
+      .setBody(JSON.stringify({ player: playerName, mode }))
+      .addHeader("Content-Type", "application/json");
+    if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+    await http.request(request);
+  } catch (error) {
+    console.warn(`[MC Wizard] could not clear ${mode} session for ${playerName}: ${error}`);
+  }
+}
+
 function handleLocalCommand(player, question) {
+  const simple = question.trim();
+  if (/^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(simple)) {
+    cancelPendingQuestion(player);
+    speak(player, "Hi! I’m right here. What should we build or learn today?");
+    return true;
+  }
+  if (/^(?:are you ready|you ready|ready)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(simple)) {
+    cancelPendingQuestion(player);
+    speak(player, "Ready! Tell me what you want to try, and I’ll start with you.");
+    return true;
+  }
+  if (/^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(simple)) {
+    cancelPendingQuestion(player);
+    speak(player, "You’re welcome! I’m ready for the next idea.");
+    return true;
+  }
+  if (/\b(?:tell me (?:a )?joke|minecraft joke)\b/i.test(simple)) {
+    cancelPendingQuestion(player);
+    speak(player, "Why did the creeper cross the road? To get to the other ssssside!");
+    return true;
+  }
   if (/^(?:undo|undo (?:my |the )?last build)(?: please)?[.!]?$/i.test(question)) {
     undoLastBuild(player);
     return true;
@@ -1680,6 +1752,9 @@ world.afterEvents.playerSpawn.subscribe((event) => {
     bringWizardTo(player, followPlayerId === player.id);
     if (initialSpawn && !greetedPlayers.has(player.id)) {
       greetedPlayers.add(player.id);
+      cancelPendingQuestion(player);
+      void clearBackendSession(player.name, "wizard");
+      void clearBackendSession(player.name, "general");
       speak(player, "Hello! I’m MC Wizard. Chat normally when we’re alone or nearby, or say ‘wiz’ when the server is busy. Ask about Bedrock redstone, commands, or a demo.");
     }
   }, 20);

@@ -7,7 +7,7 @@ import { loadCorpus } from "../src/rag.mjs";
 import { startServer, validateAskBody } from "../src/server.mjs";
 import { createFileSessionStore } from "../src/sessions.mjs";
 import { safeCommandRefusal, unsafeCommandAnswer } from "../src/command-safety.mjs";
-import { classifyAction, createWizard } from "../src/wizard.mjs";
+import { classifyAction, createWizard, instantConversationAnswer } from "../src/wizard.mjs";
 import { validateConsoleCommand } from "../src/admin.mjs";
 import { readRuntimeSettings, validateRuntimeSettings, writeRuntimeSettings } from "../src/runtime-settings.mjs";
 import {
@@ -139,6 +139,8 @@ test("ships and equips a visible wizard costume with a vanilla fallback", () => 
   assert.match(packScript, /EquipmentSlot\.Chest/);
   assert.match(packScript, /mcwizard:hat/);
   assert.match(packScript, /mcwizard:robe/);
+  assert.match(packScript, /mcwizard:wand/);
+  assert.doesNotMatch(packScript, /minecraft:blaze_rod/);
   assert.match(packScript, /minecraft:leather_helmet/);
   assert.match(packScript, /minecraft:leather_chestplate/);
 });
@@ -224,6 +226,7 @@ test("moves blocked builds to a fresh workshop and queues busy requests", () => 
   assert.match(packScript, /player\.teleport/);
   assert.match(packScript, /grass_block/);
   assert.match(packScript, /function queueBuild/);
+  assert.match(packScript, /function standingBlockY/);
   assert.match(e2eScript, /action-first-workshop/);
   assert.match(e2eScript, /prepareBuildWorkshop/);
   assert.doesNotMatch(packScript, /Move to an open area and ask again/);
@@ -245,6 +248,8 @@ test("constrains the Claude CLI bridge to text-only ephemeral safe mode", () => 
   assert.match(localBridgeScript, /"--tools", ""/);
   assert.match(localBridgeScript, /"--no-session-persistence"/);
   assert.match(localBridgeScript, /host = "127\.0\.0\.1"/);
+  assert.match(localBridgeScript, /MTOK_TIMEOUT_MS/);
+  assert.match(localBridgeScript, /inFlight >= 1/);
   assert.doesNotMatch(localBridgeScript, /dangerously-skip|bypassPermissions/);
 });
 
@@ -412,10 +417,30 @@ test("uses retrieved material for specific command-block questions", async () =>
   assert.doesNotMatch(result.answer, /closest verified note|from “clone Command”/i);
 });
 
-test("answers ordinary conversation as a character instead of dumping retrieval", async () => {
-  const greeting = await wizard.ask({ player: "BuilderKid", question: "hi wiz" });
-  assert.match(greeting.answer, /MC Wizard/i);
+test("answers ordinary conversation instantly without invoking the provider", async () => {
+  let providerCalled = false;
+  const greetingWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "slow", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalled = true;
+      throw new Error("provider should not be called");
+    },
+  });
+  const greeting = await greetingWizard.ask({ player: "BuilderKid", question: "hi wiz" });
+  assert.match(greeting.answer, /right here/i);
+  assert.equal(greeting.mode, "local-instant");
+  assert.equal(providerCalled, false);
+  assert.match(instantConversationAnswer("are you ready?"), /Ready!/);
   assert.doesNotMatch(greeting.answer, /source|verified note/i);
+});
+
+test("cancels stale replies and keeps children updated while deeper work runs", () => {
+  assert.match(packScript, /discarded stale/);
+  assert.match(packScript, /pendingQuestions\.get\(key\) !== token/);
+  assert.match(packScript, /I’m still thinking/);
+  assert.match(packScript, /clearBackendSession/);
+  assert.match(packScript, /HttpRequestMethod\.Delete/);
 });
 
 test("uses the OpenAI Responses adapter without giving the model build authority", async () => {
@@ -630,7 +655,7 @@ test("hot-loads validated operator tuning into the next model request", async ()
       return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
     },
   });
-  await tunedWizard.ask({ player: "Admin", question: "hello" });
+  await tunedWizard.ask({ player: "Admin", question: "What is redstone dust?" });
   await tunedWizard.ask({ player: "Admin", question: "write a guide", mode: "general" });
   assert.equal(requests[0].max_tokens, 222);
   assert.match(requests[0].messages[0].content, /sparkle wire/);
@@ -665,4 +690,6 @@ test("serves a loopback admin desk and sends console text without a shell", asyn
   assert.match(adminScript, /\["exec", "mc-wizard-bedrock", "send-command", command\]/);
   assert.match(adminScript, /ROSETTA_SEND_SCRIPT/);
   assert.match(adminScript, /Admin panel is loopback-only/);
+  assert.match(adminScript, /setInterval\(loadLogs,4000\)/);
+  assert.match(adminScript, /scrollTop=panel\.scrollHeight/);
 });

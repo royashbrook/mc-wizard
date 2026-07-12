@@ -6,7 +6,19 @@ const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const PACK_ID = "48450204-0c54-4c3b-855a-c76eda67275d";
 const RESOURCE_PACK_ID = "5dd80b07-b583-4bb3-979c-41c25ce274d8";
 const MODULE_ID = "4e8790fe-18dc-46d1-aa31-ec78a924b717";
-const VERSION = [0, 1, 0];
+const manifest = JSON.parse(await readFile(
+  path.join(ROOT, "bedrock", "behavior_packs", "mc_wizard", "manifest.json"),
+  "utf8",
+));
+const VERSION = manifest.header.version;
+const resourceManifest = JSON.parse(await readFile(
+  path.join(ROOT, "bedrock", "resource_packs", "mc_wizard", "manifest.json"),
+  "utf8",
+));
+const RESOURCE_VERSION = resourceManifest.header.version;
+if (![VERSION, RESOURCE_VERSION].every((version) => Array.isArray(version) && version.length === 3)) {
+  throw new Error("Pack manifests must have three-part header versions");
+}
 
 const [serverDirectory, worldName, requestedUrl] = process.argv.slice(2);
 if (!serverDirectory || !worldName) {
@@ -80,8 +92,8 @@ try {
   if (error.code !== "ENOENT") throw error;
 }
 const existingResourcePack = worldResourcePacks.find((pack) => pack.pack_id === RESOURCE_PACK_ID);
-if (existingResourcePack) existingResourcePack.version = VERSION;
-else worldResourcePacks.push({ pack_id: RESOURCE_PACK_ID, version: VERSION });
+if (existingResourcePack) existingResourcePack.version = RESOURCE_VERSION;
+else worldResourcePacks.push({ pack_id: RESOURCE_PACK_ID, version: RESOURCE_VERSION });
 await writeFile(worldResourcePacksFile, `${JSON.stringify(worldResourcePacks, null, 2)}\n`);
 
 await writeFile(path.join(configTarget, "permissions.json"), `${JSON.stringify({
