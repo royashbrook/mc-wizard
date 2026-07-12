@@ -31,7 +31,7 @@ Ask `wizard, build me something that changes every time I press a button` and th
 - A safe action boundary: model prose cannot become commands or JavaScript. Fixed skills and bounded validated build plans are the only executable output.
 - A loopback-only operator desk for live AI tuning, health, Bedrock console commands, logs, and browser-based dialogue tests.
 - Journaled snapshots, rollback on failure/disconnect/restart, recent-build protection, and `wizard undo`.
-- A pack installer that preserves other activated packs and installs the Wizard's visible hat-and-robe resource pack.
+- A pack installer that preserves other activated packs, plus an original importable classic Wizard skin pack.
 
 ## Run the brain
 
@@ -150,7 +150,9 @@ The behavior pack uses beta chat, HTTP, and [`@minecraft/server-gametest`](https
 
 When a real player joins, the behavior pack is set up to spawn one `MC Wizard` near that player. This is a server-side `SimulatedPlayer`, not a custom mob wearing a player-shaped model: it is an actual subclass of Bedrock's `Player`. It uses the normal player rendering path and can navigate, turn to look at a child, speak under its own name, carry selected items, and place or interact with blocks as a player.
 
-The embodiment does not need a second Xbox/Microsoft account. The companion resource pack renders a purple hat and robe; if it fails to load, the same visible player, name tag, held blaze rod, and vanilla armor fallback remain. It requires a Beta-APIs-enabled world and the pre-release GameTest Script API.
+The embodiment does not need a second Xbox/Microsoft account. It requires a Beta-APIs-enabled world and the pre-release GameTest Script API. The original Astral Workshop Wizard skin is a standard 64x64 classic-arm skin under `bedrock/skin_packs/mc_wizard`; it intentionally replaces the old fake hat-and-robe shell. Run `npm run package:skin` to create `dist/mc-wizard-skin.mcpack` for Bedrock's Classic Skins picker. Applying that selected skin to a server-created `SimulatedPlayer` is a separate live Script API acceptance test and is not claimed as working yet.
+
+![Astral Workshop Wizard skin preview](docs/assets/mc-wizard-skin-preview.png)
 
 Address the character in chat:
 

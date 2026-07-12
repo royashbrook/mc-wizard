@@ -20,6 +20,7 @@
     "enable:beta": "python3 scripts/enable-beta-apis.py",
     "install:pack": "node --env-file-if-exists=.env scripts/install-pack.mjs",
     "generate:textures": "node scripts/generate-wizard-textures.mjs",
+    "package:skin": "npm run generate:textures && sh scripts/package-skin-pack.sh",
     "container:bds": "sh scripts/run-bedrock-container.sh",
     "container:delete": "container delete mc-wizard-bedrock",
     "container:logs": "container logs -f mc-wizard-bedrock",
