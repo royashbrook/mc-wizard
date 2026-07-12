@@ -239,29 +239,29 @@ function responseText(data, style) {
     .join("");
 }
 
-function wizardEnvelope(text) {
+function responseEnvelope(text) {
   const candidate = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  try {
-    const value = JSON.parse(candidate);
-    if (!value || typeof value.answer !== "string" || !value.answer.trim()) return undefined;
-    return { answer: value.answer.trim(), action: allowedWizardAction(value.action) };
-  } catch {
-    return undefined;
+  const starts = [0, ...[...candidate.matchAll(/\{\s*"(?:answer|title)"\s*:/g)].map((match) => match.index)];
+  for (const start of [...new Set(starts)].reverse()) {
+    try {
+      const value = JSON.parse(candidate.slice(start));
+      if (value && typeof value.answer === "string" && value.answer.trim()) return value;
+    } catch {}
   }
+  return undefined;
+}
+
+function wizardEnvelope(text) {
+  const value = responseEnvelope(text);
+  return value ? { answer: value.answer.trim(), action: allowedWizardAction(value.action) } : undefined;
 }
 
 function generalEnvelope(text, question) {
-  const candidate = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
-  try {
-    const value = JSON.parse(candidate);
-    if (!value || typeof value.answer !== "string" || !value.answer.trim()) return undefined;
-    return {
-      answer: value.answer.trim(),
-      title: bookTitle(typeof value.title === "string" ? value.title : question),
-    };
-  } catch {
-    return undefined;
-  }
+  const value = responseEnvelope(text);
+  return value ? {
+    answer: value.answer.trim(),
+    title: bookTitle(typeof value.title === "string" ? value.title : question),
+  } : undefined;
 }
 
 async function askProvider({ provider, fetchImpl, question, hits, history, player, env, general, tuning }) {

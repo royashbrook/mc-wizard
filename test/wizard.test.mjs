@@ -255,10 +255,14 @@ test("constrains CLI providers to text-only ephemeral safe mode", () => {
   assert.match(localBridgeScript, /provider === "grok"/);
   assert.match(localBridgeScript, /"--no-memory"/);
   assert.match(localBridgeScript, /"--no-subagents"/);
+  assert.match(localBridgeScript, /"--no-plan"/);
   assert.match(localBridgeScript, /"--disable-web-search"/);
   assert.match(localBridgeScript, /"--output-format", "plain"/);
   assert.match(localBridgeScript, /host = "127\.0\.0\.1"/);
   assert.match(localBridgeScript, /MTOK_TIMEOUT_MS/);
+  assert.match(localBridgeScript, /function isolatedGrokEnvironment/);
+  assert.match(localBridgeScript, /HOME: cleanHome/);
+  assert.match(localBridgeScript, /symlinkSync\(sourceAuth, targetAuth\)/);
   assert.match(localBridgeScript, /let queue = Promise\.resolve\(\)/);
   assert.match(localBridgeScript, /queue = run\.catch/);
   assert.doesNotMatch(localBridgeScript, /writeHead\(429/);
@@ -382,12 +386,19 @@ test("starts a bounded castle gate locally without waiting for a provider", asyn
 });
 
 test("expands a castle follow-up into four complete walls without a provider", async () => {
+  const gate = classifyAction("Build me a castle");
   const action = classifyAction("Make it bigger and give it four walls", [
     { question: "Build me a castle", answer: "I built a small castle gate." },
   ]);
   assert.equal(action.type, "build_plan");
   assert.equal(action.plan.title, "Four Wall Castle");
   assert.equal(validateBuildPlan(action.plan).blocks.length, 94);
+  const gateTargets = new Set(gate.plan.blocks.map(({ target }) => target.join(",")));
+  assert.equal(action.plan.blocks.some(({ target }) => gateTargets.has(target.join(","))), false);
+  const gateBounds = planBounds(gate.plan);
+  const wallBounds = planBounds(action.plan);
+  assert.ok(gateBounds.min[0] <= wallBounds.max[0] && gateBounds.max[0] >= wallBounds.min[0]);
+  assert.ok(gateBounds.min[2] <= wallBounds.max[2] && gateBounds.max[2] >= wallBounds.min[2]);
 });
 
 test("starts a validated prototype when a novel build provider fails", async () => {
@@ -444,7 +455,7 @@ test("executes custom plans through player placement with journaled rollback and
   assert.match(packScript, /function recoverInterruptedTransaction/);
   assert.match(packScript, /function undoLastBuild/);
   assert.match(packScript, /protected spawn area/);
-  assert.match(packScript, /protected by a recent MC Wizard build/);
+  assert.doesNotMatch(packScript, /protected by a recent MC Wizard build/);
   assert.match(packScript, /action\?\.type === "build_plan"/);
   assert.doesNotMatch(packScript, /tryTeleport/);
 });
@@ -501,6 +512,8 @@ test("uses live world state for small talk and ambient Wizard behavior", () => {
   assert.match(packScript, /function worldSmallTalk/);
   assert.match(packScript, /getWeather\(\)/);
   assert.match(packScript, /world\.getTimeOfDay\(\)/);
+  assert.match(packScript, /day or night/);
+  assert.match(packScript, /Minecraft time/);
   assert.match(packScript, /function idleLookAround/);
   assert.match(packScript, /minecraft:redstone_wire/);
 });
@@ -575,10 +588,10 @@ test("keeps the explicit AI route out of character and labels its provider", asy
     logger: { warn() {} },
     fetchImpl: async (url, options) => {
       request = { url, body: JSON.parse(options.body) };
-      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      return new Response(JSON.stringify({ choices: [{ message: { content: `I’ll answer clearly.${JSON.stringify({
         title: "Blue Sky",
         answer: "A normal answer with a complete final sentence.",
-      }) } }] }), {
+      })}` } }] }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });

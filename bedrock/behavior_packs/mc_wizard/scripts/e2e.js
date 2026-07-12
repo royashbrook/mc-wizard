@@ -378,6 +378,69 @@ function calculatorWorldLocation(origin, [x, y, z]) {
   return { x: calculatorOrigin.x - x, y: calculatorOrigin.y + y, z: calculatorOrigin.z - z };
 }
 
+function runOverlappingPlanCheck(kid, origin, onPass, fail) {
+  kid.teleport(
+    { x: origin.x + 0.5, y: origin.y, z: origin.z + 0.5 },
+    { dimension: kid.dimension, facingLocation: { x: origin.x + 0.5, y: origin.y + 1.6, z: origin.z + 10 } },
+  );
+  const location = ([x, z]) => ({ x: origin.x - x, y: origin.y, z: origin.z + 6 + z });
+  const first = [[0, 1], [2, 3]].map(location);
+  const second = [[0, 3], [2, 1]].map(location);
+  const isStone = (target) => kid.dimension.getBlock(target)?.typeId === "minecraft:stone";
+  chatCallbacks.buildValidatedPlan(kid, {
+    title: "E2E overlap first",
+    blocks: [
+      { target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:stone" },
+      { target: [2, 0, 3], support: [2, -1, 3], itemId: "minecraft:stone" },
+    ],
+  });
+  poll(
+    () => first.every(isStone),
+    600,
+    () => {
+      chatCallbacks.buildValidatedPlan(kid, {
+        title: "E2E overlap second",
+        blocks: [
+          { target: [0, 0, 3], support: [0, -1, 3], itemId: "minecraft:stone" },
+          { target: [2, 0, 1], support: [2, -1, 1], itemId: "minecraft:stone" },
+        ],
+      });
+      poll(
+        () => [...first, ...second].every(isStone),
+        600,
+        () => system.runTimeout(() => {
+          if (![...first, ...second].every(isStone)) {
+            fail("the overlapping-bounds plans did not remain physically built");
+            return;
+          }
+          report("CHECK", "overlapping-plan-bounds", "two nonintersecting plans with identical bounds both remained built");
+          if (!chatCallbacks.undoLastBuild(kid)) {
+            fail("the wizard could not undo the second overlapping-bounds plan");
+            return;
+          }
+          system.runTimeout(() => {
+            if (!first.every(isStone)
+              || second.some((target) => kid.dimension.getBlock(target)?.typeId !== "minecraft:air")) {
+              fail("overlapping-bounds cleanup did not preserve the first plan and undo only the second");
+              return;
+            }
+            for (const target of first) kid.dimension.getBlock(target)?.setType("minecraft:air");
+            if (first.some((target) => kid.dimension.getBlock(target)?.typeId !== "minecraft:air")) {
+              fail("overlapping-bounds fixture cleanup left blocks behind");
+              return;
+            }
+            onPass();
+          }, 20);
+        }, 20),
+        "the wizard to finish the second nonintersecting plan inside the first plan's bounds",
+        fail,
+      );
+    },
+    "the wizard to finish the first overlapping-bounds plan",
+    fail,
+  );
+}
+
 function runCustomPlanCheck(kid, origin, transport, fail) {
   if (!chatCallbacks.undoLastBuild(kid)) {
     fail("the wizard could not undo the calculator before the custom-plan check");
@@ -419,11 +482,12 @@ function runCustomPlanCheck(kid, origin, transport, fail) {
           fail("custom-plan undo did not restore the fixture");
           return;
         }
-        Promise.resolve(chatCallbacks.prepareBuildWorkshop(kid)).then((prepared) => {
-          if (!prepared) {
-            fail("the wizard could not prepare an action-first workshop");
-            return;
-          }
+        runOverlappingPlanCheck(kid, origin, () => {
+          Promise.resolve(chatCallbacks.prepareBuildWorkshop(kid)).then((prepared) => {
+            if (!prepared) {
+              fail("the wizard could not prepare an action-first workshop");
+              return;
+            }
           system.runTimeout(() => {
           const location = kid.location;
           const feet = {
@@ -470,7 +534,8 @@ function runCustomPlanCheck(kid, origin, transport, fail) {
             fail,
           );
           }, 20);
-        }).catch((error) => fail(`the action-first workshop rejected: ${error}`));
+          }).catch((error) => fail(`the action-first workshop rejected: ${error}`));
+        }, fail);
       }, 20);
     },
     "the wizard to finish the validated custom plan",

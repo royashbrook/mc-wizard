@@ -4,5 +4,6 @@ node_modules/
 __pycache__/
 runtime/
 graphify-out/
+.headroom-cache/
 *.log
 .DS_Store

@@ -59,7 +59,6 @@ const pendingQuestions = new Map();
 const lastUndo = new Map();
 const placementRetries = new Map();
 const preparedPlacements = new Set();
-const protectedRegions = [];
 const TRANSACTION_JOURNAL = "mcwizard:active_transaction";
 const UNDO_RETENTION_TICKS = 20 * 60 * 10;
 const WORKSHOP_COUNTER = "mcwizard:workshop_counter";
@@ -314,7 +313,8 @@ function worldSmallTalk(player, question) {
   const text = question.trim();
   const asksMood = /\b(?:what(?:’|'| i)s up|how are you|how(?:’|'| i)s it going|you doing)\b/i.test(text);
   const asksWeather = /\b(?:weather|rain|raining|sunny|storm|storming|thunder|sky)\b/i.test(text);
-  if (!asksMood && !asksWeather) return undefined;
+  const asksTime = /\b(?:what time|time is it|day or night|night or day|is it (?:day|night)|daytime|nighttime)\b/i.test(text);
+  if (!asksMood && !asksWeather && !asksTime) return undefined;
   let weather;
   try {
     weather = typeof player.dimension.getWeather === "function" ? player.dimension.getWeather() : undefined;
@@ -326,6 +326,10 @@ function worldSmallTalk(player, question) {
     : time < 12000 ? "daytime"
       : time < 13000 ? "sunset"
         : "night";
+  if (asksTime) {
+    const hour = Math.floor((time / 1000 + 6) % 24);
+    return `It’s ${dayPart} right now—about ${String(hour).padStart(2, "0")}:00 in Minecraft time.`;
+  }
   if (weather === "Thunder") return `That thunder has excellent wizard timing. It’s ${dayPart}, so I’m keeping my wand dry and watching the sky.`;
   if (weather === "Rain") return `It’s raining at ${dayPart}. Good weather for roofs, hidden workshops, and dramatic entrances.`;
   if (weather === "Clear") return `Clear skies at ${dayPart}. I’m doing well and ready to wander, build, or inspect whatever you’re making.`;
@@ -386,33 +390,6 @@ function buildTargetHasEntity(dimension, target) {
     .some((entity) => !isWizardPlayer(entity));
 }
 
-function transactionBounds(locations) {
-  return {
-    min: {
-      x: Math.min(...locations.map((location) => location.x)),
-      y: Math.min(...locations.map((location) => location.y)),
-      z: Math.min(...locations.map((location) => location.z)),
-    },
-    max: {
-      x: Math.max(...locations.map((location) => location.x)),
-      y: Math.max(...locations.map((location) => location.y)),
-      z: Math.max(...locations.map((location) => location.z)),
-    },
-  };
-}
-
-function regionsOverlap(a, b) {
-  return a.min.x <= b.max.x && a.max.x >= b.min.x
-    && a.min.y <= b.max.y && a.max.y >= b.min.y
-    && a.min.z <= b.max.z && a.max.z >= b.min.z;
-}
-
-function pruneProtectedRegions() {
-  for (let index = protectedRegions.length - 1; index >= 0; index -= 1) {
-    if (protectedRegions[index].expiresTick <= system.currentTick) protectedRegions.splice(index, 1);
-  }
-}
-
 function beginTransaction(playerId, token, dimension, expectedBlocks) {
   const unique = new Map(expectedBlocks.map(({ location }) => [
     `${location.x},${location.y},${location.z}`,
@@ -420,11 +397,6 @@ function beginTransaction(playerId, token, dimension, expectedBlocks) {
   ]));
   const locations = [...unique.values()];
   if (!locations.length || locations.length > 400) throw new Error("build transaction is outside the 1-400 block limit");
-  const bounds = transactionBounds(locations);
-  pruneProtectedRegions();
-  if (protectedRegions.some((region) => region.dimensionId === dimension.id && regionsOverlap(region.bounds, bounds))) {
-    throw new Error("that area is protected by a recent MC Wizard build; undo it or build elsewhere");
-  }
   const protectedRadius = Number(variable("mc_wizard_protected_spawn_radius", 0)) || 0;
   if (protectedRadius > 0 && dimension.id === "minecraft:overworld") {
     const spawn = world.getDefaultSpawnLocation();
@@ -445,7 +417,6 @@ function beginTransaction(playerId, token, dimension, expectedBlocks) {
     playerId,
     token,
     dimensionId: dimension.id,
-    bounds,
     snapshots,
     expectedBlocks,
   };
@@ -480,12 +451,6 @@ function commitTransaction(token) {
     ...transaction,
     expiresTick: system.currentTick + UNDO_RETENTION_TICKS,
   });
-  protectedRegions.push({
-    playerId: transaction.playerId,
-    dimensionId: transaction.dimensionId,
-    bounds: transaction.bounds,
-    expiresTick: system.currentTick + UNDO_RETENTION_TICKS,
-  });
   world.setDynamicProperty(TRANSACTION_JOURNAL, undefined);
   activeTransaction = undefined;
 }
@@ -503,9 +468,6 @@ function undoLastBuild(player) {
   }
   restoreSnapshots(transaction);
   lastUndo.delete(player.id);
-  for (let index = protectedRegions.length - 1; index >= 0; index -= 1) {
-    if (protectedRegions[index].playerId === player.id) protectedRegions.splice(index, 1);
-  }
   speak(player, "Undone. I restored every block from before my last build.");
   return true;
 }

@@ -1,5 +1,8 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
+import { existsSync, mkdirSync, symlinkSync } from "node:fs";
+import { homedir } from "node:os";
+import path from "node:path";
 import { httpUpstream, serveChat } from "mtok-bridge";
 
 const host = "127.0.0.1";
@@ -8,9 +11,21 @@ const provider = process.env.MTOK_PROVIDER || "claude";
 const model = process.env.MTOK_MODEL || provider;
 const timeoutMs = Math.min(Math.max(Number(process.env.MTOK_TIMEOUT_MS) || 18_000, 5_000), 30_000);
 let queue = Promise.resolve();
+const grokEnv = provider === "grok" ? isolatedGrokEnvironment() : process.env;
 const upstream = provider === "ollama"
   ? httpUpstream({ baseUrl: process.env.MTOK_UPSTREAM || "http://127.0.0.1:11434/v1" })
   : provider === "grok" ? grokUpstream : claudeUpstream;
+
+function isolatedGrokEnvironment() {
+  const cleanHome = path.resolve(process.env.MTOK_GROK_HOME || "runtime/provider-home");
+  const sourceAuth = path.join(homedir(), ".grok", "auth.json");
+  const grokDirectory = path.join(cleanHome, ".grok");
+  const targetAuth = path.join(grokDirectory, "auth.json");
+  if (!existsSync(sourceAuth)) throw new Error(`Grok is not logged in: missing ${sourceAuth}`);
+  mkdirSync(grokDirectory, { recursive: true, mode: 0o700 });
+  if (!existsSync(targetAuth)) symlinkSync(sourceAuth, targetAuth);
+  return { ...process.env, HOME: cleanHome };
+}
 
 function cliInput(payload) {
   return {
@@ -74,13 +89,14 @@ function grokUpstream(payload) {
       "--cwd", "/private/tmp",
       "--no-memory",
       "--no-subagents",
+      "--no-plan",
       "--disable-web-search",
       "--tools", "",
-      "--max-turns", "1",
+      "--max-turns", "3",
       "--output-format", "plain",
       "--system-prompt-override", systemPrompt || "Answer clearly and use no tools.",
       "--verbatim",
-    ], { cwd: "/private/tmp", env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    ], { cwd: "/private/tmp", env: grokEnv, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     let errorOutput = "";
     let timedOut = false;
