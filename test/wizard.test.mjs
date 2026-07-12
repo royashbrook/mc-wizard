@@ -212,8 +212,20 @@ test("routes explicit AI chat from anywhere and delivers long answers as signed 
   assert.match(packScript, /minecraft:writable_book/);
   assert.match(packScript, /component\.setContents/);
   assert.match(packScript, /component\.signBook/);
+  assert.match(packScript, /bookTitle\(payload\.title \|\| question\)/);
   assert.match(packScript, /player\.dimension\.spawnItem/);
   assert.doesNotMatch(packScript, /Let me check my Bedrock notes/);
+});
+
+test("moves blocked builds to a fresh workshop and queues busy requests", () => {
+  assert.match(packScript, /function prepareBuildWorkshop/);
+  assert.match(packScript, /player\.teleport/);
+  assert.match(packScript, /grass_block/);
+  assert.match(packScript, /function queueBuild/);
+  assert.match(e2eScript, /action-first-workshop/);
+  assert.match(e2eScript, /prepareBuildWorkshop/);
+  assert.doesNotMatch(packScript, /Move to an open area and ask again/);
+  assert.doesNotMatch(packScript, /Move to a flat field and ask again/);
 });
 
 test("creates readable book pages and whole-word titles", () => {
@@ -466,7 +478,10 @@ test("keeps the explicit AI route out of character and labels its provider", asy
     logger: { warn() {} },
     fetchImpl: async (url, options) => {
       request = { url, body: JSON.parse(options.body) };
-      return new Response(JSON.stringify({ choices: [{ message: { content: "A normal answer." } }] }), {
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        title: "Blue Sky",
+        answer: "A normal answer with a complete final sentence.",
+      }) } }] }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -475,11 +490,15 @@ test("keeps the explicit AI route out of character and labels its provider", asy
   const result = await modelWizard.ask({ player: "BuilderKid", question: "Why is the sky blue?", mode: "general" });
   assert.equal(request.url, "http://127.0.0.1:8790/v1/chat/completions");
   assert.match(request.body.messages[0].content, /Do not roleplay as MC Wizard/);
+  assert.match(request.body.messages[0].content, /between 3 and 16 characters/);
+  assert.match(request.body.messages[0].content, /finish the final sentence/);
   assert.doesNotMatch(request.body.messages[1].content, /Retrieved sources/);
   assert.equal(result.kind, "general");
   assert.equal(result.label, "Ollama");
   assert.equal(result.action, null);
   assert.deepEqual(result.sources, []);
+  assert.equal(result.title, "Blue Sky");
+  assert.equal(result.answer, "A normal answer with a complete final sentence.");
 });
 
 test("lets the model select only registered Wizard skills and carries session history", async () => {

@@ -419,14 +419,37 @@ function runCustomPlanCheck(kid, origin, transport, fail) {
           fail("custom-plan undo did not restore the fixture");
           return;
         }
-        report(
-          "PASS",
-          "two-bit-redstone-calculator",
-          `request via ${transport}; book delivery, transaction undo, custom orientation, one lever click, and all 16 player-powered sums verified`,
-        );
-        try {
-          kid.disconnect();
-        } catch {}
+        Promise.resolve(chatCallbacks.prepareBuildWorkshop(kid)).then((prepared) => {
+          if (!prepared) {
+            fail("the wizard could not prepare an action-first workshop");
+            return;
+          }
+          system.runTimeout(() => {
+          const location = kid.location;
+          const feet = {
+            x: Math.floor(location.x),
+            y: Math.round(location.y),
+            z: Math.floor(location.z),
+          };
+          const ground = { ...feet, y: feet.y - 1 };
+          if (kid.dimension.id !== "minecraft:overworld"
+            || Math.abs(location.y - 256) > 1
+            || kid.dimension.getBlock(ground)?.typeId !== "minecraft:grass_block"
+            || kid.dimension.getBlock(feet)?.typeId !== "minecraft:air") {
+            fail(`the action-first workshop failed validation: dimension=${kid.dimension.id}; location=${JSON.stringify(location)}; ground=${kid.dimension.getBlock(ground)?.typeId}; feet=${kid.dimension.getBlock(feet)?.typeId}`);
+            return;
+          }
+          report("CHECK", "action-first-workshop", "player teleported to a clear grass build pad");
+          report(
+            "PASS",
+            "two-bit-redstone-calculator",
+            `request via ${transport}; book delivery, transaction undo, custom orientation, workshop relocation, one lever click, and all 16 player-powered sums verified`,
+          );
+          try {
+            kid.disconnect();
+          } catch {}
+          }, 20);
+        }).catch((error) => fail(`the action-first workshop rejected: ${error}`));
       }, 20);
     },
     "the wizard to finish the validated custom plan",
@@ -572,6 +595,7 @@ export function startE2E(callbacks) {
     || typeof callbacks?.undoLastBuild !== "function"
     || typeof callbacks?.hasCommittedBuild !== "function"
     || typeof callbacks?.buildValidatedPlan !== "function"
+    || typeof callbacks?.prepareBuildWorkshop !== "function"
     || typeof callbacks?.deliverTestBook !== "function") {
     report("FAIL", "configuration", "shared chat router callbacks are required");
     return;
