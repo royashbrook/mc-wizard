@@ -533,6 +533,40 @@ test("lets the model select only registered Wizard skills and carries session hi
   assert.match(requests[1].messages[1].content, /I’ll build the calculator now/);
 });
 
+test("retries a promised build until the provider supplies a safe action", async () => {
+  const requests = [];
+  const actionWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "claude", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async (_url, options) => {
+      requests.push(JSON.parse(options.body));
+      const content = requests.length === 1
+        ? JSON.stringify({ answer: "I’ll build a small tower now.", action: null })
+        : JSON.stringify({
+            answer: "I’ll start with a small stone castle tower.",
+            action: {
+              type: "build_plan",
+              version: 1,
+              plan: {
+                title: "Castle tower",
+                blocks: [{ target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:stone" }],
+              },
+            },
+          });
+      return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const result = await actionWizard.ask({ player: "Kid", question: "Build me a giant castle" });
+  assert.equal(requests.length, 2);
+  assert.match(requests[1].messages[1].content, /Action contract correction/);
+  assert.equal(result.action.type, "build_plan");
+  assert.match(result.answer, /castle tower/i);
+});
+
 test("persists bounded separate sessions without plaintext player identity", async () => {
   const directory = await mkdtemp(join(tmpdir(), "mc-wizard-session-"));
   const filePath = join(directory, "sessions.json");

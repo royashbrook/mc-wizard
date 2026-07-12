@@ -25,8 +25,8 @@ const checks = [
   ["described build", "Build me a switch whose output changes every time I press a button.", (result) => (
     result.action?.id === "copper_bulb_t_flip_flop"
   )],
-  ["unsupported build", "Build me a giant castle right now.", (result) => result.action === null
-    && /calculator|flip-flop/i.test(result.answer)],
+  ["oversized build", "Build me a giant castle right now.", (result) => result.action?.type === "build_plan"
+    && /castle|tower|miniature|section/i.test(result.answer)],
 ];
 
 let failed = 0;
