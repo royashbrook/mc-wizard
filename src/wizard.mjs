@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { allowedWizardAction, wizardSkillPrompt } from "./skills.mjs";
+import { createMemorySessionStore } from "./sessions.mjs";
+import { safeCommandRefusal, unsafeCommandAnswer } from "./command-safety.mjs";
 
 const SYSTEM_PROMPT = `You are MC Wizard: a clever, warm Minecraft Bedrock mentor for children and families.
 Sound like a capable person in the world, not a search engine. Lead with the direct answer. Use short sentences and concrete steps a nine-year-old can follow.
@@ -34,6 +36,13 @@ function isTFlipFlopQuestion(question) {
 function isCalculatorQuestion(question) {
   return /\b(?:calculator|binary\s+adder|full\s+adder)\b/i.test(question)
     || /\badd(?:ing)?\b.{0,50}\b(?:numbers?|binary|redstone)\b/i.test(question);
+}
+
+function isOrdinaryConversation(question) {
+  const text = question.trim();
+  return /^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
+    || /^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
+    || /\b(?:who are you|what can you do|tell me (?:a )?joke|how are you|what do you think|weather)\b/i.test(text);
 }
 
 export function classifyAction(question) {
@@ -202,27 +211,35 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   }
   const answer = responseText(await response.json(), provider.style).trim();
   if (!answer) throw new Error("AI provider returned no text");
-  return answer.slice(0, general ? 12_000 : 1_200);
+  return answer.slice(0, general ? 12_000 : 24_000);
 }
 
-export function createWizard({ corpus, env = process.env, fetchImpl = fetch, logger = console } = {}) {
+export function createWizard({
+  corpus,
+  env = process.env,
+  fetchImpl = fetch,
+  logger = console,
+  sessions = createMemorySessionStore(),
+} = {}) {
   if (!corpus) throw new Error("createWizard requires a corpus");
   const provider = providerFrom(env);
-  const histories = new Map();
 
   return {
     provider: provider.name,
+    clearSession(player, mode = "wizard") {
+      return sessions.delete(player, mode);
+    },
     async ask({ question, player = "anonymous", mode: requestMode = "wizard" }) {
       const general = requestMode === "general";
-      const historyKey = `${requestMode}:${player}`;
-      const history = histories.get(historyKey) || [];
+      const history = sessions.get(player, requestMode);
       const includePreview = /\b(beta|preview|experimental)\b/i.test(question);
-      const retrievalQuery = general ? "" : isTFlipFlopQuestion(question)
+      const conversational = !general && isOrdinaryConversation(question);
+      const retrievalQuery = general || conversational ? "" : isTFlipFlopQuestion(question)
         ? `${question} copper bulb t flip flop comparator toggle`
         : isCalculatorQuestion(question)
           ? `${question} binary redstone calculator two bit full adder carry lamps`
           : question;
-      const rankedHits = general ? [] : corpus.search(retrievalQuery, { limit: 4, includePreview });
+      const rankedHits = general || conversational ? [] : corpus.search(retrievalQuery, { limit: 4, includePreview });
       const relevanceFloor = (rankedHits[0]?.score || 0) * 0.5;
       const hits = rankedHits.filter((hit) => hit.score >= relevanceFloor);
       const action = general ? null : classifyAction(question);
@@ -236,7 +253,11 @@ export function createWizard({ corpus, env = process.env, fetchImpl = fetch, log
           const providerAnswer = await askProvider({ provider, fetchImpl, question, hits, history, player, env, general });
           const envelope = general ? undefined : wizardEnvelope(providerAnswer);
           answer = envelope?.answer || providerAnswer;
-          if (envelope) selectedAction = envelope.action;
+          if (envelope) selectedAction = envelope.action || action;
+          if (!general && unsafeCommandAnswer(answer)) {
+            answer = safeCommandRefusal();
+            selectedAction = null;
+          }
           responseMode = provider.name;
         } catch (error) {
           logger.warn(`[wizard] ${error.message}; using offline answer`);
@@ -249,7 +270,7 @@ export function createWizard({ corpus, env = process.env, fetchImpl = fetch, log
         version: hit.version,
         channel: hit.channel,
       }])).values()].slice(0, 3);
-      histories.set(historyKey, [...history, { question, answer }].slice(-12));
+      await sessions.set(player, requestMode, [...history, { question, answer }]);
       return {
         answer,
         action: selectedAction,

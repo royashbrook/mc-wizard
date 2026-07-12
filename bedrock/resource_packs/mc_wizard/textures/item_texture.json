@@ -1,0 +1,8 @@
+{
+  "resource_pack_name": "mc_wizard",
+  "texture_name": "atlas.items",
+  "texture_data": {
+    "mcwizard_hat": { "textures": "textures/items/wizard_hat" },
+    "mcwizard_robe": { "textures": "textures/items/wizard_robe" }
+  }
+}

@@ -15,7 +15,7 @@ iPad / Bedrock chat
   → MC Wizard walks, looks, chats, holds, and places the approved blocks
 ```
 
-Status: the Node brain, 30,877-chunk corpus, HTTP bridge, provider adapters, Apple-container BDS, fresh Beta-APIs world, behavior pack, two visible `SimulatedPlayer` entities, addressed engine chat, brain requests, and typed build actions have all been observed locally. The headless run passes the Wizard's complete 334-action calculator build, scaffold cleanup, one Test Kid lever raycast, and all 16 sums. The five-part T-flip-flop build passes structurally, but BDS 1.26.33.2 does not toggle its copper-bulb `lit` state through the synthetic pulse, so real iPad interaction remains its acceptance test.
+Status: the Node brain, persistent bounded dialogue sessions, provider bridge, versioned RAG promotion, Apple-container BDS, behavior/resource packs, embodied `SimulatedPlayer`, safe typed plans, transaction rollback/undo, and isolated headless world runner are implemented. The physical 334-action calculator acceptance run is intentionally slow because the Wizard navigates within reach and uses an inventory item for every placement. BDS 1.26.33.2 still does not toggle a copper bulb's `lit` state through the synthetic pulse, so that one interaction remains an iPad acceptance check.
 
 Ask `wizard, build me something that changes every time I press a button` and the brain returns a kid-friendly explanation, cites the retrieved material, and emits the typed action for a Bedrock copper-bulb T flip-flop. The visible MC Wizard is designed to walk to the demonstration site and place the approved blocks once the BDS prerequisite above is available.
 
@@ -28,8 +28,9 @@ Ask `wizard, build me something that changes every time I press a button` and th
 - A current Bedrock 26.30+ behavior pack using `@minecraft/server`, `@minecraft/server-gametest`, `@minecraft/server-net`, and `@minecraft/server-admin`.
 - A visible, server-created MC Wizard based on Bedrock's official [`SimulatedPlayer`](https://learn.microsoft.com/en-us/minecraft/creator/scriptapi/minecraft/server-gametest/simulatedplayer?view=minecraft-bedrock-experimental), which extends `Player` and can walk, look, chat, hold items, and perform player block interactions.
 - Two real build actions performed through the embodied wizard's player APIs: a bounded copper-bulb T flip-flop and a two-bit redstone calculator.
-- A safe action boundary: model prose cannot become commands or JavaScript. The behavior pack recognizes one exact action ID and runs fixed code.
-- A pack installer that preserves other activated behavior packs in an existing BDS world.
+- A safe action boundary: model prose cannot become commands or JavaScript. Fixed skills and bounded validated build plans are the only executable output.
+- Journaled snapshots, rollback on failure/disconnect/restart, recent-build protection, and `wizard undo`.
+- A pack installer that preserves other activated packs and installs the Wizard's visible hat-and-robe resource pack.
 
 ## Run the brain
 
@@ -42,6 +43,16 @@ npm run hooks:install
 npm test
 npm start
 ```
+
+For the prepared local stack, one supervisor owns the provider bridge, brain, and Bedrock container with bounded restart backoff:
+
+```bash
+npm run wizard:start
+npm run wizard:status
+npm run wizard:stop
+```
+
+Status reports only service health, provider name, and corpus size; it does not print tokens, prompts, player identifiers, or credentials.
 
 Commits are issue-driven. The tracked `commit-msg` hook rejects messages without a reference to an existing issue in this repository. Use a message such as `Improve dialogue sessions (Refs #8)`.
 
@@ -94,8 +105,9 @@ This command:
 
 1. shallow-clones or updates `MicrosoftDocs/minecraft-creator` under ignored `.cache/`;
 2. caches stable and preview changelogs into separate directories;
-3. records the documentation commit and sync time;
-4. lets the service index the new Markdown on its next start.
+3. builds a staged stable/preview Bedrock release with revision, version, attribution, and content hashes;
+4. runs retrieval and dialogue smoke evaluations;
+5. atomically promotes the staged release only if every evaluation passes.
 
 It requires Git and internet access. The first sync downloads roughly 8,800 repository files plus 712 changelog articles. The resulting `.cache/` is intentionally ignored: this workspace currently indexes 30,876 chunks, but a fresh clone must run `npm run sync:docs` to recreate that corpus. Before syncing, only the four authored mechanic cards are available.
 
@@ -113,7 +125,7 @@ The behavior pack uses beta chat, HTTP, and [`@minecraft/server-gametest`](https
 
 When a real player joins, the behavior pack is set up to spawn one `MC Wizard` near that player. This is a server-side `SimulatedPlayer`, not a custom mob wearing a player-shaped model: it is an actual subclass of Bedrock's `Player`. It uses the normal player rendering path and can navigate, turn to look at a child, speak under its own name, carry selected items, and place or interact with blocks as a player.
 
-The embodiment does not need a separate resource pack or a second Xbox/Microsoft account. It does require the behavior pack, a Beta-APIs-enabled world, and the pre-release GameTest Script API. These capabilities are documented by Microsoft, but they have not yet been observed from an iPad against this spike's BDS world.
+The embodiment does not need a second Xbox/Microsoft account. The companion resource pack renders a purple hat and robe; if it fails to load, the same visible player, name tag, held blaze rod, and vanilla armor fallback remain. It requires a Beta-APIs-enabled world and the pre-release GameTest Script API.
 
 Address the character in chat:
 
@@ -214,7 +226,7 @@ The pack can run its real chat-to-build path without an Xbox login. With the bra
 npm run test:e2e:bds
 ```
 
-It installs the gated harness with a unique run ID, launches a unique Apple container with no published port, and always stops/deletes that container and disables the gate afterward. Raw BDS output is saved to ignored `runtime/bedrock/e2e-last.log`.
+It bootstraps a fresh Beta-APIs world under a unique `runtime/e2e/<run-id>` data root, launches a unique Apple container with no published port, and always stops/deletes that container. A passing world is deleted; a failing world is retained for diagnosis. Raw BDS output is saved to ignored `runtime/e2e-last.log`.
 
 The test creates a disposable pad away from spawn and spawns a uniquely named Test Kid as a second official `SimulatedPlayer`. Test Kid first attempts each request with `SimulatedPlayer.chat`. If BDS does not surface that call through `world.beforeEvents.chatSend`, the harness detects the missing event after ten ticks and invokes the exact same addressed-message parser/router directly. Every run reports `engine-event` or `direct-harness-fallback`, so a passing build test never falsely claims that simulated chat reached the engine listener. It then checks the wizard's five-part T flip-flop, asks for the two-bit calculator, and verifies one real Test Kid lever raycast. Because BDS eventually ignores repeated SimulatedPlayer lever clicks, the isolated fixture removes those four levers and Test Kid physically places or breaks redstone blocks at the exact input positions while all 16 electrical sums are read from the output lamps. It emits one correlated `MC_WIZARD_E2E` PASS/FAIL record and disconnects. Real iPad chat always uses the engine listener; the direct chat route exists only inside the gated headless harness.
 
@@ -264,9 +276,9 @@ Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not 
 
 ## Known limits of this spike
 
-- The automated Node tests and HTTP bridge pass, and BDS has created both SimulatedPlayers and routed Test Kid's addressed chat to the brain. Neither character has yet been seen or controlled from an iPad.
-- The T flip-flop and two-bit calculator actions have no undo. They require bounded, clear natural-ground areas and refuse occupied or constructed sites. Complete player-style placement and the calculator truth table pass headlessly; the T-flip-flop's real-client copper-bulb transition still needs the iPad check.
-- The current documented Script API cannot program command-block command text dynamically. Prepared `.mcstructure` lessons can preserve command-block data; novel lessons must place the wiring and tell the child what to paste, or emulate the behavior in script.
+- The live iPad test verified the visible player entity, chat, AI books, and basic mechanics. The new costume silhouette and the T-flip-flop's real-client copper-bulb transition still need a quick iPad visual check.
+- The T flip-flop, calculator, command lessons, and validated plans are transactional and undoable. They require bounded clear areas, reject occupied/protected overlaps, and roll back on failure or disconnect.
+- The current documented Script API cannot safely program arbitrary command-block text. Prepared lesson definitions make the Wizard physically place the command block and button, then tell the child exactly what to paste; they deliberately do not `/structure load` a prebuilt result.
 - Official Microsoft documentation is not a complete gameplay encyclopedia. Fill gaps with versioned, self-authored mechanic cards backed by reproducible Bedrock tests. Do not ingest the community wiki by default without accepting its attribution, noncommercial, and share-alike requirements.
 - There is no parental-control UI, durable child-chat audit policy, per-world protected region, undo transaction, semantic cache, embedding index, or retrieval evaluation set yet. The current E2E harness covers the in-world vertical slice only.
 
@@ -276,8 +288,8 @@ MC Wizard is released under the [MIT License](./LICENSE). Microsoft Minecraft do
 
 ## Next proof points
 
-1. Complete the iPad/BDS acceptance checklist above, including the real-client copper-bulb transition.
-2. Add restart/backup recovery checks for the explicitly open private-LAN server.
-3. Add undo/protected regions before any larger build action.
+1. Complete the remaining iPad visual checks for the costume and real-client copper-bulb transition.
+2. Add a scheduled world-backup restore drill for the explicitly open private-LAN server.
+3. Expand the evaluated mechanic-card catalog before broadening the arbitrary-plan block allowlist.
 4. Replace or separately license the calculator geometry before commercial distribution.
 5. Build a retrieval eval set from real questions from one Bedrock-playing child; add embeddings only if the lexical baseline misses them.

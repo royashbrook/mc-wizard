@@ -6,7 +6,7 @@ import { calculatorResult, createCalculatorBlueprint } from "./calculator.js";
 const TEST_TAG = "mcwizard:e2e";
 const TICKING_AREA = "mc_wizard_e2e";
 const POLL_TICKS = 10;
-const TIMEOUT_TICKS = 600;
+const TIMEOUT_TICKS = 1_200;
 let runId = "";
 let testName = "";
 let chatCallbacks;
@@ -190,12 +190,15 @@ async function drivePulseAsPlayer(kid, bulb) {
 }
 
 async function preparePad(dimension) {
+  dimension.runCommand("gamerule domobspawning false");
   const spawn = world.getDefaultSpawnLocation();
   const x = Math.floor(spawn.x) + 16;
   const z = Math.floor(spawn.z) + 16;
   const top = dimension.getTopmostBlock({ x, z });
   if (!top) throw new Error("the E2E pad chunk did not load");
-  const y = Math.min(top.location.y + 1, 310);
+  // Build the disposable fixture above the terrain and liquid surface so
+  // delayed ocean ticks cannot recreate water inside the player-build area.
+  const y = Math.min(top.location.y + 10, 300);
   let padReady = false;
   for (let attempt = 0; attempt < 3 && !padReady; attempt += 1) {
     dimension.runCommand(
@@ -204,6 +207,16 @@ async function preparePad(dimension) {
     dimension.runCommand(
       `fill ${x - 8} ${y} ${z - 3} ${x + 8} ${y + 6} ${z + 22} air replace`,
     );
+    // The disposable fixture may spawn in an ocean. Normalize each test-pad
+    // block because liquid ticks can survive a successful fill command.
+    for (let padX = x - 8; padX <= x + 8; padX += 1) {
+      for (let padZ = z - 3; padZ <= z + 22; padZ += 1) {
+        dimension.getBlock({ x: padX, y: y - 1, z: padZ })?.setType("minecraft:stone");
+        for (let padY = y; padY <= y + 6; padY += 1) {
+          dimension.getBlock({ x: padX, y: padY, z: padZ })?.setType("minecraft:air");
+        }
+      }
+    }
     await system.waitTicks(2);
     padReady = [
       { x, z: z + 5 },
@@ -230,6 +243,24 @@ async function preparePad(dimension) {
     throw new Error("the E2E pad floor did not persist");
   }
   return { x, y, z };
+}
+
+function undoTFlipFlop(kid, expected, onPass, fail) {
+  if (!chatCallbacks.undoLastBuild(kid)) {
+    fail("the wizard could not undo its T flip-flop before the calculator test");
+    return;
+  }
+  system.runTimeout(() => {
+    const remaining = expected.filter(([location]) => (
+      kid.dimension.getBlock(location)?.typeId !== "minecraft:air"
+    ));
+    if (remaining.length) {
+      fail(`undo left ${remaining.length} T flip-flop blocks behind`);
+      return;
+    }
+    report("CHECK", "transaction-undo", "the wizard restored its first build before starting the calculator");
+    onPass();
+  }, 20);
 }
 
 function runTFlipFlopCheck(kid, origin, onPass) {
@@ -263,7 +294,8 @@ function runTFlipFlopCheck(kid, origin, onPass) {
     "wizard, build a t flip flop for me",
     "t-flip-flop",
     (transport) => poll(
-      () => expected.every(([location, typeId]) => dimension.getBlock(location)?.typeId === typeId),
+      () => chatCallbacks.hasCommittedBuild(kid.id)
+        && expected.every(([location, typeId]) => dimension.getBlock(location)?.typeId === typeId),
       TIMEOUT_TICKS,
       async () => {
         const wizard = world.getAllPlayers().find((player) => (
@@ -288,8 +320,7 @@ function runTFlipFlopCheck(kid, origin, onPass) {
             "copper-bulb-runtime-limit",
             "the automated player pulse did not toggle the bulb; calculator test continues separately",
           );
-          for (const [location] of expected) dimension.getBlock(location)?.setType("minecraft:air");
-          system.runTimeout(onPass, 220);
+          undoTFlipFlop(kid, expected, () => system.runTimeout(onPass, 200), fail);
           return;
         }
         if (dimension.getBlock(bulb)?.permutation.getState("lit") !== true) {
@@ -298,8 +329,7 @@ function runTFlipFlopCheck(kid, origin, onPass) {
             "copper-bulb-runtime-limit",
             "player pulse reached and released the bulb, but BDS 1.26.33.2 did not toggle its lit state",
           );
-          for (const [location] of expected) dimension.getBlock(location)?.setType("minecraft:air");
-          system.runTimeout(onPass, 220);
+          undoTFlipFlop(kid, expected, () => system.runTimeout(onPass, 200), fail);
           return;
         }
         poll(
@@ -326,8 +356,7 @@ function runTFlipFlopCheck(kid, origin, onPass) {
                   "visible-player-t-flip-flop",
                   `request via ${transport}; embodiment, placement, and two pulses verified`,
                 );
-                for (const [location] of expected) dimension.getBlock(location)?.setType("minecraft:air");
-                system.runTimeout(onPass, 220);
+                undoTFlipFlop(kid, expected, () => system.runTimeout(onPass, 200), fail);
               },
               "the second pulse to turn the output off",
               fail,
@@ -347,6 +376,62 @@ function runTFlipFlopCheck(kid, origin, onPass) {
 function calculatorWorldLocation(origin, [x, y, z]) {
   const calculatorOrigin = { x: origin.x + 5, y: origin.y, z: origin.z + 18 };
   return { x: calculatorOrigin.x - x, y: calculatorOrigin.y + y, z: calculatorOrigin.z - z };
+}
+
+function runCustomPlanCheck(kid, origin, transport, fail) {
+  if (!chatCallbacks.undoLastBuild(kid)) {
+    fail("the wizard could not undo the calculator before the custom-plan check");
+    return;
+  }
+  kid.teleport(
+    { x: origin.x + 0.5, y: origin.y, z: origin.z + 0.5 },
+    { dimension: kid.dimension, facingLocation: { x: origin.x + 0.5, y: origin.y + 1.6, z: origin.z + 10 } },
+  );
+  const customOrigin = { x: origin.x, y: origin.y, z: origin.z + 6 };
+  const stone = customOrigin;
+  const log = { x: customOrigin.x - 1, y: customOrigin.y, z: customOrigin.z };
+  chatCallbacks.buildValidatedPlan(kid, {
+    title: "E2E orientation lesson",
+    blocks: [
+      { target: [0, 0, 0], support: [0, -1, 0], itemId: "minecraft:smooth_stone" },
+      { target: [1, 0, 0], support: [0, 0, 0], itemId: "minecraft:oak_log" },
+    ],
+  });
+  poll(
+    () => chatCallbacks.hasCommittedBuild(kid.id)
+      && kid.dimension.getBlock(stone)?.typeId === "minecraft:smooth_stone"
+      && kid.dimension.getBlock(log)?.typeId === "minecraft:oak_log",
+    1_200,
+    () => {
+      const axis = kid.dimension.getBlock(log)?.permutation.getState("pillar_axis");
+      if (axis !== "x") {
+        fail(`custom-plan log axis was ${axis}, expected x`);
+        return;
+      }
+      report("CHECK", "validated-custom-plan", "support order, player placement, and horizontal log orientation passed");
+      if (!chatCallbacks.undoLastBuild(kid)) {
+        fail("the wizard could not undo the custom-plan check");
+        return;
+      }
+      system.runTimeout(() => {
+        if (kid.dimension.getBlock(stone)?.typeId !== "minecraft:air"
+          || kid.dimension.getBlock(log)?.typeId !== "minecraft:air") {
+          fail("custom-plan undo did not restore the fixture");
+          return;
+        }
+        report(
+          "PASS",
+          "two-bit-redstone-calculator",
+          `request via ${transport}; book delivery, transaction undo, custom orientation, one lever click, and all 16 player-powered sums verified`,
+        );
+        try {
+          kid.disconnect();
+        } catch {}
+      }, 20);
+    },
+    "the wizard to finish the validated custom plan",
+    fail,
+  );
 }
 
 function runCalculatorTruthTable(kid, origin, blueprint, transport, fail) {
@@ -371,14 +456,8 @@ function runCalculatorTruthTable(kid, origin, blueprint, transport, fail) {
         fail(mismatches.join("; "));
         return;
       }
-      report(
-        "PASS",
-        "two-bit-redstone-calculator",
-        `request via ${transport}; one lever click and all 16 player-powered sums verified without a human login`,
-      );
-      try {
-        kid.disconnect();
-      } catch {}
+      report("CHECK", "calculator-truth-table", "all 16 player-powered sums matched the three output lamps");
+      system.runTimeout(() => runCustomPlanCheck(kid, origin, transport, fail), 20);
       return;
     }
     const [a, b] = cases[index];
@@ -443,7 +522,7 @@ function runCalculatorCheck(kid, origin) {
         const types = Array.isArray(typeId) ? typeId : [typeId];
         return types.includes(kid.dimension.getBlock(location)?.typeId);
       }),
-      9_000,
+      30_000,
       () => {
         const consoleLocation = calculatorWorldLocation(origin, [5, 0, 13]);
         kid.teleport(
@@ -489,7 +568,11 @@ export function startE2E(callbacks) {
   }
   testName = `WizKid-${runId.slice(0, 8)}`;
   if (typeof callbacks?.routeAddressedMessage !== "function"
-    || typeof callbacks?.engineAddressedMessageCount !== "function") {
+    || typeof callbacks?.engineAddressedMessageCount !== "function"
+    || typeof callbacks?.undoLastBuild !== "function"
+    || typeof callbacks?.hasCommittedBuild !== "function"
+    || typeof callbacks?.buildValidatedPlan !== "function"
+    || typeof callbacks?.deliverTestBook !== "function") {
     report("FAIL", "configuration", "shared chat router callbacks are required");
     return;
   }
@@ -522,10 +605,31 @@ export function startE2E(callbacks) {
           { x: origin.x + 0.5, y: origin.y, z: origin.z + 0.5 },
           { dimension },
         );
-        system.runTimeout(
-          () => runTFlipFlopCheck(kid, origin, () => runCalculatorCheck(kid, origin)),
-          20,
-        );
+        callbacks.deliverTestBook(kid);
+        system.runTimeout(() => {
+          const droppedBooks = dimension.getEntities({ type: "minecraft:item", location: kid.location, maxDistance: 5 })
+            .map((entity) => entity.getComponent("minecraft:item")?.itemStack)
+            .filter(Boolean);
+          const inventory = kid.getComponent("minecraft:inventory")?.container;
+          const carriedBooks = [];
+          for (let slot = 0; inventory && slot < inventory.size; slot += 1) {
+            const item = inventory.getItem(slot);
+            if (item) carriedBooks.push(item);
+          }
+          const book = [...droppedBooks, ...carriedBooks]
+            .find((item) => /minecraft:(?:written|writable)_book/.test(item.typeId || "")
+              && item.getComponent("minecraft:book")?.title);
+          if (!book) {
+            report("FAIL", "book-delivery", "the long-answer book was not dropped at Test Kid's feet");
+            try { kid.disconnect(); } catch {}
+            return;
+          }
+          report("CHECK", "book-delivery", "the real long-answer path dropped a signed written book");
+          system.runTimeout(
+            () => runTFlipFlopCheck(kid, origin, () => runCalculatorCheck(kid, origin)),
+            20,
+          );
+        }, 20);
       } catch (error) {
         report("FAIL", "visible-player-t-flip-flop", String(error));
         try {

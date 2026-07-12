@@ -2,6 +2,7 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer as createNodeServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import { loadCorpus } from "./rag.mjs";
+import { createFileSessionStore } from "./sessions.mjs";
 import { createWizard } from "./wizard.mjs";
 
 const MAX_BODY_BYTES = 16 * 1024;
@@ -83,6 +84,20 @@ export function createHttpServer({ wizard, corpus, token, maxConcurrent = 4, coo
       });
       return;
     }
+    if (request.method === "DELETE" && url.pathname === "/v1/session") {
+      if (!authorized(request, token)) {
+        sendJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      try {
+        const { player, mode } = validateAskBody({ ...(await readJson(request)), question: "delete" });
+        const deleted = await wizard.clearSession(player, mode);
+        sendJson(response, 200, { deleted });
+      } catch (error) {
+        sendJson(response, error.status || 500, { error: error.status ? error.message : "internal error" });
+      }
+      return;
+    }
     if (request.method !== "POST" || url.pathname !== "/v1/ask") {
       sendJson(response, 404, { error: "not found" });
       return;
@@ -128,7 +143,13 @@ export async function startServer({ env = process.env, logger = console } = {}) 
     throw new Error("Refusing a default or short bridge token on a non-loopback address; use at least 24 characters");
   }
   const corpus = await loadCorpus();
-  const wizard = createWizard({ corpus, env, logger });
+  const sessions = await createFileSessionStore({
+    filePath: env.SESSION_FILE || "runtime/brain/sessions.json",
+    salt: env.WIZARD_SALT || token,
+    maxTurns: Math.min(Math.max(Number(env.SESSION_MAX_TURNS) || 12, 1), 50),
+    ttlMs: Math.min(Math.max(Number(env.SESSION_TTL_MS) || 86_400_000, 60_000), 30 * 86_400_000),
+  });
+  const wizard = createWizard({ corpus, env, logger, sessions });
   const port = Number(env.PORT) || 3000;
   const cooldownMs = Math.min(Math.max(Number(env.REQUEST_COOLDOWN_MS) || 1_500, 0), 60_000);
   const server = createHttpServer({ wizard, corpus, token, cooldownMs, logger });

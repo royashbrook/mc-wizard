@@ -1,0 +1,38 @@
+{
+  "format_version": "1.12.0",
+  "minecraft:geometry": [
+    {
+      "description": {
+        "identifier": "geometry.mcwizard_robe",
+        "texture_width": 64,
+        "texture_height": 64,
+        "visible_bounds_width": 2,
+        "visible_bounds_height": 3,
+        "visible_bounds_offset": [0, 1, 0]
+      },
+      "bones": [
+        {
+          "name": "robe_body",
+          "parent": "body",
+          "pivot": [0, 24, 0],
+          "cubes": [
+            { "origin": [-5, 12, -3], "size": [10, 12, 6], "inflate": 0.6, "uv": [0, 0] },
+            { "origin": [-7, 4, -4], "size": [14, 8, 8], "inflate": 0.2, "uv": [0, 20] }
+          ]
+        },
+        {
+          "name": "robe_right_arm",
+          "parent": "rightArm",
+          "pivot": [-5, 22, 0],
+          "cubes": [{ "origin": [-9, 12, -3], "size": [4, 12, 6], "inflate": 0.5, "uv": [36, 0] }]
+        },
+        {
+          "name": "robe_left_arm",
+          "parent": "leftArm",
+          "pivot": [5, 22, 0],
+          "cubes": [{ "origin": [5, 12, -3], "size": [4, 12, 6], "inflate": 0.5, "uv": [36, 18] }]
+        }
+      ]
+    }
+  ]
+}

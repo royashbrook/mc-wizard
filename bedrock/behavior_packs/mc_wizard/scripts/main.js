@@ -1,6 +1,7 @@
 import {
   BlockPermutation,
   Direction,
+  EquipmentSlot,
   GameMode,
   ItemStack,
   system,
@@ -12,6 +13,12 @@ import { http, HttpRequest, HttpRequestMethod } from "@minecraft/server-net";
 import { startE2E } from "./e2e.js";
 import { createCalculatorBlueprint } from "./calculator.js";
 import { bookPages, bookTitle } from "./book.js";
+import {
+  expectedPlacementStates,
+  planBounds,
+  validateBuildPlan,
+} from "./build-plan.js";
+import { commandLesson } from "./command-lessons.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
 const WIZARD_NAME = "MC Wizard";
@@ -41,12 +48,18 @@ const OPPOSITE_CARDINAL = {
   east: "west",
   west: "east",
 };
-// Stay close enough that previously placed blocks cannot hide the clicked face.
-// The API may report a use animation at longer range without changing the world.
-const BUILD_REACH_SQUARED = 2.75 * 2.75;
+// Match a creative player's practical block reach. Every placement is still
+// verified because the API can report a use animation without changing the world.
+const BUILD_REACH_SQUARED = 5.5 * 5.5;
 const lastBuildTick = new Map();
 const greetedPlayers = new Set();
 const engineAddressedMessageCounts = new Map();
+const lastUndo = new Map();
+const placementRetries = new Map();
+const preparedPlacements = new Set();
+const protectedRegions = [];
+const TRANSACTION_JOURNAL = "mcwizard:active_transaction";
+const UNDO_RETENTION_TICKS = 20 * 60 * 10;
 
 let wizard;
 let followPlayerId;
@@ -56,6 +69,7 @@ let buildInProgress = false;
 let activeBuildToken;
 let nextBuildToken = 0;
 let buildMovement;
+let activeTransaction;
 
 function variable(name, fallback) {
   try {
@@ -172,6 +186,27 @@ function equipWizard(itemId = "minecraft:blaze_rod") {
   }
 }
 
+function dressWizard() {
+  if (!wizardIsValid()) return;
+  const equippable = wizard.getComponent("minecraft:equippable");
+  if (!equippable) {
+    console.warn("[MC Wizard] equippable component unavailable; name tag and blaze rod remain visible");
+    return;
+  }
+  try {
+    equippable.setEquipment(EquipmentSlot.Head, new ItemStack("mcwizard:hat", 1));
+    equippable.setEquipment(EquipmentSlot.Chest, new ItemStack("mcwizard:robe", 1));
+  } catch (error) {
+    console.warn(`[MC Wizard] costume unavailable, using vanilla armor fallback: ${error}`);
+    try {
+      equippable.setEquipment(EquipmentSlot.Head, new ItemStack("minecraft:leather_helmet", 1));
+      equippable.setEquipment(EquipmentSlot.Chest, new ItemStack("minecraft:leather_chestplate", 1));
+    } catch (fallbackError) {
+      console.warn(`[MC Wizard] vanilla costume fallback failed: ${fallbackError}`);
+    }
+  }
+}
+
 function ensureWizard(anchor) {
   if (wizardIsValid()) return wizard;
 
@@ -197,6 +232,7 @@ function ensureWizard(anchor) {
     );
     wizard.addTag(WIZARD_TAG);
     equipWizard();
+    dressWizard();
     wizard.lookAtEntity(anchor, LookDuration.UntilMove);
     console.warn(`[MC Wizard] spawned beside ${anchor.name}`);
     return wizard;
@@ -286,6 +322,143 @@ function buildTargetHasEntity(dimension, target) {
     .some((entity) => !isWizardPlayer(entity));
 }
 
+function transactionBounds(locations) {
+  return {
+    min: {
+      x: Math.min(...locations.map((location) => location.x)),
+      y: Math.min(...locations.map((location) => location.y)),
+      z: Math.min(...locations.map((location) => location.z)),
+    },
+    max: {
+      x: Math.max(...locations.map((location) => location.x)),
+      y: Math.max(...locations.map((location) => location.y)),
+      z: Math.max(...locations.map((location) => location.z)),
+    },
+  };
+}
+
+function regionsOverlap(a, b) {
+  return a.min.x <= b.max.x && a.max.x >= b.min.x
+    && a.min.y <= b.max.y && a.max.y >= b.min.y
+    && a.min.z <= b.max.z && a.max.z >= b.min.z;
+}
+
+function pruneProtectedRegions() {
+  for (let index = protectedRegions.length - 1; index >= 0; index -= 1) {
+    if (protectedRegions[index].expiresTick <= system.currentTick) protectedRegions.splice(index, 1);
+  }
+}
+
+function beginTransaction(playerId, token, dimension, expectedBlocks) {
+  const unique = new Map(expectedBlocks.map(({ location }) => [
+    `${location.x},${location.y},${location.z}`,
+    { x: location.x, y: location.y, z: location.z },
+  ]));
+  const locations = [...unique.values()];
+  if (!locations.length || locations.length > 400) throw new Error("build transaction is outside the 1-400 block limit");
+  const bounds = transactionBounds(locations);
+  pruneProtectedRegions();
+  if (protectedRegions.some((region) => region.dimensionId === dimension.id && regionsOverlap(region.bounds, bounds))) {
+    throw new Error("that area is protected by a recent MC Wizard build; undo it or build elsewhere");
+  }
+  const protectedRadius = Number(variable("mc_wizard_protected_spawn_radius", 0)) || 0;
+  if (protectedRadius > 0 && dimension.id === "minecraft:overworld") {
+    const spawn = world.getDefaultSpawnLocation();
+    if (locations.some((location) => (
+      Math.abs(location.x - spawn.x) <= protectedRadius && Math.abs(location.z - spawn.z) <= protectedRadius
+    ))) throw new Error("that build would enter the protected spawn area");
+  }
+  const snapshots = locations.map((location) => {
+    const block = dimension.getBlock(location);
+    if (!block) throw new Error(`could not snapshot ${location.x},${location.y},${location.z}`);
+    return {
+      location,
+      typeId: block.typeId,
+      states: block.permutation.getAllStates(),
+    };
+  });
+  const transaction = {
+    playerId,
+    token,
+    dimensionId: dimension.id,
+    bounds,
+    snapshots,
+    expectedBlocks,
+  };
+  world.setDynamicProperty(TRANSACTION_JOURNAL, JSON.stringify({
+    dimensionId: dimension.id,
+    snapshots,
+  }));
+  activeTransaction = transaction;
+  return transaction;
+}
+
+function restoreSnapshots(transaction) {
+  const dimension = world.getDimension(transaction.dimensionId);
+  for (const snapshot of transaction.snapshots) {
+    dimension.getBlock(snapshot.location)?.setPermutation(
+      BlockPermutation.resolve(snapshot.typeId, snapshot.states || {}),
+    );
+  }
+}
+
+function rollbackTransaction(token) {
+  if (!activeTransaction || activeTransaction.token !== token) return;
+  restoreSnapshots(activeTransaction);
+  world.setDynamicProperty(TRANSACTION_JOURNAL, undefined);
+  activeTransaction = undefined;
+}
+
+function commitTransaction(token) {
+  if (!activeTransaction || activeTransaction.token !== token) return;
+  const transaction = activeTransaction;
+  lastUndo.set(transaction.playerId, {
+    ...transaction,
+    expiresTick: system.currentTick + UNDO_RETENTION_TICKS,
+  });
+  protectedRegions.push({
+    playerId: transaction.playerId,
+    dimensionId: transaction.dimensionId,
+    bounds: transaction.bounds,
+    expiresTick: system.currentTick + UNDO_RETENTION_TICKS,
+  });
+  world.setDynamicProperty(TRANSACTION_JOURNAL, undefined);
+  activeTransaction = undefined;
+}
+
+function undoLastBuild(player) {
+  const transaction = lastUndo.get(player.id);
+  if (!transaction || transaction.expiresTick <= system.currentTick) {
+    lastUndo.delete(player.id);
+    speak(player, "I don’t have a recent build to undo.");
+    return false;
+  }
+  if (buildInProgress) {
+    speak(player, "I’ll finish or roll back the current build before undoing another one.");
+    return false;
+  }
+  restoreSnapshots(transaction);
+  lastUndo.delete(player.id);
+  for (let index = protectedRegions.length - 1; index >= 0; index -= 1) {
+    if (protectedRegions[index].playerId === player.id) protectedRegions.splice(index, 1);
+  }
+  speak(player, "Undone. I restored every block from before my last build.");
+  return true;
+}
+
+function recoverInterruptedTransaction() {
+  const journal = world.getDynamicProperty(TRANSACTION_JOURNAL);
+  if (typeof journal !== "string" || !journal) return;
+  try {
+    restoreSnapshots(JSON.parse(journal));
+    console.warn("[MC Wizard] restored an interrupted build transaction");
+  } catch (error) {
+    console.warn(`[MC Wizard] could not restore interrupted build: ${error}`);
+  } finally {
+    world.setDynamicProperty(TRANSACTION_JOURNAL, undefined);
+  }
+}
+
 function findClearSite(player, forward, right) {
   const location = player.location;
   const base = {
@@ -347,6 +520,39 @@ function canReachBuildTarget(location, target) {
   return distanceSquared(eye, targetCenter) <= BUILD_REACH_SQUARED;
 }
 
+function horizontalClearanceSquared(location, target) {
+  const dx = Math.max(target.x - location.x, 0, location.x - (target.x + 1));
+  const dz = Math.max(target.z - location.z, 0, location.z - (target.z + 1));
+  return dx * dx + dz * dz;
+}
+
+function navigateWizardToBuildPosition(destination, forceDirect = false, movement) {
+  wizard.stopFlying();
+  if (forceDirect && Math.abs(destination.y - wizard.location.y) <= 1.5) {
+    if (movement?.lastJumpTick
+      && system.currentTick - movement.lastJumpTick < 12
+      && !wizard.isOnGround) return;
+    wizard.moveToLocation(destination, { speed: 0.8, faceTarget: true });
+    if (wizard.isOnGround
+      && (!movement?.lastJumpTick || system.currentTick - movement.lastJumpTick >= 12)
+      && wizard.jump()
+      && movement) movement.lastJumpTick = system.currentTick;
+    return;
+  }
+  try {
+    const navigation = wizard.navigateToLocation(destination, 1);
+    if (navigation.isFullPath) {
+      if (system.currentTick % 10 === 0) wizard.jump();
+      return;
+    }
+  } catch {
+    // Bedrock can briefly report a fractional airborne height over redstone.
+  }
+  if (Math.abs(destination.y - wizard.location.y) <= 1.5) {
+    wizard.moveToLocation(destination, { speed: 0.8, faceTarget: true });
+  }
+}
+
 function wizardCanReach(dimension, target, support = target) {
   if (!wizardIsValid() || wizard.dimension.id !== dimension.id) return false;
   const feet = {
@@ -357,14 +563,18 @@ function wizardCanReach(dimension, target, support = target) {
   const targetOccupiesBody = target.x === feet.x
     && target.z === feet.z
     && (target.y === feet.y || target.y === feet.y + 1);
+  const targetTouchesBody = (target.y === feet.y || target.y === feet.y + 1)
+    && horizontalClearanceSquared(wizard.location, target) < 0.4 * 0.4;
   return !targetOccupiesBody
+    && !targetTouchesBody
     && canReachBuildTarget(wizard.location, target)
     && canReachBuildTarget(wizard.location, support);
 }
 
-function positionWizardForBuild(dimension, target, support = target) {
+function positionWizardForBuild(dimension, target, support = target, forceMove = false) {
   if (!wizardIsValid()) throw new Error("the simulated player is unavailable");
-  if (wizardCanReach(dimension, target, support)) {
+  const key = `${dimension.id}:${target.x},${target.y},${target.z}:${support.x},${support.y},${support.z}`;
+  if (!forceMove && wizardCanReach(dimension, target, support)) {
     wizard.stopMoving();
     if (buildMovement) {
       buildMovement = undefined;
@@ -376,8 +586,8 @@ function positionWizardForBuild(dimension, target, support = target) {
 
   const candidates = [];
   for (let y = target.y + 1; y >= target.y - 4; y -= 1) {
-    for (let x = target.x - 3; x <= target.x + 3; x += 1) {
-      for (let z = target.z - 3; z <= target.z + 3; z += 1) {
+    for (let x = target.x - 5; x <= target.x + 5; x += 1) {
+      for (let z = target.z - 5; z <= target.z + 5; z += 1) {
         if (x === target.x && z === target.z) continue;
         const location = { x: x + 0.5, y, z: z + 0.5 };
         if (!canReachBuildTarget(location, target) || !canReachBuildTarget(location, support)) continue;
@@ -401,19 +611,120 @@ function positionWizardForBuild(dimension, target, support = target) {
     throw new Error(`the simulated player cannot stand within reach of ${target.x},${target.y},${target.z}`);
   }
 
-  const key = `${dimension.id}:${target.x},${target.y},${target.z}:${support.x},${support.y},${support.z}`;
   if (buildMovement?.key === key) {
-    if (system.currentTick - buildMovement.startedTick > 400) {
+    if (wizardCanReach(dimension, target, support)
+      && distanceSquared(wizard.location, buildMovement.destination) < 1) {
+      wizard.stopMoving();
+      buildMovement = undefined;
+      return true;
+    }
+    const movementElapsed = system.currentTick - buildMovement.startedTick;
+    if (buildMovement.mode === "flight-takeoff") {
+      wizard.fly();
+      if (movementElapsed < 10) return false;
+      const clearanceY = Math.max(wizard.location.y, buildMovement.destination.y) + 4;
+      buildMovement = {
+        ...buildMovement,
+        mode: "flight",
+        startedTick: system.currentTick,
+        waypoint: 0,
+        waypoints: [
+          { x: wizard.location.x, y: clearanceY, z: wizard.location.z },
+          { x: buildMovement.destination.x, y: clearanceY, z: buildMovement.destination.z },
+          buildMovement.destination,
+        ],
+        commandedWaypoint: undefined,
+      };
+      return false;
+    }
+    if (buildMovement.mode === "flight-land") {
+      wizard.stopFlying();
+      if (wizard.isOnGround || movementElapsed > 40) {
+        buildMovement = {
+          ...buildMovement,
+          mode: "ground",
+          startedTick: system.currentTick,
+          attempt: 0,
+          tried: [],
+        };
+        navigateWizardToBuildPosition(buildMovement.destination);
+      }
+      return false;
+    }
+    if (buildMovement.mode === "flight") {
+      if (movementElapsed > 600) {
+        const from = `${wizard.location.x.toFixed(1)},${wizard.location.y.toFixed(1)},${wizard.location.z.toFixed(1)}`;
+        const to = `${buildMovement.destination.x.toFixed(1)},${buildMovement.destination.y.toFixed(1)},${buildMovement.destination.z.toFixed(1)}`;
+        buildMovement = undefined;
+        wizard.stopMoving();
+        throw new Error(`the simulated player could not fly from ${from} to ${to} within reach of ${target.x},${target.y},${target.z}`);
+      }
+      let waypoint = buildMovement.waypoints[buildMovement.waypoint];
+      if (distanceSquared(wizard.location, waypoint) < 0.5) {
+        buildMovement.waypoint += 1;
+        buildMovement.commandedWaypoint = undefined;
+        waypoint = buildMovement.waypoints[buildMovement.waypoint];
+        if (buildMovement.waypoint === 2) {
+          buildMovement.mode = "flight-land";
+          buildMovement.startedTick = system.currentTick;
+          wizard.stopMoving();
+          wizard.stopFlying();
+          return false;
+        }
+        if (!waypoint) {
+          buildMovement = undefined;
+          wizard.stopMoving();
+          return false;
+        }
+      }
+      if (buildMovement.commandedWaypoint !== buildMovement.waypoint) {
+        wizard.moveToLocation(waypoint, { speed: 1, faceTarget: true });
+        buildMovement.commandedWaypoint = buildMovement.waypoint;
+      }
+      return false;
+    }
+    if (movementElapsed > 120) {
+      const alternative = (buildMovement.attempt || 0) < 3
+        ? validCandidates.find((location) => (
+          distanceSquared(location, buildMovement.destination) >= 2.25
+          && !(buildMovement.tried || []).some((tried) => distanceSquared(location, tried) < 0.25)
+        ))
+        : undefined;
+      if (alternative) {
+        buildMovement = {
+          ...buildMovement,
+          destination: alternative,
+          startedTick: system.currentTick,
+          attempt: (buildMovement.attempt || 0) + 1,
+          tried: [...(buildMovement.tried || []), buildMovement.destination],
+          lastJumpTick: undefined,
+        };
+        wizard.stopMoving();
+        return false;
+      }
+      buildMovement = {
+        ...buildMovement,
+        mode: "flight-takeoff",
+        startedTick: system.currentTick,
+      };
+      wizard.stopMoving();
+      wizard.fly();
+      return false;
+    }
+    if (movementElapsed > 600) {
       const from = `${wizard.location.x.toFixed(1)},${wizard.location.y.toFixed(1)},${wizard.location.z.toFixed(1)}`;
       const to = `${buildMovement.destination.x.toFixed(1)},${buildMovement.destination.y.toFixed(1)},${buildMovement.destination.z.toFixed(1)}`;
       buildMovement = undefined;
       wizard.stopMoving();
       throw new Error(
-        `the simulated player could not fly from ${from} to ${to} within reach of ${target.x},${target.y},${target.z}`,
+        `the simulated player could not move from ${from} to ${to} within reach of ${target.x},${target.y},${target.z}`,
       );
     }
-    wizard.fly();
-    wizard.moveToLocation(buildMovement.destination, { speed: 0.8, faceTarget: true });
+    navigateWizardToBuildPosition(
+      buildMovement.destination,
+      movementElapsed > 40,
+      buildMovement,
+    );
     return false;
   }
 
@@ -431,10 +742,13 @@ function positionWizardForBuild(dimension, target, support = target) {
         && blockIsOpen(dimension, feet)
         && blockIsOpen(dimension, head);
     });
-  const destination = elevatedDestination || validCandidates[0];
-  buildMovement = { key, destination, startedTick: system.currentTick };
-  wizard.fly();
-  wizard.moveToLocation(destination, { speed: 0.8, faceTarget: true });
+  const forcedDestination = forceMove
+    ? validCandidates.find((location) => distanceSquared(location, wizard.location) >= 2.25)
+    : undefined;
+  const destination = forcedDestination || elevatedDestination || validCandidates[0];
+  buildMovement = { key, destination, startedTick: system.currentTick, mode: "ground" };
+  wizard.stopMoving();
+  navigateWizardToBuildPosition(destination);
   wizard.lookAtLocation(target, LookDuration.UntilMove);
   return false;
 }
@@ -447,6 +761,7 @@ function placeAsWizard(
   expectedType,
   permutation,
   direction = Direction.Up,
+  expectedStates = {},
 ) {
   if (!wizardIsValid()) throw new Error("the simulated player is unavailable");
   const targetBeforePlacement = dimension.getBlock(target);
@@ -456,11 +771,18 @@ function placeAsWizard(
   if (buildTargetHasEntity(dimension, target)) {
     throw new Error(`an entity entered the build area at ${target.x},${target.y},${target.z}`);
   }
-  if (!positionWizardForBuild(dimension, target, support)) return false;
+  const retryKey = `${target.x},${target.y},${target.z}:${itemId}`;
+  if (!positionWizardForBuild(dimension, target, support, placementRetries.has(retryKey))) return false;
 
   const item = new ItemStack(itemId, 1);
-  wizard.stopUsingItem();
-  if (!wizard.setItem(item, 0, true)) throw new Error(`could not equip ${itemId}`);
+  if (!preparedPlacements.has(retryKey)) {
+    wizard.stopUsingItem();
+    if (!wizard.setItem(item, 0, true)) throw new Error(`could not equip ${itemId}`);
+    wizard.lookAtBlock(support, LookDuration.Instant);
+    preparedPlacements.add(retryKey);
+    return "placement-prepare";
+  }
+  preparedPlacements.delete(retryKey);
   wizard.lookAtBlock(support, LookDuration.Instant);
   const placed = wizard.useItemOnBlock(
     item,
@@ -468,14 +790,39 @@ function placeAsWizard(
     direction,
     faceLocation(direction),
   );
-  if (!placed) throw new Error(`the simulated player could not place ${itemId}`);
+  if (!placed) {
+    const attempts = (placementRetries.get(retryKey) || 0) + 1;
+    console.warn(`[MC Wizard] placement retry ${attempts} for ${itemId}; wizard=${wizard.location.x.toFixed(1)},${wizard.location.y.toFixed(1)},${wizard.location.z.toFixed(1)} target=${target.x},${target.y},${target.z} support=${support.x},${support.y},${support.z}; use=false`);
+    if (attempts <= 3) {
+      placementRetries.set(retryKey, attempts);
+      wizard.stopMoving();
+      return "placement-retry";
+    }
+    placementRetries.delete(retryKey);
+    throw new Error(`the simulated player could not place ${itemId} after ${attempts} attempts`);
+  }
 
   const block = dimension.getBlock(target);
   const expectedTypes = Array.isArray(expectedType) ? expectedType : [expectedType];
   if (!block || !expectedTypes.includes(block.typeId)) {
+    const attempts = (placementRetries.get(retryKey) || 0) + 1;
+    console.warn(`[MC Wizard] placement retry ${attempts} for ${itemId}; wizard=${wizard.location.x.toFixed(1)},${wizard.location.y.toFixed(1)},${wizard.location.z.toFixed(1)} target=${target.x},${target.y},${target.z} support=${support.x},${support.y},${support.z}; result=${block?.typeId || "nothing"}`);
+    if (attempts <= 3) {
+      placementRetries.set(retryKey, attempts);
+      wizard.stopMoving();
+      return "placement-retry";
+    }
+    placementRetries.delete(retryKey);
     throw new Error(
-      `${itemId} placement created ${block?.typeId || "nothing"}, not ${expectedTypes.join(" or ")}`,
+      `${itemId} placement created ${block?.typeId || "nothing"}, not ${expectedTypes.join(" or ")}, after ${attempts} attempts`,
     );
+  }
+  placementRetries.delete(retryKey);
+  for (const [state, expected] of Object.entries(expectedStates)) {
+    const actual = block.permutation.getState(state);
+    if (actual !== expected) {
+      throw new Error(`${itemId} orientation ${state}=${actual}, expected ${expected}`);
+    }
   }
   if (permutation) block.setPermutation(permutation);
   return true;
@@ -497,11 +844,14 @@ function breakAsWizard(dimension, target) {
   return true;
 }
 
-function clearBuild(token) {
+function clearBuild(token, rollback = false) {
   if (activeBuildToken !== token) return false;
+  if (rollback) rollbackTransaction(token);
   activeBuildToken = undefined;
   buildInProgress = false;
   buildMovement = undefined;
+  placementRetries.clear();
+  preparedPlacements.clear();
   if (wizardIsValid()) {
     wizard.stopMoving();
     wizard.stopFlying();
@@ -518,7 +868,6 @@ function finishBuild(playerId, token, dimension, expectedBlocks, successMessage)
     return !expectedTypes.includes(dimension.getBlock(location)?.typeId);
   });
   const complete = !mismatch;
-  if (!clearBuild(token) || !player) return;
   if (!complete) {
     const actual = dimension.getBlock(mismatch.location)?.typeId || "unloaded";
     const expected = Array.isArray(mismatch.typeId) ? mismatch.typeId.join(" or ") : mismatch.typeId;
@@ -527,9 +876,12 @@ function finishBuild(playerId, token, dimension, expectedBlocks, successMessage)
         + mismatch.location.x + "," + mismatch.location.y + "," + mismatch.location.z
         + ": expected " + expected + ", got " + actual,
     );
-    speak(player, "I placed the parts, but the circuit changed before I could verify it. I won’t call that finished.");
+    clearBuild(token, true);
+    if (player) speak(player, "The build failed verification, so I restored the area to exactly how it was before I started.");
     return;
   }
+  commitTransaction(token);
+  if (!clearBuild(token) || !player) return;
   console.warn("[MC Wizard] final build verification passed");
   speak(player, successMessage);
 }
@@ -546,8 +898,19 @@ function runBuildSteps(
 ) {
   if (activeBuildToken !== token) return;
   if (!playerById(playerId)) {
-    clearBuild(token);
+    clearBuild(token, true);
     return;
+  }
+  if (index === 0 && !activeTransaction) {
+    try {
+      beginTransaction(playerId, token, dimension, expectedBlocks);
+    } catch (error) {
+      console.warn(`[MC Wizard] transaction refused: ${error}`);
+      clearBuild(token, true);
+      const player = playerById(playerId);
+      if (player) speak(player, `I won’t start that build: ${error.message}.`);
+      return;
+    }
   }
   if (index >= steps.length) {
     finishBuild(playerId, token, dimension, expectedBlocks, successMessage);
@@ -557,12 +920,15 @@ function runBuildSteps(
   let stepComplete;
   try {
     stepComplete = steps[index]();
-    if (stepComplete !== false && index % 50 === 0) {
+    if (stepComplete !== false
+      && stepComplete !== "placement-retry"
+      && stepComplete !== "placement-prepare"
+      && index % 50 === 0) {
       console.warn("[MC Wizard] build progress " + index + "/" + steps.length);
     }
   } catch (error) {
     console.warn(`[MC Wizard] build step ${index} failed: ${error}`);
-    clearBuild(token);
+    clearBuild(token, true);
     const player = playerById(playerId);
     if (player) speak(player, `I had to stop: ${error.message}. I did not fake the missing placement.`);
     return;
@@ -576,9 +942,13 @@ function runBuildSteps(
       expectedBlocks,
       successMessage,
       delayTicks,
-      stepComplete === false ? index : index + 1,
+      stepComplete === false || stepComplete === "placement-retry" || stepComplete === "placement-prepare"
+        ? index
+        : index + 1,
     ),
-    stepComplete === false ? 1 : delayTicks,
+    stepComplete === "placement-retry" ? 10
+      : stepComplete === "placement-prepare" ? 3
+        : stepComplete === false ? 1 : delayTicks,
   );
 }
 
@@ -708,6 +1078,209 @@ function calculatorLocation(origin, forward, right, [x, y, z]) {
   };
 }
 
+function playerCopyableCalculatorSupport(dimension, itemId, target, plannedSupport) {
+  const isFloorTile = itemId === "minecraft:smooth_stone" || itemId.endsWith("_wool");
+  if (!isFloorTile || plannedSupport.y !== target.y - 1) return plannedSupport;
+  const neighbors = [
+    { x: target.x - 1, y: target.y, z: target.z },
+    { x: target.x + 1, y: target.y, z: target.z },
+    { x: target.x, y: target.y, z: target.z - 1 },
+    { x: target.x, y: target.y, z: target.z + 1 },
+  ];
+  return neighbors.find((location) => dimension.getBlock(location)?.isSolid) || plannedSupport;
+}
+
+function playerAccessibleCalculatorOrder(placements) {
+  const ordered = [];
+  const built = new Set();
+  const key = ([x, y, z]) => `${x},${y},${z}`;
+  const isStackedFullBlock = (placement) => placement.action !== "break"
+    && (placement.itemId === "minecraft:smooth_stone" || placement.itemId.endsWith("_wool"))
+    && placement.support[1] === placement.target[1] - 1;
+  const hasBuiltNeighbor = (placement) => {
+    const [x, y, z] = placement.target;
+    return [[x - 1, y, z], [x + 1, y, z], [x, y, z - 1], [x, y, z + 1]]
+      .some((location) => built.has(key(location)));
+  };
+
+  for (let index = 0; index < placements.length;) {
+    const first = placements[index];
+    if (!isStackedFullBlock(first)) {
+      ordered.push(first);
+      if (first.action !== "break") built.add(key(first.target));
+      index += 1;
+      continue;
+    }
+    const run = [];
+    while (index < placements.length
+      && isStackedFullBlock(placements[index])
+      && placements[index].target[1] === first.target[1]) {
+      run.push(placements[index]);
+      index += 1;
+    }
+    while (run.length) {
+      const nextIndex = run.findIndex(hasBuiltNeighbor);
+      const [next] = run.splice(nextIndex < 0 ? 0 : nextIndex, 1);
+      ordered.push(next);
+      built.add(key(next.target));
+    }
+  }
+  return ordered;
+}
+
+function customLocation(origin, forward, right, [x, y, z]) {
+  return {
+    x: origin.x + right.x * x + forward.x * z,
+    y: origin.y + y,
+    z: origin.z + right.z * x + forward.z * z,
+  };
+}
+
+function findCustomSite(player, plan, forward, right) {
+  const origin = {
+    x: Math.floor(player.location.x) + forward.x * 6,
+    y: Math.floor(player.location.y),
+    z: Math.floor(player.location.z) + forward.z * 6,
+  };
+  const bounds = planBounds(plan);
+  for (let x = bounds.min[0] - 2; x <= bounds.max[0] + 2; x += 1) {
+    for (let z = bounds.min[2] - 2; z <= bounds.max[2] + 2; z += 1) {
+      const ground = player.dimension.getBlock(customLocation(origin, forward, right, [x, -1, z]));
+      if (!ground || !SAFE_GROUND.has(ground.typeId)) return null;
+    }
+  }
+  for (const placement of plan.blocks) {
+    const target = customLocation(origin, forward, right, placement.target);
+    const block = player.dimension.getBlock(target);
+    if (!block || !SAFE_SPACE.has(block.typeId) || buildTargetHasEntity(player.dimension, target)) return null;
+  }
+  return origin;
+}
+
+function buildValidatedPlan(player, value) {
+  let plan;
+  try {
+    plan = validateBuildPlan(value);
+  } catch (error) {
+    speak(player, `I rejected that plan before touching the world: ${error.message}.`);
+    return;
+  }
+  if (buildInProgress) {
+    speak(player, "I’m already building. I’ll finish or roll that back first.");
+    return;
+  }
+  const dimension = player.dimension;
+  const forward = cardinalDirection(player);
+  const right = { x: -forward.z, z: forward.x };
+  const origin = findCustomSite(player, plan, forward, right);
+  if (!origin) {
+    speak(player, "I need a clear, flat natural-ground area for that plan. Move to an open field and ask again.");
+    return;
+  }
+  const bot = bringWizardTo(player);
+  if (!bot) {
+    speak(player, "My player body is unavailable, so I won’t pretend to build it.");
+    return;
+  }
+  buildInProgress = true;
+  const token = ++nextBuildToken;
+  activeBuildToken = token;
+  lastBuildTick.set(player.id, system.currentTick);
+  const steps = plan.blocks.map((placement) => {
+    const target = customLocation(origin, forward, right, placement.target);
+    const support = customLocation(origin, forward, right, placement.support);
+    const direction = directionFromSupport(support, target);
+    const expectedStates = expectedPlacementStates(
+      placement.itemId,
+      [support.x, support.y, support.z],
+      [target.x, target.y, target.z],
+    );
+    return () => placeAsWizard(
+      dimension,
+      placement.itemId,
+      support,
+      target,
+      placement.expectedType,
+      undefined,
+      direction,
+      expectedStates,
+    );
+  });
+  const expectedBlocks = plan.blocks.map((placement) => ({
+    location: customLocation(origin, forward, right, placement.target),
+    typeId: placement.expectedType,
+  }));
+  speak(player, `I validated “${plan.title}”. I’ll place its ${plan.blocks.length} blocks one at a time, then verify all of them.`);
+  system.runTimeout(() => runBuildSteps(
+    player.id,
+    token,
+    dimension,
+    steps,
+    expectedBlocks,
+    `${plan.title} is built and verified. Say “wizard undo” within ten minutes if you want me to restore the area.`,
+    8,
+  ), 20);
+}
+
+function buildCommandLesson(player, id) {
+  const lesson = commandLesson(id);
+  if (!lesson) {
+    speak(player, "I don’t have that command-block lesson.");
+    return;
+  }
+  if (buildInProgress) {
+    speak(player, "I’m already building. I’ll finish or roll that back first.");
+    return;
+  }
+  const dimension = player.dimension;
+  const forward = cardinalDirection(player);
+  const right = { x: -forward.z, z: forward.x };
+  const base = findClearSite(player, forward, right);
+  if (!base) {
+    speak(player, "Move to a clear natural-ground area and ask for the command lesson again.");
+    return;
+  }
+  if (!bringWizardTo(player)) {
+    speak(player, "My player body is unavailable, so I won’t pretend to place the command block.");
+    return;
+  }
+  buildInProgress = true;
+  const token = ++nextBuildToken;
+  activeBuildToken = token;
+  const commandBlock = offset(base, forward, right, 0);
+  const button = offset(commandBlock, forward, right, 0, 0, 1);
+  const steps = [
+    () => placeAsWizard(
+      dimension,
+      "minecraft:command_block",
+      offset(commandBlock, forward, right, 0, 0, -1),
+      commandBlock,
+      "minecraft:command_block",
+    ),
+    () => placeAsWizard(
+      dimension,
+      "minecraft:stone_button",
+      commandBlock,
+      button,
+      "minecraft:stone_button",
+    ),
+  ];
+  const expectedBlocks = [
+    { location: commandBlock, typeId: "minecraft:command_block" },
+    { location: button, typeId: "minecraft:stone_button" },
+  ];
+  speak(player, `I’ll place the hardware for “${lesson.title}”. Bedrock does not let my script safely type novel command text, so you will paste one short command yourself.`);
+  system.runTimeout(() => runBuildSteps(
+    player.id,
+    token,
+    dimension,
+    steps,
+    expectedBlocks,
+    `Lesson ready. Open the command block and paste: ${lesson.command} Set it to Impulse, Unconditional, Needs Redstone, then press the button. ${lesson.explanation}`,
+    10,
+  ), 20);
+}
+
 function findCalculatorSite(player, forward, right) {
   const origin = {
     x: Math.floor(player.location.x) + forward.x * 18 - right.x * 5,
@@ -777,7 +1350,8 @@ function buildRedstoneCalculator(player) {
   }
   speak(player, "I’ll build a two-bit binary adder using only blocks, redstone dust, torches, levers, and lamps. It adds any two numbers from zero to three.");
 
-  const steps = blueprint.placements.map((placement) => {
+  const orderedPlacements = playerAccessibleCalculatorOrder(blueprint.placements);
+  const steps = orderedPlacements.map((placement) => {
     const target = calculatorLocation(origin, forward, right, placement.target);
     if (placement.action === "break") {
       let breakStarted = false;
@@ -799,17 +1373,24 @@ function buildRedstoneCalculator(player) {
         return false;
       };
     }
-    const support = calculatorLocation(origin, forward, right, placement.support);
-    const direction = directionFromSupport(support, target);
-    return () => placeAsWizard(
-      dimension,
-      placement.itemId,
-      support,
-      target,
-      placement.expectedType,
-      undefined,
-      direction,
-    );
+    const plannedSupport = calculatorLocation(origin, forward, right, placement.support);
+    return () => {
+      const support = playerCopyableCalculatorSupport(
+        dimension,
+        placement.itemId,
+        target,
+        plannedSupport,
+      );
+      return placeAsWizard(
+        dimension,
+        placement.itemId,
+        support,
+        target,
+        placement.expectedType,
+        undefined,
+        directionFromSupport(support, target),
+      );
+    };
   });
   const finalBlocks = new Map();
   for (const placement of blueprint.placements) {
@@ -836,7 +1417,7 @@ function buildRedstoneCalculator(player) {
       steps,
       [...finalBlocks.values()],
       "Calculator built. The four near levers are A-two, B-two, A-one, and B-one. Read the three pink output lamps as four, two, one. Try one plus three: the lamps should show one-zero-zero, which is four.",
-      12,
+      variable("mc_wizard_e2e", false) === true ? 8 : 12,
     );
   }, 20);
 }
@@ -864,6 +1445,10 @@ function applyResponse(playerId, payload, question) {
     && action.id === "binary_adder_2bit"
     && action.version === 1) {
     buildRedstoneCalculator(player);
+  } else if (action?.type === "build_plan" && action.version === 1) {
+    buildValidatedPlan(player, action.plan);
+  } else if (action?.type === "command_lesson" && action.version === 1) {
+    buildCommandLesson(player, action.id);
   }
 }
 
@@ -897,6 +1482,10 @@ async function askBackend(playerId, question, mode = "wizard") {
 }
 
 function handleLocalCommand(player, question) {
+  if (/^(?:undo|undo (?:my |the )?last build)(?: please)?[.!]?$/i.test(question)) {
+    undoLastBuild(player);
+    return true;
+  }
   const wantsMovement = /^(?:come(?: here)?|follow(?: me)?|stay|wait here|stop following)(?: please)?[.!]?$/i
     .test(question);
   if (buildInProgress && wantsMovement) {
@@ -1003,6 +1592,7 @@ world.afterEvents.playerLeave.subscribe(() => {
     }
     wizard = undefined;
     followPlayerId = undefined;
+    if (activeBuildToken !== undefined) rollbackTransaction(activeBuildToken);
     activeBuildToken = undefined;
     buildInProgress = false;
   });
@@ -1042,11 +1632,19 @@ system.runInterval(() => {
 }, 80);
 
 world.afterEvents.worldLoad.subscribe(() => {
+  recoverInterruptedTransaction();
   console.warn(`[MC Wizard] ready; brain=${WIZARD_URL}`);
   if (variable("mc_wizard_e2e", false) === true) {
     system.runTimeout(() => startE2E({
       routeAddressedMessage,
       engineAddressedMessageCount: (playerId) => engineAddressedMessageCounts.get(playerId) || 0,
+      undoLastBuild,
+      hasCommittedBuild: (playerId) => lastUndo.has(playerId),
+      buildValidatedPlan,
+      deliverTestBook: (player) => deliverModelAnswer(player, {
+        label: "E2E",
+        answer: "# Redstone guide\n\n" + "Use repeaters to control timing, comparators to measure signals, and lamps to make output easy to read. ".repeat(12),
+      }, "redstone guide"),
     }), 20);
   }
 });
