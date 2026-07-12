@@ -7,7 +7,7 @@ const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const RUNTIME = path.join(ROOT, "runtime", "supervisor");
 const PID_FILE = path.join(RUNTIME, "mc-wizard.pid");
 const LOG_FILE = path.join(RUNTIME, "mc-wizard.log");
-const DAEMON_PATTERN = `${path.join(ROOT, "scripts", "supervisor.mjs")} daemon`;
+const DAEMON_PATTERN = `${path.join(ROOT, "scripts", "supervisor.mjs")} daemon`.replace("/", "[/]");
 
 function run(command, args, options = {}) {
   return new Promise((resolve) => {
@@ -23,7 +23,7 @@ function daemonPids() {
     let output = "";
     child.stdout.on("data", (chunk) => { output += chunk; });
     child.once("error", () => resolve([]));
-    child.once("exit", () => resolve(output.split(/\s+/).map(Number).filter(Number.isInteger)));
+    child.once("exit", () => resolve(output.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0)));
   });
 }
 

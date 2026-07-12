@@ -75,6 +75,7 @@ let nextBuildToken = 0;
 let nextQuestionToken = 0;
 let buildMovement;
 let activeTransaction;
+let lastAmbientTick = 0;
 
 function variable(name, fallback) {
   try {
@@ -173,7 +174,7 @@ function arrivalPosition(player) {
     y: standingBlockY(player.location),
     z: Math.floor(player.location.z),
   };
-  for (const [x, z] of [[2, 0], [-2, 0], [0, 2], [0, -2], [3, 1], [-3, -1]]) {
+  for (const [x, z] of [[3, 0], [-3, 0], [0, 3], [0, -3], [2, 2], [-2, -2]]) {
     const feet = { x: base.x + x, y: base.y, z: base.z + z };
     const head = { x: feet.x, y: feet.y + 1, z: feet.z };
     const ground = player.dimension.getBlock({ x: feet.x, y: feet.y - 1, z: feet.z });
@@ -196,29 +197,23 @@ function equipWizard(itemId = "mcwizard:wand") {
   }
 }
 
-function dressWizard() {
+function removeOldCostume() {
   if (!wizardIsValid()) return;
   const equippable = wizard.getComponent("minecraft:equippable");
-  if (!equippable) {
-    console.warn("[MC Wizard] equippable component unavailable; name tag and wand remain visible");
-    return;
-  }
+  if (!equippable) return;
   try {
-    equippable.setEquipment(EquipmentSlot.Head, new ItemStack("mcwizard:hat", 1));
-    equippable.setEquipment(EquipmentSlot.Chest, new ItemStack("mcwizard:robe", 1));
+    equippable.setEquipment(EquipmentSlot.Head, undefined);
+    equippable.setEquipment(EquipmentSlot.Chest, undefined);
   } catch (error) {
-    console.warn(`[MC Wizard] costume unavailable, using vanilla armor fallback: ${error}`);
-    try {
-      equippable.setEquipment(EquipmentSlot.Head, new ItemStack("minecraft:leather_helmet", 1));
-      equippable.setEquipment(EquipmentSlot.Chest, new ItemStack("minecraft:leather_chestplate", 1));
-    } catch (fallbackError) {
-      console.warn(`[MC Wizard] vanilla costume fallback failed: ${fallbackError}`);
-    }
+    console.warn(`[MC Wizard] could not clear the old costume: ${error}`);
   }
 }
 
 function ensureWizard(anchor) {
-  if (wizardIsValid()) return wizard;
+  if (wizardIsValid()) {
+    removeOldCostume();
+    return wizard;
+  }
 
   wizard = world.getAllPlayers().find((player) => isWizardPlayer(player));
   if (wizardIsValid()) return wizard;
@@ -242,7 +237,7 @@ function ensureWizard(anchor) {
     );
     wizard.addTag(WIZARD_TAG);
     equipWizard();
-    dressWizard();
+    removeOldCostume();
     wizard.lookAtEntity(anchor, LookDuration.UntilMove);
     console.warn(`[MC Wizard] spawned beside ${anchor.name}`);
     return wizard;
@@ -260,6 +255,20 @@ function distanceSquared(a, b) {
   return x * x + y * y + z * z;
 }
 
+function moveWizardBeside(bot, player) {
+  const distance = distanceSquared(bot.location, player.location);
+  const destination = arrivalPosition(player);
+  if ((distance < 2.25 * 2.25 || distance > 4.5 * 4.5)
+    && destination
+    && distanceSquared(bot.location, destination) > 0.75 * 0.75) {
+    bot.navigateToLocation(destination, 0.65);
+    return true;
+  }
+  bot.stopMoving();
+  bot.lookAtEntity(player, LookDuration.UntilMove);
+  return false;
+}
+
 function bringWizardTo(player, follow = true, forceMovement = false) {
   const bot = ensureWizard(player);
   if (!bot) return undefined;
@@ -275,12 +284,7 @@ function bringWizardTo(player, follow = true, forceMovement = false) {
     const sameDimension = bot.dimension.id === player.dimension.id;
     if (!sameDimension) {
       console.warn(`[MC Wizard] ${player.name} is in another dimension; refusing to teleport`);
-    } else if (distanceSquared(bot.location, player.location) > 4 * 4) {
-      bot.navigateToEntity(player, 0.7);
-    } else {
-      bot.stopMoving();
-      bot.lookAtEntity(player, LookDuration.UntilMove);
-    }
+    } else moveWizardBeside(bot, player);
   } catch (error) {
     console.warn(`[MC Wizard] could not move to ${player.name}: ${error}`);
   }
@@ -304,6 +308,56 @@ function speak(player, message) {
     }
     player.sendMessage(`${PREFIX}${line}`);
   }
+}
+
+function worldSmallTalk(player, question) {
+  const text = question.trim();
+  const asksMood = /\b(?:what(?:’|'| i)s up|how are you|how(?:’|'| i)s it going|you doing)\b/i.test(text);
+  const asksWeather = /\b(?:weather|rain|raining|sunny|storm|storming|thunder|sky)\b/i.test(text);
+  if (!asksMood && !asksWeather) return undefined;
+  let weather;
+  try {
+    weather = typeof player.dimension.getWeather === "function" ? player.dimension.getWeather() : undefined;
+  } catch {
+    weather = undefined;
+  }
+  const time = world.getTimeOfDay();
+  const dayPart = time < 1000 || time >= 23000 ? "sunrise"
+    : time < 12000 ? "daytime"
+      : time < 13000 ? "sunset"
+        : "night";
+  if (weather === "Thunder") return `That thunder has excellent wizard timing. It’s ${dayPart}, so I’m keeping my wand dry and watching the sky.`;
+  if (weather === "Rain") return `It’s raining at ${dayPart}. Good weather for roofs, hidden workshops, and dramatic entrances.`;
+  if (weather === "Clear") return `Clear skies at ${dayPart}. I’m doing well and ready to wander, build, or inspect whatever you’re making.`;
+  return `I’m doing well. It’s ${dayPart} here, and I’m ready to explore or build with you.`;
+}
+
+function idleLookAround(player) {
+  if (!wizardIsValid() || system.currentTick - lastAmbientTick < 200) return;
+  lastAmbientTick = system.currentTick;
+  const base = {
+    x: Math.floor(player.location.x),
+    y: standingBlockY(player.location),
+    z: Math.floor(player.location.z),
+  };
+  for (let radius = 1; radius <= 4; radius += 1) {
+    for (let x = -radius; x <= radius; x += 1) {
+      for (let z = -radius; z <= radius; z += 1) {
+        const location = { x: base.x + x, y: base.y, z: base.z + z };
+        const typeId = player.dimension.getBlock(location)?.typeId || "";
+        if (/redstone|command_block|comparator|repeater|lever|button|lamp/.test(typeId)) {
+          wizard.lookAtBlock(location, LookDuration.UntilMove);
+          return;
+        }
+      }
+    }
+  }
+  const view = player.getViewDirection();
+  wizard.lookAtLocation({
+    x: player.location.x + view.x * 5,
+    y: player.location.y + Math.max(1, view.y * 5),
+    z: player.location.z + view.z * 5,
+  }, LookDuration.UntilMove);
 }
 
 function cardinalDirection(player) {
@@ -1657,6 +1711,12 @@ function handleLocalCommand(player, question) {
     speak(player, "Why did the creeper cross the road? To get to the other ssssside!");
     return true;
   }
+  const smallTalk = worldSmallTalk(player, simple);
+  if (smallTalk) {
+    cancelPendingQuestion(player);
+    speak(player, smallTalk);
+    return true;
+  }
   if (/^(?:undo|undo (?:my |the )?last build)(?: please)?[.!]?$/i.test(question)) {
     undoLastBuild(player);
     return true;
@@ -1798,12 +1858,7 @@ system.runInterval(() => {
     const distance = sameDimension ? distanceSquared(wizard.location, player.location) : Infinity;
     if (!sameDimension) {
       console.warn(`[MC Wizard] ${player.name} is in another dimension; refusing to teleport`);
-    } else if (distance > 4 * 4) {
-      wizard.navigateToEntity(player, 0.65);
-    } else {
-      wizard.stopMoving();
-      wizard.lookAtEntity(player, LookDuration.UntilMove);
-    }
+    } else if (!moveWizardBeside(wizard, player)) idleLookAround(player);
   } catch (error) {
     console.warn(`[MC Wizard] follow loop failed: ${error}`);
   }

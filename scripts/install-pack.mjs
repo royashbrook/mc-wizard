@@ -122,7 +122,7 @@ await writeFile(path.join(configTarget, "secrets.json"), `${JSON.stringify({
 }, null, 2)}\n`);
 
 console.log(`Installed MC Wizard in ${serverRoot}`);
-console.log(`Activated behavior and costume resource packs for world: ${worldName}`);
+console.log(`Activated behavior and wand resource packs for world: ${worldName}`);
 console.log(`Brain endpoint: ${brainUrl}`);
 if (token === "dev-only-change-me") console.warn("Using the development bridge token; change it before exposing the service.");
 console.warn("The world must already have the Beta APIs experiment enabled.");

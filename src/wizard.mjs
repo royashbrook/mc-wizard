@@ -46,6 +46,13 @@ function isCastleQuestion(question) {
   return /\b(?:castle|fort|fortress|castle\s+gate)\b/i.test(question);
 }
 
+function isCastleExpansionQuestion(question, history = []) {
+  const expansion = /\b(?:bigger|larger|expand|four\s+walls|4\s+walls|finish(?:\s+the)?\s+walls|walls\s+and\s+towers)\b/i.test(question);
+  const castleContext = isCastleQuestion(question)
+    || history.some((turn) => /\b(?:castle|fort|fortress)\b/i.test(`${turn.question} ${turn.answer}`));
+  return expansion && castleContext;
+}
+
 function smallCastleAction() {
   const blocks = [];
   const add = (target, support, itemId = "minecraft:cobblestone") => {
@@ -62,11 +69,41 @@ function smallCastleAction() {
   return { type: "build_plan", version: 1, plan: { title: "Mini Castle Gate", blocks } };
 }
 
+function fourWallCastleAction() {
+  const blocks = [];
+  const perimeter = [];
+  for (let x = -6; x <= 6; x += 1) {
+    if (![-1, 0, 1].includes(x)) perimeter.push([x, 1]);
+    perimeter.push([x, 13]);
+  }
+  for (let z = 2; z <= 12; z += 1) perimeter.push([-6, z], [6, z]);
+  for (const [x, z] of perimeter) {
+    blocks.push({ target: [x, 0, z], support: [x, -1, z], itemId: "minecraft:cobblestone" });
+  }
+  for (const [x, z] of perimeter) {
+    blocks.push({ target: [x, 1, z], support: [x, 0, z], itemId: "minecraft:cobblestone" });
+  }
+  for (const [x, z] of [[-6, 1], [6, 1], [-6, 13], [6, 13]]) {
+    blocks.push({ target: [x, 2, z], support: [x, 1, z], itemId: "minecraft:cobblestone" });
+  }
+  return { type: "build_plan", version: 1, plan: { title: "Four Wall Castle", blocks } };
+}
+
+function prototypeAction() {
+  const blocks = [];
+  for (let x = -2; x <= 2; x += 1) {
+    for (let z = 2; z <= 6; z += 1) {
+      blocks.push({ target: [x, 0, z], support: [x, -1, z], itemId: "minecraft:smooth_stone" });
+    }
+  }
+  return { type: "build_plan", version: 1, plan: { title: "Prototype Start", blocks } };
+}
+
 function isOrdinaryConversation(question) {
   const text = question.trim();
   return /^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
     || /^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
-    || /\b(?:are you ready|you ready|who are you|what can you do|tell me (?:a )?joke|how are you|what do you think|weather)\b/i.test(text);
+    || /\b(?:are you ready|you ready|who are you|what can you do|tell me (?:a )?joke|how are you|how(?:’|'| i)s it going|what(?:’|'| i)s up|what do you think|weather)\b/i.test(text);
 }
 
 export function instantConversationAnswer(question) {
@@ -86,10 +123,16 @@ export function instantConversationAnswer(question) {
   if (/\b(?:who are you|what can you do)\b/i.test(text)) {
     return "I’m MC Wizard. I can teach Bedrock redstone and commands, debug builds, or build a small demo while you watch.";
   }
+  if (/\b(?:how are you|how(?:’|'| i)s it going|what(?:’|'| i)s up)\b/i.test(text)) {
+    return "I’m doing well—wand ready, boots on, and looking for something interesting to build. What’s up with you?";
+  }
+  if (/\b(?:weather|rain|raining|sunny|storm|thunder)\b/i.test(text)) {
+    return "I like clear skies for building and rain for dramatic wizard entrances. In the world, I’ll look up and tell you what the sky is actually doing.";
+  }
   return undefined;
 }
 
-export function classifyAction(question) {
+export function classifyAction(question, history = []) {
   const refusesBuild = /\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
     || /\bjust\s+(?:explain|describe|tell)\b/i.test(question);
   if (refusesBuild) return null;
@@ -108,6 +151,7 @@ export function classifyAction(question) {
       version: 1,
     };
   }
+  if (wantsBuild && isCastleExpansionQuestion(question, history)) return fourWallCastleAction();
   if (wantsBuild && isCastleQuestion(question)) return smallCastleAction();
   return null;
 }
@@ -141,6 +185,9 @@ function localAnswer(question, hits, action) {
       return `${intro} I’ll place the Bedrock 1.21+ version a few blocks in front of you: button, copper bulb, comparator, and output lamp. Press the button and the output lamp should alternate on and off.`;
     }
     return `${intro} In modern Bedrock, a copper bulb is the smallest example. Put a button on the bulb. Each press toggles the light; a comparator reading the bulb gives signal 15 when lit and 0 when dark.`;
+  }
+  if (action?.plan?.title === "Four Wall Castle") {
+    return "Yes—four real walls this time. I’ll build a thirteen-by-thirteen cobblestone perimeter with a three-block gate opening and raised corner posts, then verify every block.";
   }
   if (isCastleQuestion(question) && action) {
     return "A proper castle starts with a strong gate. I’ll build a small cobblestone gate with two battlements and bright flags, one block at a time, so you can expand it into walls and towers.";
@@ -293,6 +340,7 @@ export function createWizard({
       const general = requestMode === "general";
       const instantAnswer = general ? undefined : instantConversationAnswer(question);
       const history = sessions.get(player, requestMode);
+      const buildRequest = !general && isBuildRequest(question);
       const includePreview = /\b(beta|preview|experimental)\b/i.test(question);
       const conversational = !general && isOrdinaryConversation(question);
       const retrievalQuery = general || conversational ? "" : isTFlipFlopQuestion(question)
@@ -300,12 +348,12 @@ export function createWizard({
         : isCalculatorQuestion(question)
           ? `${question} binary redstone calculator two bit full adder carry lamps`
           : question;
-      const rankedHits = general || conversational ? [] : corpus.search(retrievalQuery, { limit: 4, includePreview });
+      const rankedHits = general || conversational || buildRequest ? [] : corpus.search(retrievalQuery, { limit: 4, includePreview });
       const relevanceFloor = (rankedHits[0]?.score || 0) * 0.5;
       const hits = rankedHits.filter((hit) => hit.score >= relevanceFloor);
-      const action = general ? null : classifyAction(question);
+      const action = general ? null : classifyAction(question, history);
       let answer = instantAnswer || (general
-        ? "The general AI provider is offline. Ask an adult to start the local model bridge."
+        ? `${provider.label} did not answer yet. I’ll keep this request short and try again when you ask.`
         : localAnswer(question, hits, action));
       let selectedAction = action;
       let title = general ? bookTitle(question) : undefined;
@@ -318,20 +366,27 @@ export function createWizard({
           answer = envelope?.answer || providerAnswer;
           if (general) title = envelope?.title || title;
           else selectedAction = envelope.action;
-          if (!general && isBuildRequest(question) && !selectedAction) {
-            answer = "I couldn’t turn that into a safe player-build yet, and I won’t pretend I did. Try asking for a small castle gate, calculator, or T flip flop while I learn that design.";
+          if (!general && buildRequest && !selectedAction) {
+            answer = "My full design didn’t pass the build check, so I’m not leaving you waiting. I’ll lay a five-by-five prototype floor now; tell me the most important feature and I’ll build outward from it.";
+            selectedAction = prototypeAction();
+            responseMode = "local-prototype";
           }
           if (!general && unsafeCommandAnswer(answer)) {
             answer = safeCommandRefusal();
             selectedAction = null;
           }
-          responseMode = provider.name;
+          if (responseMode !== "local-prototype") responseMode = provider.name;
         } catch (error) {
           logger.warn(`[wizard] ${error.message}; using offline answer`);
           responseMode = "offline-fallback";
         }
       } else if (!tuning.aiEnabled) {
         responseMode = "admin-disabled";
+      }
+      if (!general && buildRequest && !selectedAction) {
+        answer = "My deeper plan is taking too long, so I’m starting instead of giving up. I’ll lay a five-by-five prototype floor now; tell me the most important feature and I’ll build outward from it.";
+        selectedAction = prototypeAction();
+        responseMode = "local-prototype";
       }
       const sources = [...new Map(hits.map((hit) => [hit.source, {
         title: hit.title,

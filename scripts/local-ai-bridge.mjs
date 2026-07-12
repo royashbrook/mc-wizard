@@ -7,7 +7,7 @@ const port = Number(process.env.MTOK_PORT) || 8790;
 const provider = process.env.MTOK_PROVIDER || "claude";
 const model = process.env.MTOK_MODEL || provider;
 const timeoutMs = Math.min(Math.max(Number(process.env.MTOK_TIMEOUT_MS) || 18_000, 5_000), 30_000);
-let inFlight = 0;
+let queue = Promise.resolve();
 const upstream = provider === "ollama"
   ? httpUpstream({ baseUrl: process.env.MTOK_UPSTREAM || "http://127.0.0.1:11434/v1" })
   : provider === "grok" ? grokUpstream : claudeUpstream;
@@ -120,12 +120,6 @@ const server = createServer(async (request, response) => {
     response.writeHead(404).end();
     return;
   }
-  if (inFlight >= 1) {
-    response.writeHead(429, { "content-type": "application/json" });
-    response.end(JSON.stringify({ error: "local model is already thinking" }));
-    return;
-  }
-
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
@@ -143,13 +137,15 @@ const server = createServer(async (request, response) => {
     response.writeHead(400).end();
     return;
   }
-  inFlight += 1;
+  const run = queue.then(() => serveChat({ body, models: [model], upstream }));
+  queue = run.catch(() => undefined);
   try {
-    const result = await serveChat({ body, models: [model], upstream });
+    const result = await run;
     response.writeHead(result.status, { "content-type": "application/json" });
     response.end(JSON.stringify(result.json));
-  } finally {
-    inFlight -= 1;
+  } catch (error) {
+    response.writeHead(502, { "content-type": "application/json" });
+    response.end(JSON.stringify({ error: String(error?.message || error) }));
   }
 });
 

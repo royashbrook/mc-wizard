@@ -8,7 +8,7 @@ const RUNTIME = path.join(ROOT, "runtime", "admin");
 const PID_FILE = path.join(RUNTIME, "admin.pid");
 const LOG_FILE = path.join(RUNTIME, "admin.log");
 const ADMIN_URL = `http://${process.env.ADMIN_HOST || "127.0.0.1"}:${process.env.ADMIN_PORT || 3001}`;
-const ADMIN_PATTERN = path.join(ROOT, "src", "admin.mjs");
+const ADMIN_PATTERN = path.join(ROOT, "src", "admin.mjs").replace("/", "[/]");
 
 function adminPids() {
   return new Promise((resolve) => {
@@ -16,7 +16,7 @@ function adminPids() {
     let output = "";
     child.stdout.on("data", (chunk) => { output += chunk; });
     child.once("error", () => resolve([]));
-    child.once("exit", () => resolve(output.split(/\s+/).map(Number).filter(Number.isInteger)));
+    child.once("exit", () => resolve(output.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0)));
   });
 }
 

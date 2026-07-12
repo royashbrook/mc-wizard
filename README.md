@@ -301,7 +301,7 @@ Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not 
 
 ## Known limits of this spike
 
-- The live iPad test verified the visible player entity, chat, AI books, and basic mechanics. The fitted costume, custom wand, and T-flip-flop's real-client copper-bulb transition still need a quick iPad visual check. The current Script API can read a simulated player's skin but cannot assign one, so the costume uses fitted attachables rather than a replacement player skin.
+- The live iPad test verified the visible player entity, chat, AI books, and basic mechanics. The custom wand and T-flip-flop's real-client copper-bulb transition still need a quick iPad visual check. The fitted costume was removed after testing because it obscured the player model.
 - The T flip-flop, calculator, command lessons, and validated plans are transactional and undoable. They require bounded clear areas, reject occupied/protected overlaps, and roll back on failure or disconnect.
 - The current documented Script API cannot safely program arbitrary command-block text. Prepared lesson definitions make the Wizard physically place the command block and button, then tell the child exactly what to paste; they deliberately do not `/structure load` a prebuilt result.
 - Official Microsoft documentation is not a complete gameplay encyclopedia. Fill gaps with versioned, self-authored mechanic cards backed by reproducible Bedrock tests. Do not ingest the community wiki by default without accepting its attribution, noncommercial, and share-alike requirements.
@@ -313,7 +313,7 @@ MC Wizard is released under the [MIT License](./LICENSE). Microsoft Minecraft do
 
 ## Next proof points
 
-1. Complete the remaining iPad visual checks for the costume and real-client copper-bulb transition.
+1. Complete the remaining iPad visual checks for the wand and real-client copper-bulb transition.
 2. Add a scheduled world-backup restore drill for the explicitly open private-LAN server.
 3. Expand the evaluated mechanic-card catalog before broadening the arbitrary-plan block allowlist.
 4. Replace or separately license the calculator geometry before commercial distribution.

@@ -41,9 +41,10 @@ let installPackScript;
 let resourceManifest;
 let syncDocsScript;
 let supervisorScript;
+let adminServiceScript;
 
 before(async () => {
-  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText] = await Promise.all([
+  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText, adminServiceText] = await Promise.all([
     loadCorpus(),
     readFile(new URL("../bedrock/behavior_packs/mc_wizard/manifest.json", import.meta.url), "utf8"),
     readFile(new URL("../bedrock/config/4e8790fe-18dc-46d1-aa31-ec78a924b717/permissions.json", import.meta.url), "utf8"),
@@ -56,6 +57,7 @@ before(async () => {
     readFile(new URL("../bedrock/resource_packs/mc_wizard/manifest.json", import.meta.url), "utf8"),
     readFile(new URL("../scripts/sync-docs.mjs", import.meta.url), "utf8"),
     readFile(new URL("../scripts/supervisor.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/admin-service.mjs", import.meta.url), "utf8"),
   ]);
   corpus = loadedCorpus;
   packManifest = JSON.parse(manifestText);
@@ -69,6 +71,7 @@ before(async () => {
   resourceManifest = JSON.parse(resourceManifestText);
   syncDocsScript = syncDocsText;
   supervisorScript = supervisorText;
+  adminServiceScript = adminServiceText;
   wizard = createWizard({ corpus, env: {} });
 });
 
@@ -118,7 +121,10 @@ test("embodies the guide as an official simulated player", () => {
   )));
   assert.ok(packPermissions.allowed_modules.includes("@minecraft/server-gametest"));
   assert.match(packScript, /spawnSimulatedPlayer/);
-  assert.match(packScript, /navigateToEntity/);
+  assert.match(packScript, /navigateToLocation/);
+  assert.match(packScript, /function moveWizardBeside/);
+  assert.match(packScript, /distance < 2\.25 \* 2\.25/);
+  assert.doesNotMatch(packScript, /navigateToEntity\(player/);
   assert.match(packScript, /\.chat\(/);
   assert.match(packScript, /useItemOnBlock/);
   assert.match(packScript, /if \(!placed\)/);
@@ -130,19 +136,16 @@ test("embodies the guide as an official simulated player", () => {
   assert.match(packScript, /wizard\.setItem\(item, 0, true\)/);
 });
 
-test("ships and equips a visible wizard costume with a vanilla fallback", () => {
+test("ships a custom wand without covering the simulated player in costume geometry", () => {
   assert.equal(resourceManifest.header.uuid, "5dd80b07-b583-4bb3-979c-41c25ce274d8");
   assert.ok(packManifest.dependencies.some((dependency) => dependency.uuid === resourceManifest.header.uuid));
   assert.match(installPackScript, /resource_packs/);
   assert.match(installPackScript, /world_resource_packs\.json/);
-  assert.match(packScript, /EquipmentSlot\.Head/);
-  assert.match(packScript, /EquipmentSlot\.Chest/);
-  assert.match(packScript, /mcwizard:hat/);
-  assert.match(packScript, /mcwizard:robe/);
   assert.match(packScript, /mcwizard:wand/);
   assert.doesNotMatch(packScript, /minecraft:blaze_rod/);
-  assert.match(packScript, /minecraft:leather_helmet/);
-  assert.match(packScript, /minecraft:leather_chestplate/);
+  assert.doesNotMatch(packScript, /function dressWizard/);
+  assert.match(packScript, /function removeOldCostume/);
+  assert.doesNotMatch(packScript, /new ItemStack\("(?:mcwizard:(?:hat|robe)|minecraft:leather_(?:helmet|chestplate))"/);
 });
 
 test("prepares fixed command-block lessons and rejects unsafe generated commands", () => {
@@ -256,8 +259,17 @@ test("constrains CLI providers to text-only ephemeral safe mode", () => {
   assert.match(localBridgeScript, /"--output-format", "plain"/);
   assert.match(localBridgeScript, /host = "127\.0\.0\.1"/);
   assert.match(localBridgeScript, /MTOK_TIMEOUT_MS/);
-  assert.match(localBridgeScript, /inFlight >= 1/);
+  assert.match(localBridgeScript, /let queue = Promise\.resolve\(\)/);
+  assert.match(localBridgeScript, /queue = run\.catch/);
+  assert.doesNotMatch(localBridgeScript, /writeHead\(429/);
   assert.doesNotMatch(localBridgeScript, /dangerously-skip|bypassPermissions/);
+});
+
+test("process discovery patterns cannot match their own pgrep commands", () => {
+  assert.match(supervisorScript, /replace\("\/", "\[\/\]"\)/);
+  assert.match(adminServiceScript, /replace\("\/", "\[\/\]"\)/);
+  assert.match(supervisorScript, /pid > 0/);
+  assert.match(adminServiceScript, /pid > 0/);
 });
 
 test("pins and confines the Apple container launch to an explicit private-LAN mode", () => {
@@ -369,6 +381,29 @@ test("starts a bounded castle gate locally without waiting for a provider", asyn
   assert.match(result.answer, /strong gate/i);
 });
 
+test("expands a castle follow-up into four complete walls without a provider", async () => {
+  const action = classifyAction("Make it bigger and give it four walls", [
+    { question: "Build me a castle", answer: "I built a small castle gate." },
+  ]);
+  assert.equal(action.type, "build_plan");
+  assert.equal(action.plan.title, "Four Wall Castle");
+  assert.equal(validateBuildPlan(action.plan).blocks.length, 94);
+});
+
+test("starts a validated prototype when a novel build provider fails", async () => {
+  const fallbackWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "slow", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => { throw new Error("timeout"); },
+  });
+  const result = await fallbackWizard.ask({ player: "Kid", question: "Build me a moon base" });
+  assert.equal(result.mode, "local-prototype");
+  assert.equal(result.action.type, "build_plan");
+  assert.equal(validateBuildPlan(result.action.plan).blocks.length, 25);
+  assert.match(result.answer, /starting instead of giving up/i);
+});
+
 test("validates bounded support-ordered custom plans and directional logs", () => {
   const plan = validateBuildPlan({
     title: "Tiny arch",
@@ -457,7 +492,17 @@ test("answers ordinary conversation instantly without invoking the provider", as
   assert.equal(greeting.mode, "local-instant");
   assert.equal(providerCalled, false);
   assert.match(instantConversationAnswer("are you ready?"), /Ready!/);
+  assert.match(instantConversationAnswer("what's up?"), /wand ready/i);
+  assert.match(instantConversationAnswer("what do you think of the weather?"), /clear skies/i);
   assert.doesNotMatch(greeting.answer, /source|verified note/i);
+});
+
+test("uses live world state for small talk and ambient Wizard behavior", () => {
+  assert.match(packScript, /function worldSmallTalk/);
+  assert.match(packScript, /getWeather\(\)/);
+  assert.match(packScript, /world\.getTimeOfDay\(\)/);
+  assert.match(packScript, /function idleLookAround/);
+  assert.match(packScript, /minecraft:redstone_wire/);
 });
 
 test("cancels stale replies and keeps children updated while deeper work runs", () => {
