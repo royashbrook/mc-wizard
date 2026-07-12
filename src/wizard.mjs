@@ -42,6 +42,26 @@ function isCalculatorQuestion(question) {
     || /\badd(?:ing)?\b.{0,50}\b(?:numbers?|binary|redstone)\b/i.test(question);
 }
 
+function isCastleQuestion(question) {
+  return /\b(?:castle|fort|fortress|castle\s+gate)\b/i.test(question);
+}
+
+function smallCastleAction() {
+  const blocks = [];
+  const add = (target, support, itemId = "minecraft:cobblestone") => {
+    blocks.push({ target, support, itemId });
+  };
+  for (const x of [-3, -2, -1, 1, 2, 3]) add([x, 0, 3], [x, -1, 3]);
+  for (const x of [-3, -2, -1, 1, 2, 3]) add([x, 1, 3], [x, 0, 3]);
+  for (const x of [-3, -2, -1]) add([x, 2, 3], [x, 1, 3]);
+  add([0, 2, 3], [-1, 2, 3]);
+  for (const x of [1, 2, 3]) add([x, 2, 3], [x, 1, 3]);
+  for (const x of [-3, -1, 1, 3]) add([x, 3, 3], [x, 2, 3]);
+  add([-3, 4, 3], [-3, 3, 3], "minecraft:red_wool");
+  add([3, 4, 3], [3, 3, 3], "minecraft:blue_wool");
+  return { type: "build_plan", version: 1, plan: { title: "Mini Castle Gate", blocks } };
+}
+
 function isOrdinaryConversation(question) {
   const text = question.trim();
   return /^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
@@ -88,6 +108,7 @@ export function classifyAction(question) {
       version: 1,
     };
   }
+  if (wantsBuild && isCastleQuestion(question)) return smallCastleAction();
   return null;
 }
 
@@ -95,18 +116,6 @@ function isBuildRequest(question) {
   return !/\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
     && !/\bjust\s+(?:explain|describe|tell)\b/i.test(question)
     && /\b(build|construct|create|make|place|demo|demonstrate|show me)\b/i.test(question);
-}
-
-function cleanExcerpt(text, maxLength = 520) {
-  const clean = text
-    .replace(/^#{1,6}\s+/gm, "")
-    .replace(/```[\s\S]*?```/g, "")
-    .replace(/\[([^\]]+)]\([^\)]+\)/g, "$1")
-    .replace(/[*_`>|]/g, "")
-    .replace(/\s+/g, " ")
-    .trim();
-  if (clean.length <= maxLength) return clean;
-  return `${clean.slice(0, maxLength).replace(/\s+\S*$/, "")}…`;
 }
 
 function localAnswer(question, hits, action) {
@@ -133,11 +142,14 @@ function localAnswer(question, hits, action) {
     }
     return `${intro} In modern Bedrock, a copper bulb is the smallest example. Put a button on the bulb. Each press toggles the light; a comparator reading the bulb gives signal 15 when lit and 0 when dark.`;
   }
+  if (isCastleQuestion(question) && action) {
+    return "A proper castle starts with a strong gate. I’ll build a small cobblestone gate with two battlements and bright flags, one block at a time, so you can expand it into walls and towers.";
+  }
 
   if (!hits.length) {
     return "I’m not certain what you mean yet. What result do you want in the world, and which block or command are you trying to use?";
   }
-  return `Here’s the short Bedrock answer: ${cleanExcerpt(hits[0].text, 430)} Try it first in a small test area, and tell me what happens.`;
+  return "My deeper-thinking spell is unavailable right now. I found relevant Bedrock notes, but I won’t read raw documentation at you. Ask again in a moment, or ask me to build a small calculator, T flip-flop, or castle gate while we wait.";
 }
 
 function providerFrom(env) {
@@ -297,23 +309,18 @@ export function createWizard({
         : localAnswer(question, hits, action));
       let selectedAction = action;
       let title = general ? bookTitle(question) : undefined;
-      let responseMode = instantAnswer ? "local-instant" : "offline";
-      if (!instantAnswer && provider.enabled && tuning.aiEnabled) {
+      let responseMode = instantAnswer ? "local-instant" : action ? "local-skill" : "offline";
+      if (!instantAnswer && !action && provider.enabled && tuning.aiEnabled) {
         try {
-          let providerAnswer = await askProvider({ provider, fetchImpl, question, hits, history, player, env, general, tuning });
-          let envelope = general ? generalEnvelope(providerAnswer, question) : wizardEnvelope(providerAnswer);
-          if (!general && isBuildRequest(question) && !action && !envelope?.action) {
-            const correction = `${question}\n\nAction contract correction: Return a valid non-null build action. If the full request exceeds the safe plan limits, build a recognizable miniature or first section now. Do not merely promise, explain, or ask permission.`;
-            const retryAnswer = await askProvider({ provider, fetchImpl, question: correction, hits, history, player, env, general, tuning });
-            const retryEnvelope = wizardEnvelope(retryAnswer);
-            if (retryEnvelope?.action) {
-              providerAnswer = retryAnswer;
-              envelope = retryEnvelope;
-            }
-          }
+          const providerAnswer = await askProvider({ provider, fetchImpl, question, hits, history, player, env, general, tuning });
+          const envelope = general ? generalEnvelope(providerAnswer, question) : wizardEnvelope(providerAnswer);
+          if (!general && !envelope) throw new Error("AI provider returned an invalid Wizard response");
           answer = envelope?.answer || providerAnswer;
           if (general) title = envelope?.title || title;
-          else if (envelope) selectedAction = envelope.action || action;
+          else selectedAction = envelope.action;
+          if (!general && isBuildRequest(question) && !selectedAction) {
+            answer = "I couldn’t turn that into a safe player-build yet, and I won’t pretend I did. Try asking for a small castle gate, calculator, or T flip flop while I learn that design.";
+          }
           if (!general && unsafeCommandAnswer(answer)) {
             answer = safeCommandRefusal();
             selectedAction = null;

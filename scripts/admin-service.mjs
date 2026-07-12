@@ -8,6 +8,17 @@ const RUNTIME = path.join(ROOT, "runtime", "admin");
 const PID_FILE = path.join(RUNTIME, "admin.pid");
 const LOG_FILE = path.join(RUNTIME, "admin.log");
 const ADMIN_URL = `http://${process.env.ADMIN_HOST || "127.0.0.1"}:${process.env.ADMIN_PORT || 3001}`;
+const ADMIN_PATTERN = path.join(ROOT, "src", "admin.mjs");
+
+function adminPids() {
+  return new Promise((resolve) => {
+    const child = spawn("pgrep", ["-f", ADMIN_PATTERN], { stdio: ["ignore", "pipe", "ignore"] });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.once("error", () => resolve([]));
+    child.once("exit", () => resolve(output.split(/\s+/).map(Number).filter(Number.isInteger)));
+  });
+}
 
 async function currentPid() {
   try {
@@ -15,7 +26,11 @@ async function currentPid() {
     process.kill(pid, 0);
     return pid;
   } catch {
-    return undefined;
+    const [pid] = await adminPids();
+    if (!pid) return undefined;
+    await mkdir(RUNTIME, { recursive: true });
+    await writeFile(PID_FILE, `${pid}\n`, { mode: 0o600 });
+    return pid;
   }
 }
 

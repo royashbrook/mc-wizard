@@ -10,17 +10,23 @@ const timeoutMs = Math.min(Math.max(Number(process.env.MTOK_TIMEOUT_MS) || 18_00
 let inFlight = 0;
 const upstream = provider === "ollama"
   ? httpUpstream({ baseUrl: process.env.MTOK_UPSTREAM || "http://127.0.0.1:11434/v1" })
-  : claudeUpstream;
+  : provider === "grok" ? grokUpstream : claudeUpstream;
+
+function cliInput(payload) {
+  return {
+    systemPrompt: payload.messages
+      .filter((message) => message.role === "system")
+      .map((message) => message.content)
+      .join("\n\n"),
+    prompt: payload.messages
+      .filter((message) => message.role !== "system")
+      .map((message) => `${message.role === "assistant" ? "Assistant" : "Player"}: ${message.content}`)
+      .join("\n\n"),
+  };
+}
 
 function claudeUpstream(payload) {
-  const systemPrompt = payload.messages
-    .filter((message) => message.role === "system")
-    .map((message) => message.content)
-    .join("\n\n");
-  const prompt = payload.messages
-    .filter((message) => message.role !== "system")
-    .map((message) => `${message.role === "assistant" ? "Assistant" : "Player"}: ${message.content}`)
-    .join("\n\n");
+  const { systemPrompt, prompt } = cliInput(payload);
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const child = spawn("claude", [
@@ -56,6 +62,51 @@ function claudeUpstream(payload) {
       });
     });
     child.stdin.end(prompt);
+  });
+}
+
+function grokUpstream(payload) {
+  const { systemPrompt, prompt } = cliInput(payload);
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const child = spawn("grok", [
+      "--single", prompt,
+      "--cwd", "/private/tmp",
+      "--no-memory",
+      "--no-subagents",
+      "--disable-web-search",
+      "--tools", "",
+      "--max-turns", "1",
+      "--output-format", "plain",
+      "--system-prompt-override", systemPrompt || "Answer clearly and use no tools.",
+      "--verbatim",
+    ], { cwd: "/private/tmp", env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    let output = "";
+    let errorOutput = "";
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => { output = (output + chunk).slice(0, 64 * 1024); });
+    child.stderr.on("data", (chunk) => { errorOutput = (errorOutput + chunk).slice(-2_000); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      console.log(`[mc-wizard] grok request finished in ${Date.now() - startedAt}ms; code=${code}`);
+      if (code !== 0) {
+        reject(new Error(timedOut ? `Grok timed out after ${timeoutMs}ms` : errorOutput.trim() || `Grok exited ${code}`));
+        return;
+      }
+      const content = output.trim();
+      if (!content) return reject(new Error("Grok returned no output"));
+      resolve({
+        object: "chat.completion",
+        model,
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+      });
+    });
   });
 }
 

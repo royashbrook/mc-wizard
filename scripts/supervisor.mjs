@@ -7,6 +7,7 @@ const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const RUNTIME = path.join(ROOT, "runtime", "supervisor");
 const PID_FILE = path.join(RUNTIME, "mc-wizard.pid");
 const LOG_FILE = path.join(RUNTIME, "mc-wizard.log");
+const DAEMON_PATTERN = `${path.join(ROOT, "scripts", "supervisor.mjs")} daemon`;
 
 function run(command, args, options = {}) {
   return new Promise((resolve) => {
@@ -16,13 +17,27 @@ function run(command, args, options = {}) {
   });
 }
 
+function daemonPids() {
+  return new Promise((resolve) => {
+    const child = spawn("pgrep", ["-f", DAEMON_PATTERN], { stdio: ["ignore", "pipe", "ignore"] });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.once("error", () => resolve([]));
+    child.once("exit", () => resolve(output.split(/\s+/).map(Number).filter(Number.isInteger)));
+  });
+}
+
 async function currentPid() {
   try {
     const pid = Number(await readFile(PID_FILE, "utf8"));
     process.kill(pid, 0);
     return pid;
   } catch {
-    return undefined;
+    const [pid] = await daemonPids();
+    if (!pid) return undefined;
+    await mkdir(RUNTIME, { recursive: true });
+    await writeFile(PID_FILE, `${pid}\n`, { mode: 0o600 });
+    return pid;
   }
 }
 
@@ -57,6 +72,7 @@ async function status() {
 }
 
 async function daemon() {
+  if ((await daemonPids()).some((pid) => pid !== process.pid)) return;
   await mkdir(RUNTIME, { recursive: true });
   await writeFile(PID_FILE, `${process.pid}\n`, { mode: 0o600 });
   const log = await open(LOG_FILE, "a", 0o600);

@@ -104,7 +104,7 @@ const PAGE = `<!doctype html>
     </div>
     <div class="stack">
       <section class="panel"><h2>AI tuning</h2><p class="help">Saved changes apply to the next AI request. Bedrock does not restart. Core safety and action contracts remain active.</p><label class="check"><input type="checkbox" id="aiEnabled">Use the configured AI provider</label><label>MC Wizard prompt addendum<textarea id="wizardPrompt" placeholder="Example: Keep replies under four sentences unless the player asks for a lesson."></textarea></label><label>General AI prompt addendum<textarea id="generalPrompt" placeholder="Example: Use short section headings for long guides."></textarea></label><div class="row"><label>Wizard max output tokens<input id="wizardTokens" type="number" min="64" max="3000" placeholder="Use environment default"></label><label>General max output tokens<input id="generalTokens" type="number" min="64" max="3000" placeholder="Use environment default"></label></div><div class="actions" style="margin-top:16px"><button class="button primary" id="save">Save live tuning</button><button class="button" id="reload">Discard edits</button></div><div class="saved" id="saveStatus"></div></section>
-      <section class="panel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><h2>Recent server log</h2><p class="help">Console replies and player activity appear here.</p></div><button class="button" id="refreshLogs">Refresh</button></div><pre id="logs">Loading...</pre></section>
+      <section class="panel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><h2>Recent server log</h2><p class="help">Console replies and player activity appear here. Routine Bedrock database compaction is hidden; it is not AI activity and uses no tokens.</p></div><button class="button" id="refreshLogs">Refresh</button></div><pre id="logs">Loading...</pre></section>
     </div>
   </div>
   <p class="footer">Loopback only: this desk is available on this Mac, not to players on the LAN.</p>
@@ -146,7 +146,11 @@ export function createAdminServer({
       }
       if (request.method === "GET" && url.pathname === "/api/logs") {
         const result = await execute("container", ["logs", "-n", "120", "mc-wizard-bedrock"]);
-        return send(response, result.code === 0 ? 200 : 503, result.code === 0 ? { logs: result.output } : { error: result.output || "Bedrock logs unavailable" });
+        if (result.code !== 0) return send(response, 503, { error: result.output || "Bedrock logs unavailable" });
+        const lines = result.output.split("\n");
+        const maintenance = lines.filter((line) => line.includes("Running AutoCompaction...")).length;
+        const logs = lines.filter((line) => !line.includes("Running AutoCompaction...")).join("\n");
+        return send(response, 200, { logs: `${logs}\n[operator desk] Hidden ${maintenance} routine Bedrock database-compaction messages (0 AI requests, 0 AI tokens).` });
       }
       if (request.method === "POST" && url.pathname === "/api/console") {
         const command = validateConsoleCommand((await readJson(request)).command);

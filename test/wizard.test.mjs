@@ -171,6 +171,8 @@ test("promotes versioned documentation only after retrieval and dialogue evaluat
 
 test("supervises Bedrock, brain, provider, and corpus without secrets in status", () => {
   assert.match(supervisorScript, /Math\.min\(30_000/);
+  assert.match(supervisorScript, /function daemonPids\(\)/);
+  assert.match(supervisorScript, /pgrep/);
   assert.match(supervisorScript, /container", \["exec", "mc-wizard-bedrock", "true"\]/);
   assert.match(supervisorScript, /corpusChunks/);
   assert.match(supervisorScript, /providerName/);
@@ -242,11 +244,16 @@ test("creates readable book pages and whole-word titles", () => {
   assert.match(pages.join("\n"), /• Find wood/);
 });
 
-test("constrains the Claude CLI bridge to text-only ephemeral safe mode", () => {
+test("constrains CLI providers to text-only ephemeral safe mode", () => {
   assert.match(localBridgeScript, /from "mtok-bridge"/);
   assert.match(localBridgeScript, /"--safe-mode"/);
   assert.match(localBridgeScript, /"--tools", ""/);
   assert.match(localBridgeScript, /"--no-session-persistence"/);
+  assert.match(localBridgeScript, /provider === "grok"/);
+  assert.match(localBridgeScript, /"--no-memory"/);
+  assert.match(localBridgeScript, /"--no-subagents"/);
+  assert.match(localBridgeScript, /"--disable-web-search"/);
+  assert.match(localBridgeScript, /"--output-format", "plain"/);
   assert.match(localBridgeScript, /host = "127\.0\.0\.1"/);
   assert.match(localBridgeScript, /MTOK_TIMEOUT_MS/);
   assert.match(localBridgeScript, /inFlight >= 1/);
@@ -344,6 +351,24 @@ test("plans a bounded two-bit redstone calculator and all 16 sums", () => {
   }
 });
 
+test("starts a bounded castle gate locally without waiting for a provider", async () => {
+  let providerCalled = false;
+  const castleWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "slow", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalled = true;
+      throw new Error("provider should not be called for a local skill");
+    },
+  });
+  const result = await castleWizard.ask({ player: "Kid", question: "Build me a castle" });
+  assert.equal(providerCalled, false);
+  assert.equal(result.mode, "local-skill");
+  assert.equal(result.action.type, "build_plan");
+  assert.equal(validateBuildPlan(result.action.plan).blocks.length, 25);
+  assert.match(result.answer, /strong gate/i);
+});
+
 test("validates bounded support-ordered custom plans and directional logs", () => {
   const plan = validateBuildPlan({
     title: "Tiny arch",
@@ -391,13 +416,13 @@ test("executes custom plans through player placement with journaled rollback and
 
 test("returns an offline answer with sources and a typed action", async () => {
   const result = await wizard.ask({ player: "BuilderKid", question: "Build a T flip flop for me" });
-  assert.equal(result.mode, "offline");
+  assert.equal(result.mode, "local-skill");
   assert.equal(result.action.id, "copper_bulb_t_flip_flop");
   assert.match(result.answer, /copper bulb/i);
   assert.ok(result.sources.length > 0);
 });
 
-test("uses retrieved material for specific command-block questions", async () => {
+test("never dumps retrieved documentation when the model is unavailable", async () => {
   const commandWizard = createWizard({
     env: {},
     corpus: {
@@ -413,8 +438,8 @@ test("uses retrieved material for specific command-block questions", async () =>
     },
   });
   const result = await commandWizard.ask({ question: "How do I clone a building with command blocks?" });
-  assert.match(result.answer, /\/clone command copies blocks/i);
-  assert.doesNotMatch(result.answer, /closest verified note|from “clone Command”/i);
+  assert.doesNotMatch(result.answer, /\/clone command copies blocks/i);
+  assert.match(result.answer, /won’t read raw documentation/i);
 });
 
 test("answers ordinary conversation instantly without invoking the provider", async () => {
@@ -458,11 +483,11 @@ test("uses the OpenAI Responses adapter without giving the model build authority
     fetchImpl: async (url, options) => {
       request = { url, options, body: JSON.parse(options.body) };
       return new Response(JSON.stringify({
-        output: [{ content: [{ type: "output_text", text: "A model-backed answer." }] }],
+        output: [{ content: [{ type: "output_text", text: JSON.stringify({ answer: "A model-backed answer.", action: null }) }] }],
       }), { status: 200, headers: { "content-type": "application/json" } });
     },
   });
-  const result = await modelWizard.ask({ player: "BuilderKid", question: "Build a T flip flop" });
+  const result = await modelWizard.ask({ player: "BuilderKid", question: "What powers redstone dust?" });
   assert.equal(request.url, "https://api.example/v1/responses");
   assert.equal(request.body.store, false);
   assert.equal(request.body.max_output_tokens, 300);
@@ -470,7 +495,7 @@ test("uses the OpenAI Responses adapter without giving the model build authority
   assert.equal(request.options.headers.authorization, "Bearer test-key");
   assert.doesNotMatch(request.body.input, /BuilderKid/);
   assert.equal(result.answer, "A model-backed answer.");
-  assert.equal(result.action.id, "copper_bulb_t_flip_flop");
+  assert.equal(result.action, null);
 });
 
 test("supports an OpenAI-compatible chat endpoint without an API key", async () => {
@@ -481,7 +506,7 @@ test("supports an OpenAI-compatible chat endpoint without an API key", async () 
     logger: { warn() {} },
     fetchImpl: async (url) => {
       requestUrl = url;
-      return new Response(JSON.stringify({ choices: [{ message: { content: "Local model answer." } }] }), {
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ answer: "Local model answer.", action: null }) } }] }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -552,46 +577,12 @@ test("lets the model select only registered Wizard skills and carries session hi
       });
     },
   });
-  const built = await agentWizard.ask({ player: "Kid", question: "build a calculator" });
+  const built = await agentWizard.ask({ player: "Kid", question: "build a strange monument" });
   const followup = await agentWizard.ask({ player: "Kid", question: "what were we doing?" });
   assert.equal(built.action.id, "binary_adder_2bit");
   assert.equal(followup.action, null);
   assert.match(requests[0].messages[0].content, /build_two_bit_calculator/);
   assert.match(requests[1].messages[1].content, /I’ll build the calculator now/);
-});
-
-test("retries a promised build until the provider supplies a safe action", async () => {
-  const requests = [];
-  const actionWizard = createWizard({
-    corpus,
-    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "claude", AI_STYLE: "chat" },
-    logger: { warn() {} },
-    fetchImpl: async (_url, options) => {
-      requests.push(JSON.parse(options.body));
-      const content = requests.length === 1
-        ? JSON.stringify({ answer: "I’ll build a small tower now.", action: null })
-        : JSON.stringify({
-            answer: "I’ll start with a small stone castle tower.",
-            action: {
-              type: "build_plan",
-              version: 1,
-              plan: {
-                title: "Castle tower",
-                blocks: [{ target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:stone" }],
-              },
-            },
-          });
-      return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
-        status: 200,
-        headers: { "content-type": "application/json" },
-      });
-    },
-  });
-  const result = await actionWizard.ask({ player: "Kid", question: "Build me a giant castle" });
-  assert.equal(requests.length, 2);
-  assert.match(requests[1].messages[1].content, /Action contract correction/);
-  assert.equal(result.action.type, "build_plan");
-  assert.match(result.answer, /castle tower/i);
 });
 
 test("persists bounded separate sessions without plaintext player identity", async () => {
@@ -692,4 +683,7 @@ test("serves a loopback admin desk and sends console text without a shell", asyn
   assert.match(adminScript, /Admin panel is loopback-only/);
   assert.match(adminScript, /setInterval\(loadLogs,4000\)/);
   assert.match(adminScript, /scrollTop=panel\.scrollHeight/);
+  assert.match(adminScript, /Hidden.*routine Bedrock database-compaction messages/);
+  assert.match(adminScript, /0 AI requests, 0 AI tokens/);
+  assert.match(await readFile(new URL("../scripts/admin-service.mjs", import.meta.url), "utf8"), /function adminPids\(\)/);
 });
