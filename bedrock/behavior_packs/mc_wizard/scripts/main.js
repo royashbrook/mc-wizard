@@ -54,12 +54,15 @@ const BUILD_REACH_SQUARED = 5.5 * 5.5;
 const lastBuildTick = new Map();
 const greetedPlayers = new Set();
 const engineAddressedMessageCounts = new Map();
+const queuedBuilds = new Map();
 const lastUndo = new Map();
 const placementRetries = new Map();
 const preparedPlacements = new Set();
 const protectedRegions = [];
 const TRANSACTION_JOURNAL = "mcwizard:active_transaction";
 const UNDO_RETENTION_TICKS = 20 * 60 * 10;
+const WORKSHOP_COUNTER = "mcwizard:workshop_counter";
+const WORKSHOP_TICKING_AREA = "mc_wizard_workshop";
 
 let wizard;
 let followPlayerId;
@@ -141,7 +144,7 @@ function deliverModelAnswer(player, payload, question) {
     const component = book.getComponent("minecraft:book");
     if (!component) throw new Error("book component is unavailable");
     component.setContents(bookPages(answer));
-    component.signBook(bookTitle(question), label);
+    component.signBook(bookTitle(payload.title || question), label);
     player.dimension.spawnItem(book, {
       x: player.location.x,
       y: player.location.y + 0.5,
@@ -457,6 +460,72 @@ function recoverInterruptedTransaction() {
   } finally {
     world.setDynamicProperty(TRANSACTION_JOURNAL, undefined);
   }
+}
+
+async function prepareBuildWorkshop(player) {
+  try {
+    const sequence = Math.max(0, Number(world.getDynamicProperty(WORKSHOP_COUNTER)) || 0);
+    world.setDynamicProperty(WORKSHOP_COUNTER, sequence + 1);
+    const dimension = world.getDimension("overworld");
+    const spawn = world.getDefaultSpawnLocation();
+    const center = {
+      x: Math.floor(spawn.x) + 48 + (sequence % 8) * 64,
+      y: 256,
+      z: Math.floor(spawn.z) + 48 + Math.floor(sequence / 8) * 64,
+    };
+    speak(player, "No room here—opening a fresh workshop and moving us there now.");
+    try {
+      dimension.runCommand(`tickingarea remove ${WORKSHOP_TICKING_AREA}`);
+    } catch {}
+    dimension.runCommand(`tickingarea add circle ${center.x} ${center.y} ${center.z} 4 ${WORKSHOP_TICKING_AREA} true`);
+    player.teleport({ x: center.x + 0.5, y: center.y, z: center.z + 0.5 }, { dimension });
+    await system.waitTicks(20);
+    dimension.runCommand(`fill ${center.x - 24} ${center.y} ${center.z - 24} ${center.x} ${center.y + 24} ${center.z + 24} air`);
+    dimension.runCommand(`fill ${center.x + 1} ${center.y} ${center.z - 24} ${center.x + 24} ${center.y + 24} ${center.z + 24} air`);
+    dimension.runCommand(`fill ${center.x - 24} ${center.y - 1} ${center.z - 24} ${center.x + 24} ${center.y - 1} ${center.z + 24} grass_block`);
+    await system.waitTicks(1);
+    if (dimension.getBlock({ x: center.x, y: center.y - 1, z: center.z })?.typeId !== "minecraft:grass_block"
+      || dimension.getBlock(center)?.typeId !== "minecraft:air") {
+      throw new Error("workshop blocks were not loaded after preparation");
+    }
+    player.teleport({ x: center.x + 0.5, y: center.y, z: center.z + 0.5 }, { dimension });
+    if (wizardIsValid()) {
+      wizard.teleport({ x: center.x + 2.5, y: center.y, z: center.z + 0.5 }, { dimension });
+    }
+    system.runTimeout(() => {
+      try {
+        dimension.runCommand(`tickingarea remove ${WORKSHOP_TICKING_AREA}`);
+      } catch {}
+    }, 12_000);
+    console.warn(`[MC Wizard] prepared workshop ${sequence} for ${player.name}`);
+    return true;
+  } catch (error) {
+    console.warn(`[MC Wizard] could not prepare a workshop: ${error}`);
+    speak(player, "My workshop spell failed, so I stopped before changing this area. Try that request once more.");
+    return false;
+  }
+}
+
+function queueBuild(player, callback, delayTicks = 40, message = "I queued that build and will start it automatically.") {
+  const alreadyQueued = queuedBuilds.has(player.id);
+  queuedBuilds.set(player.id, callback);
+  speak(player, alreadyQueued ? "I updated your queued build request." : message);
+  if (alreadyQueued) return;
+  const attempt = () => {
+    const current = playerById(player.id);
+    if (!current) {
+      queuedBuilds.delete(player.id);
+      return;
+    }
+    if (buildInProgress) {
+      system.runTimeout(attempt, 40);
+      return;
+    }
+    const queued = queuedBuilds.get(player.id);
+    queuedBuilds.delete(player.id);
+    if (queued) queued(current);
+  };
+  system.runTimeout(attempt, delayTicks);
 }
 
 function findClearSite(player, forward, right) {
@@ -952,26 +1021,37 @@ function runBuildSteps(
   );
 }
 
-function buildCopperBulbTFlipFlop(player) {
+async function buildCopperBulbTFlipFlop(player) {
   console.warn("[MC Wizard] T flip-flop build requested by " + player.name);
   const previousBuild = lastBuildTick.get(player.id) || -Infinity;
   if (system.currentTick - previousBuild < 200) {
-    speak(player, "Give me a few seconds before placing another demo.");
+    queueBuild(
+      player,
+      buildCopperBulbTFlipFlop,
+      200 - (system.currentTick - previousBuild),
+      "I queued that T flip-flop and will start it in a few seconds.",
+    );
     return;
   }
   if (buildInProgress) {
-    speak(player, "I’m already building one demo. I’ll finish that first.");
+    queueBuild(player, buildCopperBulbTFlipFlop);
     return;
   }
 
-  const dimension = player.dimension;
-  const forward = cardinalDirection(player);
+  let dimension = player.dimension;
+  let forward = cardinalDirection(player);
   console.warn("[MC Wizard] T flip-flop facing " + forward.name);
-  const right = { x: -forward.z, z: forward.x };
-  const base = findClearSite(player, forward, right);
+  let right = { x: -forward.z, z: forward.x };
+  let base = findClearSite(player, forward, right);
+  if (!base && await prepareBuildWorkshop(player)) {
+    dimension = player.dimension;
+    forward = cardinalDirection(player);
+    right = { x: -forward.z, z: forward.x };
+    base = findClearSite(player, forward, right);
+  }
   if (!base) {
     console.warn("[MC Wizard] no clear T flip-flop site near " + player.name);
-    speak(player, "I couldn’t find a clear spot nearby. Move to an open area and ask again.");
+    speak(player, "I couldn’t prepare a safe build site, so I stopped before placing anything.");
     return;
   }
 
@@ -1157,7 +1237,7 @@ function findCustomSite(player, plan, forward, right) {
   return origin;
 }
 
-function buildValidatedPlan(player, value) {
+async function buildValidatedPlan(player, value) {
   let plan;
   try {
     plan = validateBuildPlan(value);
@@ -1166,15 +1246,21 @@ function buildValidatedPlan(player, value) {
     return;
   }
   if (buildInProgress) {
-    speak(player, "I’m already building. I’ll finish or roll that back first.");
+    queueBuild(player, (current) => buildValidatedPlan(current, value));
     return;
   }
-  const dimension = player.dimension;
-  const forward = cardinalDirection(player);
-  const right = { x: -forward.z, z: forward.x };
-  const origin = findCustomSite(player, plan, forward, right);
+  let dimension = player.dimension;
+  let forward = cardinalDirection(player);
+  let right = { x: -forward.z, z: forward.x };
+  let origin = findCustomSite(player, plan, forward, right);
+  if (!origin && await prepareBuildWorkshop(player)) {
+    dimension = player.dimension;
+    forward = cardinalDirection(player);
+    right = { x: -forward.z, z: forward.x };
+    origin = findCustomSite(player, plan, forward, right);
+  }
   if (!origin) {
-    speak(player, "I need a clear, flat natural-ground area for that plan. Move to an open field and ask again.");
+    speak(player, "I couldn’t prepare a safe workshop for that plan, so I stopped before placing anything.");
     return;
   }
   const bot = bringWizardTo(player);
@@ -1222,22 +1308,28 @@ function buildValidatedPlan(player, value) {
   ), 20);
 }
 
-function buildCommandLesson(player, id) {
+async function buildCommandLesson(player, id) {
   const lesson = commandLesson(id);
   if (!lesson) {
     speak(player, "I don’t have that command-block lesson.");
     return;
   }
   if (buildInProgress) {
-    speak(player, "I’m already building. I’ll finish or roll that back first.");
+    queueBuild(player, (current) => buildCommandLesson(current, id));
     return;
   }
-  const dimension = player.dimension;
-  const forward = cardinalDirection(player);
-  const right = { x: -forward.z, z: forward.x };
-  const base = findClearSite(player, forward, right);
+  let dimension = player.dimension;
+  let forward = cardinalDirection(player);
+  let right = { x: -forward.z, z: forward.x };
+  let base = findClearSite(player, forward, right);
+  if (!base && await prepareBuildWorkshop(player)) {
+    dimension = player.dimension;
+    forward = cardinalDirection(player);
+    right = { x: -forward.z, z: forward.x };
+    base = findClearSite(player, forward, right);
+  }
   if (!base) {
-    speak(player, "Move to a clear natural-ground area and ask for the command lesson again.");
+    speak(player, "I couldn’t prepare a safe command workshop, so I stopped before placing anything.");
     return;
   }
   if (!bringWizardTo(player)) {
@@ -1300,26 +1392,37 @@ function findCalculatorSite(player, forward, right) {
   return origin;
 }
 
-function buildRedstoneCalculator(player) {
+async function buildRedstoneCalculator(player) {
   console.warn("[MC Wizard] calculator build requested by " + player.name);
   const previousBuild = lastBuildTick.get(player.id) || -Infinity;
   if (system.currentTick - previousBuild < 200) {
-    speak(player, "Give me a few seconds before placing another demo.");
+    queueBuild(
+      player,
+      buildRedstoneCalculator,
+      200 - (system.currentTick - previousBuild),
+      "I queued that calculator and will start it in a few seconds.",
+    );
     return;
   }
   if (buildInProgress) {
-    speak(player, "I’m already building one demo. I’ll finish that first.");
+    queueBuild(player, buildRedstoneCalculator);
     return;
   }
 
-  const dimension = player.dimension;
-  const forward = cardinalDirection(player);
+  let dimension = player.dimension;
+  let forward = cardinalDirection(player);
   console.warn("[MC Wizard] calculator facing " + forward.name);
-  const right = { x: -forward.z, z: forward.x };
-  const origin = findCalculatorSite(player, forward, right);
+  let right = { x: -forward.z, z: forward.x };
+  let origin = findCalculatorSite(player, forward, right);
+  if (!origin && await prepareBuildWorkshop(player)) {
+    dimension = player.dimension;
+    forward = cardinalDirection(player);
+    right = { x: -forward.z, z: forward.x };
+    origin = findCalculatorSite(player, forward, right);
+  }
   if (!origin) {
     console.warn("[MC Wizard] no clear calculator site near " + player.name);
-    speak(player, "A working redstone calculator needs a clear, flat 13 by 13 natural-ground area. Move to a flat field and ask again.");
+    speak(player, "I couldn’t prepare a safe calculator workshop, so I stopped before placing anything.");
     return;
   }
 
@@ -1641,6 +1744,7 @@ world.afterEvents.worldLoad.subscribe(() => {
       undoLastBuild,
       hasCommittedBuild: (playerId) => lastUndo.has(playerId),
       buildValidatedPlan,
+      prepareBuildWorkshop,
       deliverTestBook: (player) => deliverModelAnswer(player, {
         label: "E2E",
         answer: "# Redstone guide\n\n" + "Use repeaters to control timing, comparators to measure signals, and lamps to make output easy to read. ".repeat(12),

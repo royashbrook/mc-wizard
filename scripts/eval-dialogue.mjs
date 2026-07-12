@@ -3,11 +3,11 @@ const token = process.env.BRIDGE_TOKEN || "dev-only-change-me";
 const player = `DialogueEval-${Date.now()}`;
 const cooldown = Number(process.env.REQUEST_COOLDOWN_MS) || 1_500;
 
-async function ask(question) {
+async function ask(question, mode = "wizard") {
   const response = await fetch(`${baseUrl}/v1/ask`, {
     method: "POST",
     headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-    body: JSON.stringify({ player, question, mode: "wizard" }),
+    body: JSON.stringify({ player, question, mode }),
   });
   if (!response.ok) throw new Error(`brain returned ${response.status}: ${await response.text()}`);
   const result = await response.json();
@@ -36,9 +36,23 @@ for (const [name, question, check] of checks) {
   console.log(`${passed ? "PASS" : "FAIL"}: ${name} — ${result.answer.replace(/\s+/g, " ").slice(0, 160)}`);
   if (!passed) failed += 1;
 }
-await fetch(`${baseUrl}/v1/session`, {
-  method: "DELETE",
-  headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
-  body: JSON.stringify({ player, mode: "wizard" }),
-});
+const general = await ask(
+  "Write a detailed beginner guide to surviving the first three Minecraft nights. Use complete sentences and finish the guide cleanly.",
+  "general",
+);
+const generalPassed = typeof general.title === "string"
+  && general.title.length >= 3
+  && general.title.length <= 16
+  && typeof general.answer === "string"
+  && general.answer.length >= 500
+  && /[.!?][\"')\]]?$/.test(general.answer.trim());
+console.log(`${generalPassed ? "PASS" : "FAIL"}: structured-book — ${general.title}: ${general.answer.replace(/\s+/g, " ").slice(0, 120)}`);
+if (!generalPassed) failed += 1;
+for (const mode of ["wizard", "general"]) {
+  await fetch(`${baseUrl}/v1/session`, {
+    method: "DELETE",
+    headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+    body: JSON.stringify({ player, mode }),
+  });
+}
 if (failed) process.exitCode = 1;
