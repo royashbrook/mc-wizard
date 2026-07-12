@@ -19,6 +19,7 @@ import {
   validateBuildPlan,
 } from "./build-plan.js";
 import { commandLesson } from "./command-lessons.js";
+import { splitMessage } from "./chat.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
 const WIZARD_NAME = "MC Wizard";
@@ -119,19 +120,6 @@ function playerById(id) {
 
 function wizardIsValid() {
   return Boolean(wizard?.isValid);
-}
-
-function splitMessage(message) {
-  const lines = [];
-  let remaining = String(message || "").replace(/\s+/g, " ").trim();
-  while (remaining.length > 240) {
-    const space = remaining.lastIndexOf(" ", 240);
-    const cut = space > 0 ? space : 240;
-    lines.push(remaining.slice(0, cut));
-    remaining = remaining.slice(cut).trimStart();
-  }
-  if (remaining) lines.push(remaining);
-  return lines;
 }
 
 function deliverModelAnswer(player, payload, question) {
@@ -1589,10 +1577,14 @@ async function askBackend(playerId, question, mode = "wizard") {
   if (mode === "general") player.sendMessage("§b[AI]§r Thinking…");
   else {
     bringWizardTo(player);
-    speak(player, "Let me think about that. I’ll stay right here while I work it out.");
+    const acknowledgements = [
+      "Hmm—one moment.",
+      "I’m checking that carefully.",
+      "Give me a moment to work that out.",
+    ];
     for (const [ticks, message] of [
-      [160, "I’m still thinking. You can keep building while I work."],
-      [360, "That’s taking too long. I’ll use my best local answer if the model doesn’t return soon."],
+      [80, acknowledgements[token % acknowledgements.length]],
+      [240, "Still working—I’m staying with it."],
     ]) {
       system.runTimeout(() => {
         if (pendingQuestions.get(key) !== token) return;

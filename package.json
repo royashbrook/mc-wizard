@@ -26,7 +26,7 @@
     "container:logs": "container logs -f mc-wizard-bedrock",
     "container:stop": "container stop --time 60 mc-wizard-bedrock",
     "sync:docs": "node scripts/sync-docs.mjs",
-    "test": "node --test",
+    "test": "node --test test/*.test.mjs",
     "test:e2e:bds": "sh scripts/run-e2e-container.sh",
     "test:e2e:logs": "container logs -f mc-wizard-bedrock 2>&1 | node scripts/wait-e2e.mjs"
   },

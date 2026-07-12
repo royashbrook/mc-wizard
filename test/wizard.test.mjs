@@ -253,6 +253,11 @@ test("constrains CLI providers to text-only ephemeral safe mode", () => {
   assert.match(localBridgeScript, /"--tools", ""/);
   assert.match(localBridgeScript, /"--no-session-persistence"/);
   assert.match(localBridgeScript, /provider === "grok"/);
+  assert.match(localBridgeScript, /provider === "codex"/);
+  assert.match(localBridgeScript, /function codexUpstream/);
+  assert.match(localBridgeScript, /"--ephemeral"/);
+  assert.match(localBridgeScript, /"--ignore-user-config"/);
+  assert.match(localBridgeScript, /"--disable", "shell_tool"/);
   assert.match(localBridgeScript, /"--no-memory"/);
   assert.match(localBridgeScript, /"--no-subagents"/);
   assert.match(localBridgeScript, /"--no-plan"/);
@@ -299,6 +304,50 @@ test("normalizes plurals and rejects generic retrieval matches", () => {
   const [comparator] = corpus.search("How do comparators work?");
   assert.match(`${comparator.title} ${comparator.text}`, /comparator/i);
   assert.deepEqual(corpus.search("how does something work"), []);
+});
+
+test("answers cat questions from player-facing facts and carries short follow-ups", async () => {
+  const [cat] = corpus.search("tell me about cats");
+  assert.equal(cat.title, "Cats in Minecraft Bedrock");
+  assert.match(cat.text, /raw cod or raw salmon/i);
+
+  let providerCalled = false;
+  const catWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "slow", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalled = true;
+      throw new Error("grounded quick answers must not wait for the provider");
+    },
+  });
+  const overview = await catWizard.ask({ player: "CatKid", question: "tell me about cats" });
+  const followUp = await catWizard.ask({ player: "CatKid", question: "how do I tame one" });
+  assert.equal(providerCalled, false);
+  assert.equal(overview.mode, "local-grounded");
+  assert.equal(followUp.mode, "local-grounded");
+  assert.match(followUp.answer, /raw cod or raw salmon/i);
+  assert.doesNotMatch(followUp.answer, /notes|ask an adult/i);
+});
+
+test("limits quick answers to named questions and does not pollute standalone follow-ups", async () => {
+  const requests = [];
+  const contextWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "slow", AI_STYLE: "chat" },
+    fetchImpl: async (url, options) => {
+      requests.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ answer: "A tailored provider answer.", action: null }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const gift = await contextWizard.ask({ player: "CuriousKid", question: "What gift can cats give?" });
+  assert.equal(gift.answer, "A tailored provider answer.");
+  await contextWizard.ask({ player: "CuriousKid", question: "tell me about cats" });
+  await contextWizard.ask({ player: "CuriousKid", question: "what is redstone?" });
+  assert.equal(requests.length, 2);
+  const retrievedSources = requests.at(-1).messages.at(-1).content.split("Retrieved sources:").at(-1);
+  assert.doesNotMatch(retrievedSources, /Cats in Minecraft Bedrock/);
 });
 
 test("preserves encoded command placeholders while stripping HTML", () => {
@@ -485,7 +534,8 @@ test("never dumps retrieved documentation when the model is unavailable", async 
   });
   const result = await commandWizard.ask({ question: "How do I clone a building with command blocks?" });
   assert.doesNotMatch(result.answer, /\/clone command copies blocks/i);
-  assert.match(result.answer, /won’t read raw documentation/i);
+  assert.doesNotMatch(result.answer, /notes|sources|documentation|corpus/i);
+  assert.match(result.answer, /one specific part/i);
 });
 
 test("answers ordinary conversation instantly without invoking the provider", async () => {
@@ -521,7 +571,9 @@ test("uses live world state for small talk and ambient Wizard behavior", () => {
 test("cancels stale replies and keeps children updated while deeper work runs", () => {
   assert.match(packScript, /discarded stale/);
   assert.match(packScript, /pendingQuestions\.get\(key\) !== token/);
-  assert.match(packScript, /I’m still thinking/);
+  assert.match(packScript, /\[80, acknowledgements/);
+  assert.match(packScript, /Still working—I’m staying with it/);
+  assert.doesNotMatch(packScript, /Let me think about that/);
   assert.match(packScript, /clearBackendSession/);
   assert.match(packScript, /HttpRequestMethod\.Delete/);
 });
@@ -548,8 +600,10 @@ test("uses the OpenAI Responses adapter without giving the model build authority
   const result = await modelWizard.ask({ player: "BuilderKid", question: "What powers redstone dust?" });
   assert.equal(request.url, "https://api.example/v1/responses");
   assert.equal(request.body.store, false);
-  assert.equal(request.body.max_output_tokens, 300);
+  assert.equal(request.body.max_output_tokens, 260);
   assert.equal(request.body.model, "test-model");
+  assert.match(request.body.instructions, /well-established, stable Minecraft gameplay facts/);
+  assert.doesNotMatch(request.body.instructions, /Use only the supplied/);
   assert.equal(request.options.headers.authorization, "Bearer test-key");
   assert.doesNotMatch(request.body.input, /BuilderKid/);
   assert.equal(result.answer, "A model-backed answer.");

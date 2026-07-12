@@ -131,6 +131,7 @@ async function evaluateRelease(releaseRoot) {
     ["how does a redstone comparator work", /comparator/i],
     ["how do I get a command block", /command/i],
     ["how does a t flip flop remember", /flip|bulb/i],
+    ["how do I tame a cat", /raw (?:cod|salmon)/i],
   ];
   for (const [query, expected] of checks) {
     const results = corpus.search(query);

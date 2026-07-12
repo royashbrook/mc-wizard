@@ -1,13 +1,14 @@
-import { readFile, readdir } from "node:fs/promises";
+import { readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 const PROJECT_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const STOP_WORDS = new Set([
-  "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "do",
-  "does", "for", "from", "how", "i", "if", "in", "is", "it", "me", "my",
-  "of", "on", "or", "please", "something", "that", "the", "thing", "this",
-  "to", "was", "what", "when", "with", "work", "you", "your",
+  "a", "about", "an", "and", "are", "as", "at", "be", "but", "by", "can",
+  "could", "do", "does", "for", "from", "how", "i", "if", "in", "is", "it",
+  "me", "my", "of", "on", "one", "ones", "or", "please", "something", "tell",
+  "that", "the", "thing", "this", "to", "was", "what", "when", "with", "work",
+  "would", "you", "your",
 ]);
 
 const BASE_ROOTS = [
@@ -112,6 +113,30 @@ function chunkMarkdown(markdown) {
     .filter((section) => section.length >= 60);
 }
 
+async function expandCodeSources(markdown, file, realRoot) {
+  const matches = [...markdown.matchAll(/:::code\b[^\n]*\bsource="([^"]+\.json)"[^\n]*:::/g)];
+  if (!matches.length) return markdown;
+  let output = "";
+  let offset = 0;
+  for (const match of matches) {
+    output += markdown.slice(offset, match.index);
+    let replacement = "";
+    try {
+      const target = await realpath(path.resolve(path.dirname(file), match[1]));
+      const relative = path.relative(realRoot, target);
+      if (relative && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)) {
+        const source = await readFile(target, "utf8");
+        if (source.length <= 250_000) replacement = `\n\`\`\`json\n${source}\n\`\`\`\n`;
+      }
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    output += replacement;
+    offset = match.index + match[0].length;
+  }
+  return output + markdown.slice(offset);
+}
+
 async function markdownFiles(root) {
   const files = [];
   async function walk(dir) {
@@ -144,9 +169,13 @@ export async function loadCorpus({ roots } = {}) {
     if (error.code !== "ENOENT") throw error;
   }
   for (const root of roots) {
-    for (const file of await markdownFiles(root.dir)) {
+    const files = await markdownFiles(root.dir);
+    if (!files.length) continue;
+    const realRoot = await realpath(root.dir);
+    for (const file of files) {
       const raw = await readFile(file, "utf8");
-      const [metadata, markdown] = parseFrontmatter(raw);
+      const [metadata, originalMarkdown] = parseFrontmatter(raw);
+      const markdown = await expandCodeSources(originalMarkdown, file, realRoot);
       const title = metadata.title || titleFrom(markdown, file);
       for (const [part, text] of chunkMarkdown(markdown).entries()) {
         const words = tokenize(`${title} ${text}`);
@@ -157,11 +186,13 @@ export async function loadCorpus({ roots } = {}) {
           title,
           text,
           source: sourceFor(file, metadata, creatorRef),
-          edition: metadata.edition || "bedrock",
+          edition: /\bjava edition\b/i.test(title) ? "java" : (metadata.edition || "bedrock"),
           channel: metadata.channel || "stable",
           version: metadata.version || "current",
           updated: metadata.updated || null,
           kind: metadata.kind || root.kind,
+          quickAnswer: metadata.quick_answer || null,
+          quickQuestions: String(metadata.quick_questions || "").split("|").map((value) => value.trim()).filter(Boolean),
           frequencies,
         });
       }
@@ -181,6 +212,7 @@ export async function loadCorpus({ roots } = {}) {
     const wantsHistory = /\b(changelog|changed|fixed|patch|release|version|update)\b/i.test(query);
     return chunks
       .filter((chunk) => includePreview || chunk.channel !== "preview")
+      .filter((chunk) => chunk.edition !== "java")
       .map((chunk) => {
         let score = 0;
         let matchedWords = 0;
@@ -200,8 +232,10 @@ export async function loadCorpus({ roots } = {}) {
         return { chunk, score, matchedWords };
       })
       .filter(({ score, matchedWords }) => {
-        const requiredMatches = queryWords.length <= 2
+        const requiredMatches = queryWords.length <= 1
           ? 1
+          : queryWords.length <= 4
+            ? 2
           : Math.min(3, Math.ceil(queryWords.length * 0.3));
         return score > 0 && matchedWords >= requiredMatches;
       })
@@ -217,6 +251,8 @@ export async function loadCorpus({ roots } = {}) {
         version: chunk.version,
         updated: chunk.updated,
         kind: chunk.kind,
+        quickAnswer: chunk.quickAnswer,
+        quickQuestions: chunk.quickQuestions,
         score: Number(score.toFixed(3)),
       }));
   }

@@ -114,11 +114,11 @@ For the local subscription-backed bridge used by this spike, start this first:
 npm run start:ai
 ```
 
-`mtok-bridge` provides the OpenAI-compatible transport. Its upstream can be the authenticated local Grok or Claude CLI. Grok runs single-turn with memory, subagents, web search, and tools disabled; Claude uses safe mode, an empty tool list, and no session persistence. The provider receives only the model prompt: it cannot act in Minecraft. The bridge allows one request at a time and stops a stuck local model after 18 seconds by default. Then start the brain with `npm start`.
+`mtok-bridge` provides the OpenAI-compatible transport. Its upstream can be the authenticated local Codex, Grok, or Claude CLI. Codex runs ephemerally in a read-only sandbox with user configuration, rules, apps, multi-agent, and shell tools disabled. Grok runs single-turn with memory, subagents, web search, and tools disabled; Claude uses safe mode, an empty tool list, and no session persistence. The provider receives only the model prompt: it cannot act in Minecraft. The bridge allows one request at a time and stops a stuck local model at the configured timeout. Then start the brain with `npm start`.
 
 Greetings, readiness checks, thanks, jokes, calculator builds, T flip-flops, and small castle gates run as immediate local skills without an AI request. Deeper questions use the cached corpus as evidence for the configured model to synthesize; raw documentation is never used as a chat fallback. Joining the server starts a fresh dialogue session, and late replies from an older request are discarded, so a previous build request cannot resume after reconnecting. The Bedrock log message `Running AutoCompaction...` is database maintenance, not an AI request; the operator desk hides those routine lines and reports that they use zero AI tokens.
 
-In game, `ai <question>` always means this general model route. It requires the `ai` keyword even when the player is alone or beside the Wizard, skips Minecraft RAG and Wizard actions, and prefixes short replies with `[Claude]`. Replies over 700 characters are placed in a signed book at the player's feet. Ordinary chat and `wiz`/`wizard` continue through the Minecraft-specialist route.
+In game, `ai <question>` always means this general model route. It requires the `ai` keyword even when the player is alone or beside the Wizard, skips Minecraft RAG and Wizard actions, and prefixes short replies with the configured provider label, such as `[ChatGPT]`. Replies over 700 characters are placed in a signed book at the player's feet. Ordinary chat and `wiz`/`wizard` continue through the Minecraft-specialist route.
 
 ## Load official knowledge
 
@@ -131,12 +131,13 @@ This command:
 1. shallow-clones or updates `MicrosoftDocs/minecraft-creator` under ignored `.cache/`;
 2. caches stable and preview changelogs into separate directories;
 3. builds a staged stable/preview Bedrock release with revision, version, attribution, and content hashes;
-4. runs retrieval and dialogue smoke evaluations;
-5. atomically promotes the staged release only if every evaluation passes.
+4. resolves safe JSON source transclusions so vanilla mob behavior is indexed instead of empty code placeholders;
+5. runs retrieval and dialogue smoke evaluations, including player-facing cat taming;
+6. atomically promotes the staged release only if every evaluation passes.
 
-It requires Git and internet access. The first sync downloads roughly 8,800 repository files plus 712 changelog articles. The resulting `.cache/` is intentionally ignored: this workspace currently indexes 30,876 chunks, but a fresh clone must run `npm run sync:docs` to recreate that corpus. Before syncing, only the four authored mechanic cards are available.
+It requires Git and internet access. The first sync downloads roughly 8,800 repository files plus 712 changelog articles. The resulting `.cache/` is intentionally ignored: this workspace currently indexes 31,703 chunks, but a fresh clone must run `npm run sync:docs` to recreate that corpus. Before syncing, only the six authored mechanic cards are available.
 
-Normal retrieval excludes preview material unless the question explicitly says preview, beta, or experimental. Current docs and tested mechanic cards rank above patch notes for ordinary mechanics questions. The spike uses a small exact-term/TF-IDF-style in-memory index; embeddings and a persistent vector store are intentionally deferred until retrieval evals show they improve answers.
+Normal retrieval excludes preview and Java-only material unless the question explicitly says preview, beta, or experimental. Current docs and tested mechanic cards rank above patch notes for ordinary mechanics questions. Microsoft Creator documentation is an add-on/developer corpus, not a complete gameplay encyclopedia; curated player-facing cards provide instant verified answers for high-value topics, while the configured model may answer stable common gameplay facts when retrieval is incomplete. Issue #16 tracks the broader versioned gameplay knowledge graph. The spike uses a small exact-term/TF-IDF-style in-memory index until retrieval evals justify the persistent graph/vector layer.
 
 Microsoft's repository licenses documentation under CC BY 4.0 and code samples under MIT. Preserve attribution and revision URLs. Changelog content has no explicit open-content license, so keep that cache private and return links rather than redistributing a corpus.
 

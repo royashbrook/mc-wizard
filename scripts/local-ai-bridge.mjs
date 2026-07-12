@@ -8,13 +8,15 @@ import { httpUpstream, serveChat } from "mtok-bridge";
 const host = "127.0.0.1";
 const port = Number(process.env.MTOK_PORT) || 8790;
 const provider = process.env.MTOK_PROVIDER || "claude";
-const model = process.env.MTOK_MODEL || provider;
+const model = process.env.MTOK_MODEL || (provider === "codex" ? "gpt-5.5" : provider);
 const timeoutMs = Math.min(Math.max(Number(process.env.MTOK_TIMEOUT_MS) || 18_000, 5_000), 30_000);
 let queue = Promise.resolve();
 const grokEnv = provider === "grok" ? isolatedGrokEnvironment() : process.env;
 const upstream = provider === "ollama"
   ? httpUpstream({ baseUrl: process.env.MTOK_UPSTREAM || "http://127.0.0.1:11434/v1" })
-  : provider === "grok" ? grokUpstream : claudeUpstream;
+  : provider === "grok" ? grokUpstream
+    : provider === "codex" ? codexUpstream
+      : claudeUpstream;
 
 function isolatedGrokEnvironment() {
   const cleanHome = path.resolve(process.env.MTOK_GROK_HOME || "runtime/provider-home");
@@ -77,6 +79,54 @@ function claudeUpstream(payload) {
       });
     });
     child.stdin.end(prompt);
+  });
+}
+
+function codexUpstream(payload) {
+  const { systemPrompt, prompt } = cliInput(payload);
+  return new Promise((resolve, reject) => {
+    const startedAt = Date.now();
+    const child = spawn("codex", [
+      "exec",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--skip-git-repo-check",
+      "--sandbox", "read-only",
+      "--color", "never",
+      "--disable", "shell_tool",
+      "--disable", "apps",
+      "--disable", "multi_agent",
+      "--model", model,
+      "-",
+    ], { cwd: "/private/tmp", env: process.env, stdio: ["pipe", "pipe", "pipe"] });
+    let output = "";
+    let errorOutput = "";
+    let timedOut = false;
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2_000).unref();
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => { output = (output + chunk).slice(0, 64 * 1024); });
+    child.stderr.on("data", (chunk) => { errorOutput = (errorOutput + chunk).slice(-2_000); });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      clearTimeout(timeout);
+      console.log(`[mc-wizard] codex request finished in ${Date.now() - startedAt}ms; code=${code}`);
+      if (code !== 0) {
+        reject(new Error(timedOut ? `Codex timed out after ${timeoutMs}ms` : errorOutput.trim() || `Codex exited ${code}`));
+        return;
+      }
+      const content = output.trim();
+      if (!content) return reject(new Error("Codex returned no output"));
+      resolve({
+        object: "chat.completion",
+        model,
+        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+      });
+    });
+    child.stdin.end(`${systemPrompt || "Answer clearly and use no tools."}\n\n${prompt}`);
   });
 }
 
