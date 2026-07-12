@@ -8,6 +8,8 @@ import { startServer, validateAskBody } from "../src/server.mjs";
 import { createFileSessionStore } from "../src/sessions.mjs";
 import { safeCommandRefusal, unsafeCommandAnswer } from "../src/command-safety.mjs";
 import { classifyAction, createWizard } from "../src/wizard.mjs";
+import { validateConsoleCommand } from "../src/admin.mjs";
+import { readRuntimeSettings, validateRuntimeSettings, writeRuntimeSettings } from "../src/runtime-settings.mjs";
 import {
   calculatorResult,
   createCalculatorBlueprint,
@@ -604,4 +606,63 @@ test("persists bounded separate sessions without plaintext player identity", asy
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("hot-loads validated operator tuning into the next model request", async () => {
+  const requests = [];
+  const tunedWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "claude", AI_STYLE: "chat" },
+    settings: async () => ({
+      aiEnabled: true,
+      wizardPromptAddendum: "Call redstone dust sparkle wire.",
+      generalPromptAddendum: "Use tiny section headings.",
+      wizardMaxOutputTokens: 222,
+      generalMaxOutputTokens: 333,
+    }),
+    fetchImpl: async (_url, options) => {
+      const request = JSON.parse(options.body);
+      requests.push(request);
+      const general = request.messages[0].content.includes("general-purpose AI");
+      const content = general
+        ? JSON.stringify({ title: "Night Guide", answer: "A complete guide." })
+        : JSON.stringify({ answer: "Hello, builder!", action: null });
+      return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+    },
+  });
+  await tunedWizard.ask({ player: "Admin", question: "hello" });
+  await tunedWizard.ask({ player: "Admin", question: "write a guide", mode: "general" });
+  assert.equal(requests[0].max_tokens, 222);
+  assert.match(requests[0].messages[0].content, /sparkle wire/);
+  assert.equal(requests[1].max_tokens, 333);
+  assert.match(requests[1].messages[0].content, /tiny section headings/);
+});
+
+test("validates and atomically persists runtime settings", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-settings-"));
+  const filePath = join(directory, "settings.json");
+  const value = {
+    aiEnabled: false,
+    wizardPromptAddendum: "Be concise.",
+    generalPromptAddendum: "Use headings.",
+    wizardMaxOutputTokens: 256,
+    generalMaxOutputTokens: null,
+  };
+  try {
+    assert.deepEqual(await writeRuntimeSettings(filePath, value), validateRuntimeSettings(value));
+    assert.deepEqual(await readRuntimeSettings(filePath), value);
+    assert.throws(() => validateRuntimeSettings({ ...value, wizardMaxOutputTokens: 12 }), /64 to 3,000/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("serves a loopback admin desk and sends console text without a shell", async () => {
+  assert.equal(validateConsoleCommand("/say hello builders"), "say hello builders");
+  assert.throws(() => validateConsoleCommand("say hi\nstop"), /one line/);
+  const adminScript = await readFile(new URL("../src/admin.mjs", import.meta.url), "utf8");
+  assert.match(adminScript, /MC Wizard Operator Desk/);
+  assert.match(adminScript, /\["exec", "mc-wizard-bedrock", "send-command", command\]/);
+  assert.match(adminScript, /ROSETTA_SEND_SCRIPT/);
+  assert.match(adminScript, /Admin panel is loopback-only/);
 });

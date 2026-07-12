@@ -29,6 +29,7 @@ Ask `wizard, build me something that changes every time I press a button` and th
 - A visible, server-created MC Wizard based on Bedrock's official [`SimulatedPlayer`](https://learn.microsoft.com/en-us/minecraft/creator/scriptapi/minecraft/server-gametest/simulatedplayer?view=minecraft-bedrock-experimental), which extends `Player` and can walk, look, chat, hold items, and perform player block interactions.
 - Two real build actions performed through the embodied wizard's player APIs: a bounded copper-bulb T flip-flop and a two-bit redstone calculator.
 - A safe action boundary: model prose cannot become commands or JavaScript. Fixed skills and bounded validated build plans are the only executable output.
+- A loopback-only operator desk for live AI tuning, health, Bedrock console commands, logs, and browser-based dialogue tests.
 - Journaled snapshots, rollback on failure/disconnect/restart, recent-build protection, and `wizard undo`.
 - A pack installer that preserves other activated packs and installs the Wizard's visible hat-and-robe resource pack.
 
@@ -53,6 +54,28 @@ npm run wizard:stop
 ```
 
 Status reports only service health, provider name, and corpus size; it does not print tokens, prompts, player identifiers, or credentials.
+
+### Operator desk
+
+`npm run wizard:start` also ensures the local operator desk is running. It can be managed independently without stopping Bedrock:
+
+```bash
+npm run admin:start
+npm run admin:status
+npm run admin:stop
+```
+
+Open [http://127.0.0.1:3001](http://127.0.0.1:3001) on the server Mac. The desk provides:
+
+- live Bedrock, brain, and provider health;
+- quick world controls plus a one-line Bedrock console input;
+- recent container logs;
+- a separate browser dialogue session for testing Wizard and general AI replies; and
+- hot-loaded prompt addenda, AI enable/disable, and output-token limits.
+
+AI tuning is stored in ignored `runtime/admin/settings.json` and read on every request, so saving it does not restart Bedrock or the brain. The base safety, action, and book-format contracts remain in code. Console input uses the image's documented [`send-command`](https://github.com/itzg/docker-minecraft-bedrock-server#executing-server-commands) helper without invoking a shell.
+
+The desk intentionally binds only to loopback. It is not available to iPads or other LAN devices. Change that only after adding authentication and TLS.
 
 Commits are issue-driven. The tracked `commit-msg` hook rejects messages without a reference to an existing issue in this repository. Use a message such as `Improve dialogue sessions (Refs #8)`.
 
@@ -280,7 +303,7 @@ Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not 
 - The T flip-flop, calculator, command lessons, and validated plans are transactional and undoable. They require bounded clear areas, reject occupied/protected overlaps, and roll back on failure or disconnect.
 - The current documented Script API cannot safely program arbitrary command-block text. Prepared lesson definitions make the Wizard physically place the command block and button, then tell the child exactly what to paste; they deliberately do not `/structure load` a prebuilt result.
 - Official Microsoft documentation is not a complete gameplay encyclopedia. Fill gaps with versioned, self-authored mechanic cards backed by reproducible Bedrock tests. Do not ingest the community wiki by default without accepting its attribution, noncommercial, and share-alike requirements.
-- There is no parental-control UI, durable child-chat audit policy, per-world protected region, undo transaction, semantic cache, embedding index, or retrieval evaluation set yet. The current E2E harness covers the in-world vertical slice only.
+- The operator desk is not a parental-control or child-chat-audit system. There is no durable child-chat audit policy, per-world protected region, semantic cache, embedding index, or broad retrieval evaluation set yet.
 
 ## License
 

@@ -185,7 +185,7 @@ function generalEnvelope(text, question) {
   }
 }
 
-async function askProvider({ provider, fetchImpl, question, hits, history, player, env, general }) {
+async function askProvider({ provider, fetchImpl, question, hits, history, player, env, general, tuning }) {
   const sources = hits.map((hit, index) =>
     `[Source ${index + 1}: ${hit.title}; edition=${hit.edition}; channel=${hit.channel}; version=${hit.version}]\n${hit.text}`,
   ).join("\n\n");
@@ -198,9 +198,11 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const safetyIdentifier = createHash("sha256")
     .update(`${env.WIZARD_SALT || "local-spike"}:${player || "anonymous"}`)
     .digest("hex");
-  const configuredTokens = general ? env.AI_GENERAL_MAX_OUTPUT_TOKENS : env.AI_MAX_OUTPUT_TOKENS;
+  const runtimeTokens = general ? tuning.generalMaxOutputTokens : tuning.wizardMaxOutputTokens;
+  const configuredTokens = runtimeTokens || (general ? env.AI_GENERAL_MAX_OUTPUT_TOKENS : env.AI_MAX_OUTPUT_TOKENS);
   const maxOutputTokens = Math.min(Math.max(Number(configuredTokens) || (general ? 1_200 : 300), 64), 3_000);
-  const systemPrompt = general ? GENERAL_PROMPT : SYSTEM_PROMPT;
+  const addendum = general ? tuning.generalPromptAddendum : tuning.wizardPromptAddendum;
+  const systemPrompt = `${general ? GENERAL_PROMPT : SYSTEM_PROMPT}${addendum ? `\n\nOperator tuning:\n${addendum}` : ""}`;
   const body = provider.style === "chat"
     ? {
         model: provider.model,
@@ -244,6 +246,7 @@ export function createWizard({
   fetchImpl = fetch,
   logger = console,
   sessions = createMemorySessionStore(),
+  settings = async () => ({}),
 } = {}) {
   if (!corpus) throw new Error("createWizard requires a corpus");
   const provider = providerFrom(env);
@@ -254,6 +257,7 @@ export function createWizard({
       return sessions.delete(player, mode);
     },
     async ask({ question, player = "anonymous", mode: requestMode = "wizard" }) {
+      const tuning = { aiEnabled: true, ...await settings() };
       const general = requestMode === "general";
       const history = sessions.get(player, requestMode);
       const includePreview = /\b(beta|preview|experimental)\b/i.test(question);
@@ -273,13 +277,13 @@ export function createWizard({
       let selectedAction = action;
       let title = general ? bookTitle(question) : undefined;
       let responseMode = "offline";
-      if (provider.enabled) {
+      if (provider.enabled && tuning.aiEnabled) {
         try {
-          let providerAnswer = await askProvider({ provider, fetchImpl, question, hits, history, player, env, general });
+          let providerAnswer = await askProvider({ provider, fetchImpl, question, hits, history, player, env, general, tuning });
           let envelope = general ? generalEnvelope(providerAnswer, question) : wizardEnvelope(providerAnswer);
           if (!general && isBuildRequest(question) && !action && !envelope?.action) {
             const correction = `${question}\n\nAction contract correction: Return a valid non-null build action. If the full request exceeds the safe plan limits, build a recognizable miniature or first section now. Do not merely promise, explain, or ask permission.`;
-            const retryAnswer = await askProvider({ provider, fetchImpl, question: correction, hits, history, player, env, general });
+            const retryAnswer = await askProvider({ provider, fetchImpl, question: correction, hits, history, player, env, general, tuning });
             const retryEnvelope = wizardEnvelope(retryAnswer);
             if (retryEnvelope?.action) {
               providerAnswer = retryAnswer;
@@ -298,6 +302,8 @@ export function createWizard({
           logger.warn(`[wizard] ${error.message}; using offline answer`);
           responseMode = "offline-fallback";
         }
+      } else if (!tuning.aiEnabled) {
+        responseMode = "admin-disabled";
       }
       const sources = [...new Map(hits.map((hit) => [hit.source, {
         title: hit.title,

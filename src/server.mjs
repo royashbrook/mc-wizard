@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import { loadCorpus } from "./rag.mjs";
 import { createFileSessionStore } from "./sessions.mjs";
 import { createWizard } from "./wizard.mjs";
+import { readRuntimeSettings } from "./runtime-settings.mjs";
 
 const MAX_BODY_BYTES = 16 * 1024;
 
@@ -149,7 +150,14 @@ export async function startServer({ env = process.env, logger = console } = {}) 
     maxTurns: Math.min(Math.max(Number(env.SESSION_MAX_TURNS) || 12, 1), 50),
     ttlMs: Math.min(Math.max(Number(env.SESSION_TTL_MS) || 86_400_000, 60_000), 30 * 86_400_000),
   });
-  const wizard = createWizard({ corpus, env, logger, sessions });
+  const settingsFile = env.RUNTIME_SETTINGS_FILE || "runtime/admin/settings.json";
+  const wizard = createWizard({
+    corpus,
+    env,
+    logger,
+    sessions,
+    settings: () => readRuntimeSettings(settingsFile, logger),
+  });
   const port = Number(env.PORT) || 3000;
   const cooldownMs = Math.min(Math.max(Number(env.REQUEST_COOLDOWN_MS) || 1_500, 0), 60_000);
   const server = createHttpServer({ wizard, corpus, token, cooldownMs, logger });

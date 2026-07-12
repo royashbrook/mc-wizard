@@ -36,10 +36,11 @@ async function probe(url) {
 }
 
 async function status() {
-  const [pid, brain, provider, bedrockCode] = await Promise.all([
+  const [pid, brain, provider, admin, bedrockCode] = await Promise.all([
     currentPid(),
     probe(`http://${process.env.HOST || "127.0.0.1"}:${process.env.PORT || 3000}/health`),
     probe(`http://127.0.0.1:${process.env.MTOK_PORT || 8790}/health`),
+    probe(`http://${process.env.ADMIN_HOST || "127.0.0.1"}:${process.env.ADMIN_PORT || 3001}/health`),
     run("container", ["exec", "mc-wizard-bedrock", "true"]),
   ]);
   const result = {
@@ -47,6 +48,7 @@ async function status() {
     bedrock: bedrockCode === 0,
     brain: Boolean(brain.ok),
     provider: Boolean(provider.ok),
+    admin: Boolean(admin.ok),
     corpusChunks: brain.corpusChunks || 0,
     providerName: provider.provider || brain.provider || "offline",
   };
@@ -110,6 +112,7 @@ async function daemon() {
 }
 
 async function start() {
+  await run(process.execPath, [path.join(ROOT, "scripts", "admin-service.mjs"), "start"], { stdio: "inherit" });
   if (await currentPid()) {
     console.log("MC Wizard supervisor is already running.");
     return 0;
@@ -133,6 +136,7 @@ async function start() {
 }
 
 async function stop() {
+  await run(process.execPath, [path.join(ROOT, "scripts", "admin-service.mjs"), "stop"], { stdio: "inherit" });
   const pid = await currentPid();
   if (!pid) {
     await rm(PID_FILE, { force: true });
