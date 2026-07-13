@@ -527,6 +527,253 @@ function findCompletedChickenFarm(kid, station) {
   return undefined;
 }
 
+function containerHasSuffix(dimension, location, suffix) {
+  const container = dimension.getBlock(location)?.getComponent("minecraft:inventory")?.container;
+  return Boolean(container && [...Array(container.size).keys()].some((slot) => (
+    container.getItem(slot)?.typeId?.endsWith(suffix)
+  )));
+}
+
+function automaticWoolFarmIsWorking(kid, station) {
+  const dimension = kid.dimension;
+  const origin = machineOrigin(station);
+  const chest = machineLocation(origin, [0, 0, 1]);
+  const hopper = machineLocation(origin, [0, 0, 2]);
+  const rail = machineLocation(origin, [0, 1, 2]);
+  const grass = machineLocation(origin, [0, 2, 2]);
+  const observer = machineLocation(origin, [0, 2, 3]);
+  const dispenser = machineLocation(origin, [0, 3, 3]);
+  const sheep = dimension.getEntities({ type: "minecraft:sheep", location: grass, maxDistance: 3 }).length;
+  const collectors = dimension.getEntities({ type: "minecraft:hopper_minecart", location: rail, maxDistance: 2 }).length;
+  return blockIs(dimension, chest, "minecraft:chest")
+    && blockIs(dimension, hopper, "minecraft:hopper")
+    && hopperPointsTo(dimension, hopper, chest)
+    && blockIs(dimension, rail, "minecraft:rail")
+    && blockIs(dimension, grass, ["minecraft:grass_block", "minecraft:dirt"])
+    && blockIs(dimension, observer, "minecraft:observer")
+    && blockIs(dimension, dispenser, "minecraft:dispenser")
+    && containerContains(dimension, dispenser, "minecraft:shears")
+    && collectors >= 1
+    && sheep >= 1
+    && containerHasSuffix(dimension, chest, "_wool");
+}
+
+function automaticKelpFarmIsWorking(kid, station) {
+  const dimension = kid.dimension;
+  const origin = machineOrigin(station);
+  const chest = machineLocation(origin, [0, 4, 1]);
+  const hopper = machineLocation(origin, [0, 4, 2]);
+  const plant = machineLocation(origin, [0, 1, 4]);
+  const piston = machineLocation(origin, [0, 2, 5]);
+  const observer = machineLocation(origin, [-1, 2, 4]);
+  const water = (location) => blockIs(dimension, location, ["minecraft:water", "minecraft:flowing_water"]);
+  const submergedKelp = (location) => blockIs(dimension, location, [
+    "minecraft:water",
+    "minecraft:flowing_water",
+    "minecraft:kelp",
+    "minecraft:kelp_plant",
+  ]);
+  return blockIs(dimension, chest, "minecraft:chest")
+    && blockIs(dimension, hopper, "minecraft:hopper")
+    && hopperPointsTo(dimension, hopper, chest)
+    && blockIs(dimension, plant, ["minecraft:kelp", "minecraft:kelp_plant"])
+    && [2, 3, 4, 5].every((y) => submergedKelp(machineLocation(origin, [0, y, 4])))
+    && [3, 2].every((z) => water(machineLocation(origin, [0, 5, z])))
+    && blockIs(dimension, piston, "minecraft:piston")
+    && blockIs(dimension, observer, "minecraft:observer")
+    && containerContains(dimension, chest, "minecraft:kelp");
+}
+
+async function proveLiveKelpHarvest(kid, station) {
+  const dimension = kid.dimension;
+  const origin = machineOrigin(station);
+  const at = (point) => machineLocation(origin, point);
+  const chest = at([0, 4, 1]);
+  const hopper = at([0, 4, 2]);
+  const plant = at([0, 1, 4]);
+  const clearSeededOutput = () => {
+    removeContainerItem(dimension, chest, "minecraft:kelp");
+    removeContainerItem(dimension, hopper, "minecraft:kelp");
+    removeDroppedFarmOutput(dimension, plant, "minecraft:kelp");
+  };
+
+  // Build verification seeds one floating item. Drain it, including anything
+  // still moving through the stream, before asking natural growth to prove it.
+  clearSeededOutput();
+  await system.waitTicks(20);
+  clearSeededOutput();
+  if (!blockIs(dimension, plant, ["minecraft:kelp", "minecraft:kelp_plant"])) {
+    throw new Error("the planted kelp disappeared before its live harvest");
+  }
+
+  dimension.runCommand("gamerule randomtickspeed 1000");
+  let observerPowered = false;
+  let pistonExtended = false;
+  try {
+    for (let tick = 0; tick < 800; tick += 1) {
+      observerPowered ||= dimension.getBlock(at([-1, 2, 4]))?.permutation.getState("powered_bit") === true;
+      pistonExtended ||= /piston_arm/.test(dimension.getBlock(at([0, 2, 4]))?.typeId || "");
+      if (containerContains(dimension, chest, "minecraft:kelp")) return;
+      await system.waitTicks(1);
+    }
+    const dropped = dimension.getEntities({ type: "minecraft:item", location: plant, maxDistance: 12 })
+      .map((entity) => entity.getComponent("minecraft:item")?.itemStack?.typeId)
+      .filter(Boolean);
+    const blockSnapshot = (point) => {
+      const block = dimension.getBlock(at(point));
+      return {
+        point,
+        type: block?.typeId || null,
+        states: block?.permutation?.getAllStates?.() || {},
+      };
+    };
+    const column = [1, 2, 3, 4, 5].map((y) => blockSnapshot([0, y, 4]));
+    const circuit = [
+      blockSnapshot([-1, 2, 4]),
+      blockSnapshot([-2, 2, 4]),
+      blockSnapshot([-2, 2, 5]),
+      blockSnapshot([-1, 2, 5]),
+      blockSnapshot([0, 2, 5]),
+    ];
+    throw new Error(
+      `timed out waiting for naturally grown kelp to be harvested through the stream into the chest`
+        + `; observerPowered=${observerPowered}; pistonExtended=${pistonExtended}; dropped=${JSON.stringify(dropped)}`
+        + `; column=${JSON.stringify(column)}; circuit=${JSON.stringify(circuit)}`,
+    );
+  } finally {
+    dimension.runCommand("gamerule randomtickspeed 1");
+  }
+}
+
+async function runKelpFarmAcceptance(kid) {
+  const station = {
+    x: Math.floor(kid.location.x),
+    y: Math.round(kid.location.y),
+    z: Math.floor(kid.location.z),
+  };
+  const fail = (detail) => {
+    report("FAIL", "kelp-farm-pipeline", detail);
+    try { kid.disconnect(); } catch {}
+  };
+  try {
+    kid.dimension.runCommand(`tickingarea remove ${TICKING_AREA}`);
+    kid.dimension.runCommand(`tickingarea add circle ${station.x} ${station.y} ${station.z} 4 ${TICKING_AREA} true`);
+    if (chatCallbacks.hasCommittedBuild(kid.id) && !chatCallbacks.undoLastBuild(kid)) {
+      throw new Error("could not clear the preceding workshop transaction");
+    }
+    removeAcceptanceEntities(kid, station);
+    await system.waitTicks(20);
+    const transport = await routeWizardRequest(kid, "wizard, make me an automatic kelp farm", "automatic-kelp-farm");
+    await waitFor(
+      () => chatCallbacks.hasCommittedBuild(kid.id) && automaticKelpFarmIsWorking(kid, station),
+      TIMEOUT_TICKS * 2,
+      "the source-water kelp column, observer and piston, collection stream, hopper, and tested output chest",
+    );
+    await proveLiveKelpHarvest(kid, station);
+    report("PASS", "kelp-farm-pipeline", `request via ${transport}; fresh natural growth, harvest, and collection verified`);
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    fail(String(error));
+  }
+}
+
+function findCompletedStoneBrickCastle(kid, station, size) {
+  const dimension = kid.dimension;
+  for (let x = station.x - 24; x <= station.x + 24; x += 1) {
+    for (let z = station.z - 24; z <= station.z + 24; z += 1) {
+      if (rectangleIs(dimension, x, station.y, z, size, size, "minecraft:stone_bricks")) {
+        return { x, y: station.y, z };
+      }
+    }
+  }
+  return undefined;
+}
+
+function castleUpgradeMetrics(kid, origin) {
+  if (!origin) {
+    return { upperFloor: 0, roomWalls: 0, towerTrim: 0, decorations: 0, villagers: 0 };
+  }
+  const dimension = kid.dimension;
+  const interiorMin = { x: origin.x + 1, y: origin.y + 4, z: origin.z + 1 };
+  const interiorMax = { x: origin.x + 10, y: origin.y + 4, z: origin.z + 10 };
+  const upperFloor = countBlocks(dimension, interiorMin, interiorMax, "minecraft:stone_bricks");
+  let roomWalls = 0;
+  for (const centerX of [origin.x + 5, origin.x + 6]) {
+    for (const centerZ of [origin.z + 5, origin.z + 6]) {
+      let candidate = 0;
+      for (let offset = 1; offset <= 10; offset += 1) {
+        if (dimension.getBlock({ x: centerX, y: origin.y + 2, z: origin.z + offset })?.typeId === "minecraft:stone_bricks") candidate += 1;
+        if (dimension.getBlock({ x: origin.x + offset, y: origin.y + 2, z: centerZ })?.typeId === "minecraft:stone_bricks") candidate += 1;
+      }
+      roomWalls = Math.max(roomWalls, candidate);
+    }
+  }
+  const towerTrim = countBlocks(
+    dimension,
+    origin,
+    { x: origin.x + 11, y: origin.y + 7, z: origin.z + 11 },
+    "minecraft:cobblestone",
+  );
+  const decorations = countBlocks(
+    dimension,
+    { x: origin.x + 5, y: origin.y + 1, z: origin.z + 5 },
+    { x: origin.x + 6, y: origin.y + 7, z: origin.z + 6 },
+    "minecraft:sea_lantern",
+  );
+  const villagers = dimension.getEntities({ type: "minecraft:villager_v2" }).filter(({ location }) => (
+    location.x >= origin.x && location.x <= origin.x + 12
+    && location.y >= origin.y && location.y <= origin.y + 9
+    && location.z >= origin.z && location.z <= origin.z + 12
+  )).length;
+  return { upperFloor, roomWalls, towerTrim, decorations, villagers };
+}
+
+function castleUpgradeIsComplete(kid, origin) {
+  const { upperFloor, roomWalls, towerTrim, decorations, villagers } = castleUpgradeMetrics(kid, origin);
+  return upperFloor >= 90 && roomWalls >= 12 && towerTrim >= 24 && decorations >= 1 && villagers >= 4;
+}
+
+function castleUpgradeSnapshot(kid, origin) {
+  return `origin=${origin ? `${origin.x},${origin.y},${origin.z}` : "not-found"}; metrics=${JSON.stringify(castleUpgradeMetrics(kid, origin))}; required={"upperFloor":90,"roomWalls":12,"towerTrim":24,"decorations":1,"villagers":4}`;
+}
+
+function castleShellIsComplete(kid, origin, size, height) {
+  if (!origin) return false;
+  const dimension = kid.dimension;
+  const shell = new Set(["minecraft:stone_bricks", "minecraft:cobblestone"]);
+  const roof = new Set(["minecraft:deepslate_bricks", "minecraft:cobblestone"]);
+  let wallBlocks = 0;
+  for (let offset = 0; offset < size; offset += 1) {
+    const edge = [
+      { x: origin.x + offset, y: origin.y + 2, z: origin.z },
+      { x: origin.x + offset, y: origin.y + 2, z: origin.z + size - 1 },
+    ];
+    if (offset > 0 && offset < size - 1) edge.push(
+      { x: origin.x, y: origin.y + 2, z: origin.z + offset },
+      { x: origin.x + size - 1, y: origin.y + 2, z: origin.z + offset },
+    );
+    wallBlocks += edge.filter((location) => shell.has(dimension.getBlock(location)?.typeId)).length;
+  }
+  let roofBlocks = 0;
+  for (let x = 0; x < size; x += 1) {
+    for (let z = 0; z < size; z += 1) {
+      if (roof.has(dimension.getBlock({
+        x: origin.x + x,
+        y: origin.y + height - 1,
+        z: origin.z + z,
+      })?.typeId)) roofBlocks += 1;
+    }
+  }
+  return wallBlocks >= 4 * size - 8 && roofBlocks >= size * size - 4;
+}
+
+function removeAcceptanceEntities(kid, station) {
+  for (const entity of kid.dimension.getEntities({ location: station, maxDistance: 20 })) {
+    if (entity.typeId === "minecraft:player") continue;
+    try { entity.remove(); } catch {}
+  }
+}
+
 function playerAndDroppedItemIds(kid) {
   const ids = new Set();
   const inventory = kid.getComponent("minecraft:inventory")?.container;
@@ -567,6 +814,14 @@ function containerContains(dimension, location, itemId, minimum = 1) {
     const item = container.getItem(slot);
     return item?.typeId === itemId && item.amount >= minimum;
   }));
+}
+
+function removeContainerItem(dimension, location, itemId) {
+  const container = dimension.getBlock(location)?.getComponent("minecraft:inventory")?.container;
+  if (!container) return;
+  for (let slot = 0; slot < container.size; slot += 1) {
+    if (container.getItem(slot)?.typeId === itemId) container.setItem(slot, undefined);
+  }
 }
 
 function hopperPointsTo(dimension, from, to) {
@@ -791,7 +1046,9 @@ async function runChildRequestAcceptance(kid) {
   const houseStation = { ...anchor, x: anchor.x - 45 };
   const farmStation = { ...anchor };
   const recipeStation = { ...anchor, x: anchor.x + 45 };
+  const castleStation = { ...anchor, z: anchor.z + 45 };
   let currentRequest = "fixture preparation";
+  let castleOrigin;
   try {
     kid.dimension.runCommand(`tickingarea remove ${TICKING_AREA}`);
     kid.dimension.runCommand(`tickingarea add circle ${anchor.x} ${anchor.y} ${anchor.z} 4 ${TICKING_AREA} true`);
@@ -821,6 +1078,74 @@ async function runChildRequestAcceptance(kid) {
     report("CHECK", "child-automated-chicken-farm", `request via ${farmTransport}; working machine verified`);
     if (!chatCallbacks.undoLastBuild(kid)) throw new Error("could not clear the farm transaction before the recipe test");
     await system.waitTicks(20);
+
+    removeAcceptanceEntities(kid, farmStation);
+    currentRequest = "make me a automatic wool farm using sheep";
+    await teleportToStation(kid, farmStation);
+    const woolTransport = await routeWizardRequest(kid, "wizard, make me a automatic wool farm using sheep", "automatic-wool-farm");
+    await waitFor(
+      () => chatCallbacks.hasCommittedBuild(kid.id) && automaticWoolFarmIsWorking(kid, farmStation),
+      TIMEOUT_TICKS * 2,
+      "the completed sheep, shears-loaded dispenser, grass, hopper minecart, and collected wool",
+    );
+    report("CHECK", "child-automatic-wool-farm", `request via ${woolTransport}; automatic shearing and collection verified`);
+    if (!chatCallbacks.undoLastBuild(kid)) throw new Error("could not clear the committed wool farm before the kelp-farm test");
+    removeAcceptanceEntities(kid, farmStation);
+    await system.waitTicks(20);
+
+    currentRequest = "make me an automatic kelp farm";
+    await teleportToStation(kid, farmStation);
+    const kelpTransport = await routeWizardRequest(kid, "wizard, make me an automatic kelp farm", "automatic-kelp-farm");
+    await waitFor(
+      () => chatCallbacks.hasCommittedBuild(kid.id) && automaticKelpFarmIsWorking(kid, farmStation),
+      TIMEOUT_TICKS * 2,
+      "the source-water kelp column, observer and piston, collection stream, hopper, and tested output chest",
+    );
+    await proveLiveKelpHarvest(kid, farmStation);
+    report("CHECK", "child-automatic-kelp-farm", `request via ${kelpTransport}; fresh natural growth, harvest, and collection verified`);
+    if (!chatCallbacks.undoLastBuild(kid)) throw new Error("could not clear the committed kelp farm before the potion-rain test");
+    removeAcceptanceEntities(kid, farmStation);
+    await teleportToStation(kid, farmStation);
+
+    currentRequest = "can you make it rain splash potions?";
+    const potionTransport = await routeWizardRequest(kid, "wizard, can you make it rain splash potions?", "splash-potion-rain");
+    let sawPotion = false;
+    for (let tick = 0; tick < 400 && !sawPotion; tick += 1) {
+      sawPotion = kid.dimension.getEntities({
+        type: "minecraft:splash_potion",
+        location: farmStation,
+        maxDistance: 24,
+      }).length > 0;
+      if (!sawPotion) await system.waitTicks(1);
+    }
+    if (!sawPotion) throw new Error("no falling splash-potion projectile appeared near Test Kid");
+    report("CHECK", "child-splash-potion-rain", `request via ${potionTransport}; a real bounded projectile appeared in-world`);
+
+    currentRequest = "build a 12x12 castle right here";
+    await teleportToStation(kid, castleStation);
+    const castleTransport = await routeWizardRequest(kid, "wizard, build a 12x12 castle right here", "12x12-castle");
+    await waitFor(
+      () => {
+        castleOrigin = findCompletedStoneBrickCastle(kid, castleStation, 12);
+        return Boolean(castleOrigin);
+      },
+      TIMEOUT_TICKS * 2,
+      "the initial 12x12 castle at its first site",
+    );
+    await system.waitTicks(20);
+    currentRequest = "add rooms, a second floor, guard towers, decorations, and four villagers inside";
+    const upgradeTransport = await routeWizardRequest(
+      kid,
+      "wizard, add rooms, a second floor, guard towers, decorations, and four villagers inside",
+      "in-place-castle-upgrade",
+    );
+    await waitFor(
+      () => castleUpgradeIsComplete(kid, castleOrigin)
+        && castleShellIsComplete(kid, castleOrigin, 12, 9),
+      TIMEOUT_TICKS * 2,
+      "the rooms, upper floor, corner towers, and villagers at the original castle site",
+    );
+    report("CHECK", "child-in-place-castle-upgrade", `requests via ${castleTransport}/${upgradeTransport}; original site gained every requested feature`);
 
     currentRequest = "make it daytime and make it rain";
     kid.dimension.runCommand("time set night");
@@ -858,8 +1183,352 @@ async function runChildRequestAcceptance(kid) {
     report(
       "PASS",
       "child-action-pipeline",
-      "exact child requests produced a complete sized house, working farm, world changes, gifted tools, and an in-world recipe",
+      "exact child requests produced sized and in-place-upgraded structures, working chicken, wool, and kelp farms, potion rain, world changes, gifted tools, and an in-world recipe",
     );
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    const castleState = currentRequest === "add rooms, a second floor, guard towers, decorations, and four villagers inside"
+      ? `; ${castleUpgradeSnapshot(kid, castleOrigin)}` : "";
+    fail(currentRequest, `${String(error)}${castleState}`);
+  }
+}
+
+async function runCastleRefinementAcceptance(kid) {
+  const fail = (request, detail) => {
+    report("FAIL", "castle-refinement", `${request}: ${detail}`);
+    try { kid.disconnect(); } catch {}
+  };
+  const anchor = {
+    x: Math.floor(kid.location.x),
+    y: Math.round(kid.location.y),
+    z: Math.floor(kid.location.z),
+  };
+  const castleStation = { ...anchor };
+  let currentRequest = "fixture preparation";
+  let castleOrigin;
+  try {
+    kid.dimension.runCommand(`tickingarea remove ${TICKING_AREA}`);
+    kid.dimension.runCommand(`tickingarea add circle ${anchor.x} ${anchor.y} ${anchor.z} 4 ${TICKING_AREA} true`);
+    if (chatCallbacks.hasCommittedBuild(kid.id) && !chatCallbacks.undoLastBuild(kid)) {
+      throw new Error("could not clear the preceding workshop transaction");
+    }
+    await system.waitTicks(20);
+
+    currentRequest = "build a 12x12 castle right here";
+    await teleportToStation(kid, castleStation);
+    const castleTransport = await routeWizardRequest(
+      kid,
+      "wizard, build a 12x12 castle right here",
+      "refinement-12x12-castle",
+    );
+    await waitFor(
+      () => {
+        castleOrigin = findCompletedStoneBrickCastle(kid, castleStation, 12);
+        return Boolean(castleOrigin);
+      },
+      TIMEOUT_TICKS * 2,
+      "the initial 12x12 castle at its first site",
+    );
+    await system.waitTicks(20);
+
+    currentRequest = "add rooms, towers, second floor, decorations, and four villagers";
+    const upgradeTransport = await routeWizardRequest(
+      kid,
+      "wizard, add rooms, towers, second floor, decorations, and four villagers",
+      "refinement-in-place-castle-upgrade",
+    );
+    await waitFor(
+      () => castleUpgradeIsComplete(kid, castleOrigin)
+        && castleShellIsComplete(kid, castleOrigin, 12, 9),
+      TIMEOUT_TICKS * 2,
+      "the rooms, upper floor, corner towers, and villagers at the original castle site",
+    );
+    report(
+      "CHECK",
+      "castle-refinement",
+      `requests via ${castleTransport}/${upgradeTransport}; ${castleUpgradeSnapshot(kid, castleOrigin)}`,
+    );
+
+    const trimBeforeBalcony = castleUpgradeMetrics(kid, castleOrigin).towerTrim;
+    currentRequest = "add a balcony";
+    const balconyTransport = await routeWizardRequest(kid, "wizard, add a balcony", "refinement-castle-balcony");
+    await waitFor(
+      () => rectangleIs(kid.dimension, castleOrigin.x, castleOrigin.y, castleOrigin.z, 12, 12, "minecraft:stone_bricks")
+        && castleShellIsComplete(kid, castleOrigin, 12, 9)
+        && castleUpgradeMetrics(kid, castleOrigin).towerTrim >= trimBeforeBalcony + 15,
+      TIMEOUT_TICKS * 2,
+      "the balcony to appear without replacing the castle base",
+    );
+    report("CHECK", "castle-refinement-balcony", `request via ${balconyTransport}; full castle base and new balcony verified together`);
+
+    currentRequest = "make it bigger";
+    const biggerTransport = await routeWizardRequest(kid, "wizard, make it bigger", "refinement-bigger-castle");
+    let expandedOrigin;
+    await waitFor(
+      () => {
+        expandedOrigin = findCompletedStoneBrickCastle(kid, castleStation, 16);
+        return expandedOrigin?.x === castleOrigin.x - 2
+          && expandedOrigin?.z === castleOrigin.z - 2
+          && castleShellIsComplete(kid, expandedOrigin, 16, 11);
+      },
+      TIMEOUT_TICKS * 2,
+      "the complete 16x16 castle to replace the old shell around the same center",
+    );
+    report("CHECK", "castle-refinement-bigger", `request via ${biggerTransport}; centered 16x16 base verified`);
+
+    currentRequest = "add a moat";
+    const moatTransport = await routeWizardRequest(kid, "wizard, add a moat", "refinement-castle-moat");
+    const moatOrigin = { x: castleOrigin.x - 4, y: castleOrigin.y, z: castleOrigin.z - 4 };
+    await waitFor(
+      () => countBlocks(
+        kid.dimension,
+        moatOrigin,
+        { x: moatOrigin.x + 19, y: moatOrigin.y, z: moatOrigin.z + 19 },
+        "minecraft:blue_concrete",
+      ) >= 76 && countBlocks(
+        kid.dimension,
+        moatOrigin,
+        { x: moatOrigin.x + 19, y: moatOrigin.y, z: moatOrigin.z + 19 },
+        "minecraft:stone_bricks",
+      ) >= 300 && castleShellIsComplete(kid, moatOrigin, 20, 11),
+      TIMEOUT_TICKS * 2,
+      "the moat and complete expanded castle foundation at the same center",
+    );
+    report("CHECK", "castle-refinement-moat", `request via ${moatTransport}; 20x20 foundation and full moat verified together`);
+    report(
+      "PASS",
+      "castle-refinement",
+      "the exact follow-ups upgraded, decorated, expanded, and moated the same complete castle without replacing it with a detail fragment",
+    );
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    fail(currentRequest, `${String(error)}; ${castleUpgradeSnapshot(kid, castleOrigin)}`);
+  }
+}
+
+function commonFarmIsWorking(kid, station, spec) {
+  const dimension = kid.dimension;
+  const origin = machineOrigin(station);
+  const at = (point) => machineLocation(origin, point);
+  const output = at([0, 0, 0]);
+  const plantTypes = Array.isArray(spec.plantTypes) ? spec.plantTypes : [spec.plantTypes];
+  const water = (point) => blockIs(dimension, at(point), ["minecraft:water", "minecraft:flowing_water"]);
+  const collectorWorks = !spec.collector || (
+    blockIs(dimension, at(spec.collector), "minecraft:rail")
+    && hopperMinecartsInCell(dimension, at(spec.collector)).length === 1
+  );
+  const hopperPathWorks = (spec.hopperLinks || [[spec.hopper, [0, 0, 0]]])
+    .every(([from, to]) => hopperPointsTo(dimension, at(from), at(to)));
+  return blockIs(dimension, output, "minecraft:chest")
+    && collectorWorks
+    && hopperPathWorks
+    && blockIs(dimension, at(spec.plant), plantTypes)
+    && spec.water.every(water)
+    && containerContains(dimension, output, spec.output);
+}
+
+function hopperMinecartsInCell(dimension, location) {
+  return dimension.getEntities({ type: "minecraft:hopper_minecart", location, maxDistance: 2 })
+    .filter((entity) => Math.floor(entity.location.x) === location.x
+      && Math.floor(entity.location.y) === location.y
+      && Math.floor(entity.location.z) === location.z);
+}
+
+function removeEntityContainerItem(entity, itemId) {
+  const container = entity.getComponent("minecraft:inventory")?.container;
+  for (let slot = 0; container && slot < container.size; slot += 1) {
+    if (container.getItem(slot)?.typeId === itemId) container.setItem(slot, undefined);
+  }
+}
+
+function removeDroppedFarmOutput(dimension, location, itemId) {
+  for (const entity of dimension.getEntities({ type: "minecraft:item", location, maxDistance: 12 })) {
+    if (entity.getComponent("minecraft:item")?.itemStack?.typeId !== itemId) continue;
+    try { entity.remove(); } catch {}
+  }
+}
+
+async function proveLiveCommonFarmHarvest(kid, station, spec) {
+  const dimension = kid.dimension;
+  const origin = machineOrigin(station);
+  const at = (point) => machineLocation(origin, point);
+  const resetOutput = () => {
+    removeContainerItem(dimension, at([0, 0, 0]), spec.output);
+    for (const hopper of spec.hoppers) removeContainerItem(dimension, at(hopper), spec.output);
+    if (spec.collector) {
+      for (const collector of hopperMinecartsInCell(dimension, at(spec.collector))) {
+        removeEntityContainerItem(collector, spec.output);
+      }
+    }
+    removeDroppedFarmOutput(dimension, at(spec.plant), spec.output);
+  };
+
+  // Production verification may have sent a test item through this path. Drain
+  // every copy before accelerating genuine random growth so only the working
+  // farm can put a new crop in the chest.
+  resetOutput();
+  await system.waitTicks(20);
+  resetOutput();
+  if (!spec.plantTypes.includes(dimension.getBlock(at(spec.plant))?.typeId)) {
+    throw new Error(`the planted ${spec.output} crop disappeared before its live harvest`);
+  }
+  dimension.runCommand("gamerule randomtickspeed 1000");
+  try {
+    try {
+      let observerPowered = false;
+      let pistonExtended = false;
+      for (let tick = 0; tick < 400; tick += 1) {
+        if (spec.observer) {
+          observerPowered ||= dimension.getBlock(at(spec.observer))?.permutation.getState("powered_bit") === true;
+        }
+        if (spec.pistonArm) {
+          pistonExtended ||= /piston_arm/.test(dimension.getBlock(at(spec.pistonArm))?.typeId || "");
+        }
+        if (containerContains(dimension, at([0, 0, 0]), spec.output)) return;
+        await system.waitTicks(1);
+      }
+      throw new Error(
+        `timed out waiting for naturally grown ${spec.output.replace("minecraft:", "")} to be harvested and carried into the output chest`
+          + `${spec.observer ? `; observerPowered=${observerPowered}` : ""}`
+          + `${spec.pistonArm ? `; pistonExtended=${pistonExtended}` : ""}`,
+      );
+    } catch (error) {
+      const block = (point) => {
+        const value = dimension.getBlock(at(point));
+        return { type: value?.typeId || "unloaded", states: value?.permutation.getAllStates() || {} };
+      };
+      const container = (point) => {
+        const inventory = dimension.getBlock(at(point))?.getComponent("minecraft:inventory")?.container;
+        return [...Array(inventory?.size || 0).keys()]
+          .map((slot) => inventory.getItem(slot)?.typeId)
+          .filter(Boolean);
+      };
+      const dropped = dimension.getEntities({ type: "minecraft:item", location: at(spec.plant), maxDistance: 12 })
+        .map((entity) => entity.getComponent("minecraft:item")?.itemStack?.typeId)
+        .filter(Boolean);
+      const collector = spec.collector ? hopperMinecartsInCell(dimension, at(spec.collector)).map((entity) => {
+        const inventory = entity.getComponent("minecraft:inventory")?.container;
+        return [...Array(inventory?.size || 0).keys()]
+          .map((slot) => inventory.getItem(slot)?.typeId)
+          .filter(Boolean);
+      }) : [];
+      const collectorNearby = spec.collector ? dimension.getEntities({
+        type: "minecraft:hopper_minecart",
+        location: at(spec.collector),
+        maxDistance: 12,
+      }).map(({ location }) => ({
+        x: Math.floor(location.x * 100) / 100,
+        y: Math.floor(location.y * 100) / 100,
+        z: Math.floor(location.z * 100) / 100,
+      })) : [];
+      throw new Error(`${String(error)}; state=${JSON.stringify({
+        plant: block(spec.plant),
+        growth: spec.growth.map(block),
+        ...(spec.piston ? { piston: block(spec.piston) } : {}),
+        ...(spec.observer ? { observer: block(spec.observer) } : {}),
+        ...(spec.dust ? { dust: spec.dust.map(block) } : {}),
+        ...(spec.repeater ? { repeater: block(spec.repeater) } : {}),
+        water: spec.water.map(block),
+        ...(spec.collector ? { rail: block(spec.collector), collector, collectorNearby } : {}),
+        chest: container([0, 0, 0]),
+        hopperBlocks: spec.hoppers.map(block),
+        hoppers: spec.hoppers.map(container),
+        dropped,
+      })}`);
+    }
+  } finally {
+    dimension.runCommand("gamerule randomtickspeed 1");
+  }
+}
+
+async function runCommonFarmAcceptance(kid) {
+  const fail = (request, detail) => {
+    report("FAIL", "common-farm-pipeline", `${request}: ${detail}`);
+    try { kid.disconnect(); } catch {}
+  };
+  const station = {
+    x: Math.floor(kid.location.x),
+    y: Math.round(kid.location.y),
+    z: Math.floor(kid.location.z),
+  };
+  const farms = [
+    {
+      request: "build me an automatic sugar cane farm",
+      check: "common-sugar-cane-farm",
+      collector: [0, 1, 1],
+      hopper: [0, 0, 1],
+      plant: [0, 3, 1],
+      plantTypes: ["minecraft:sugar_cane", "minecraft:reeds"],
+      water: [[-1, 2, 1]],
+      output: "minecraft:sugar_cane",
+      growth: [[0, 4, 1], [0, 5, 1]],
+      piston: [0, 4, 2],
+      pistonArm: [0, 4, 1],
+      observer: [0, 5, 2],
+      dust: [[0, 5, 3], [1, 5, 3], [2, 4, 3], [2, 4, 2]],
+      repeater: [1, 4, 2],
+      hoppers: [[0, 0, 1]],
+    },
+    {
+      request: "build me an automatic bamboo farm",
+      check: "common-bamboo-farm",
+      collector: [0, 1, 1],
+      hopper: [0, 0, 1],
+      plant: [0, 3, 1],
+      plantTypes: "minecraft:bamboo",
+      water: [],
+      output: "minecraft:bamboo",
+      growth: [[0, 4, 1], [0, 5, 1]],
+      piston: [0, 4, 2],
+      pistonArm: [0, 4, 1],
+      observer: [0, 5, 2],
+      dust: [[0, 5, 3], [1, 5, 3], [2, 4, 3], [2, 4, 2]],
+      repeater: [1, 4, 2],
+      hoppers: [[0, 0, 1]],
+    },
+    {
+      request: "build me an automatic cactus farm",
+      check: "common-cactus-farm",
+      hopper: [0, 0, 1],
+      hopperLinks: [
+        [[0, 0, 1], [0, 0, 0]],
+        [[0, 1, 1], [0, 0, 1]],
+        [[-1, 1, 1], [0, 1, 1]],
+        [[1, 1, 1], [0, 1, 1]],
+      ],
+      plant: [0, 3, 3],
+      plantTypes: "minecraft:cactus",
+      water: [[-1, 2, 4], [0, 2, 4], [1, 2, 4]],
+      output: "minecraft:cactus",
+      growth: [[0, 4, 3]],
+      hoppers: [[0, 0, 1], [0, 1, 1], [-1, 1, 1], [1, 1, 1]],
+    },
+  ];
+  let currentRequest = "fixture preparation";
+  try {
+    kid.dimension.runCommand(`tickingarea remove ${TICKING_AREA}`);
+    kid.dimension.runCommand(`tickingarea add circle ${station.x} ${station.y} ${station.z} 4 ${TICKING_AREA} true`);
+    await teleportToStation(kid, station);
+    for (let index = 0; index < farms.length; index += 1) {
+      const farm = farms[index];
+      currentRequest = farm.request;
+      const transport = await routeWizardRequest(kid, `wizard, ${farm.request}`, farm.check);
+      await waitFor(
+        () => chatCallbacks.hasCommittedBuild(kid.id) && commonFarmIsWorking(kid, station, farm),
+        TIMEOUT_TICKS * 2,
+        `the ${farm.output.replace("minecraft:", "")} crop and collection output to reach the chest`,
+      );
+      await proveLiveCommonFarmHarvest(kid, station, {
+        ...farm,
+        plantTypes: Array.isArray(farm.plantTypes) ? farm.plantTypes : [farm.plantTypes],
+      });
+      report("CHECK", farm.check, `request via ${transport}; fresh crop growth was harvested through the working collector and carried into the chest`);
+      if (index < farms.length - 1) {
+        if (!chatCallbacks.undoLastBuild(kid)) throw new Error(`could not clear ${farm.request} before the next farm`);
+        await system.waitTicks(20);
+      }
+    }
+    report("PASS", "common-farm-pipeline", "sugar cane, bamboo, and cactus each completed a natural-growth-to-collector-to-chest acceptance check");
     try { kid.disconnect(); } catch {}
   } catch (error) {
     fail(currentRequest, String(error));
@@ -1297,7 +1966,7 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "mc_wizard_e2e_run is required");
     return;
   }
-  if (scope !== "full" && scope !== "machines" && scope !== "arbitrary" && scope !== "child") {
+  if (scope !== "full" && scope !== "machines" && scope !== "arbitrary" && scope !== "child" && scope !== "refinement" && scope !== "farms" && scope !== "kelp") {
     report("FAIL", "configuration", `unsupported mc_wizard_e2e_scope: ${scope}`);
     return;
   }
@@ -1314,7 +1983,10 @@ export async function startE2E(callbacks) {
   }
   const startCheck = scope === "machines" ? "machine-action-pipeline"
     : scope === "arbitrary" ? "arbitrary-exact-structure"
-      : scope === "child" ? "child-action-pipeline" : "visible-player-t-flip-flop";
+      : scope === "child" ? "child-action-pipeline"
+        : scope === "refinement" ? "castle-refinement"
+          : scope === "farms" ? "common-farm-pipeline"
+            : scope === "kelp" ? "kelp-farm-pipeline" : "visible-player-t-flip-flop";
   report("START", startCheck);
   try {
     const dimension = world.getDimension("overworld");
@@ -1351,6 +2023,18 @@ export async function startE2E(callbacks) {
     }
     if (scope === "child") {
       system.runTimeout(() => void runChildRequestAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "refinement") {
+      system.runTimeout(() => void runCastleRefinementAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "farms") {
+      system.runTimeout(() => void runCommonFarmAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "kelp") {
+      system.runTimeout(() => void runKelpFarmAcceptance(kid), 80);
       return;
     }
     system.runTimeout(async () => {

@@ -3,6 +3,8 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 
 import {
+  expansionClearOperations,
+  obsoleteExpansionOperations,
   primitiveStructureOperations,
   validateBuildStructurePlan,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/build-structure.js";
@@ -57,6 +59,143 @@ test("validates compact phased primitives inside the requested bounds", () => {
   }), /bounds must match/);
 });
 
+test("new primitive structures require solid geometry in every phase and across every bound", () => {
+  const allAir = [
+    { shape: "box", phase: "foundation", blockId: "minecraft:air", from: [0, 0, 0], to: [11, 0, 7] },
+    { shape: "box", phase: "shell", blockId: "minecraft:air", from: [0, 1, 0], to: [0, 8, 7] },
+    { shape: "box", phase: "roof", blockId: "minecraft:air", from: [0, 9, 0], to: [11, 9, 7] },
+    { shape: "box", phase: "details", blockId: "minecraft:air", from: [11, 1, 7], to: [11, 8, 7] },
+  ];
+  assert.throws(() => validateBuildStructurePlan({ ...customPlan, primitives: allAir }), /solid primitives must include/);
+
+  const airOnlyBounds = [
+    { ...customPlan.primitives[0], from: [1, 0, 3], to: [10, 0, 3] },
+    ...customPlan.primitives.slice(1),
+    { shape: "box", phase: "details", blockId: "minecraft:air", from: [0, 0, 0], to: [11, 9, 7] },
+  ];
+  assert.throws(
+    () => validateBuildStructurePlan({ ...customPlan, primitives: airOnlyBounds }),
+    /solid primitive bounds must match/,
+  );
+
+  const airOnlyRoof = customPlan.primitives.map((primitive) => (
+    primitive.phase === "roof" ? { ...primitive, blockId: "minecraft:air" } : primitive
+  ));
+  assert.throws(
+    () => validateBuildStructurePlan({ ...customPlan, primitives: airOnlyRoof }),
+    /solid primitives must include/,
+  );
+});
+
+test("validates bounded in-place structure modifications and villagers", () => {
+  const modification = validateBuildStructurePlan({
+    ...customPlan,
+    mode: "modify",
+    features: ["rooms", "second_floor", "decorations", "towers"],
+    primitives: [
+      { shape: "box", phase: "details", blockId: "minecraft:air", from: [2, 1, 2], to: [3, 2, 3] },
+    ],
+    entities: [
+      { typeId: "minecraft:villager_v2", location: [4, 1, 4] },
+      { typeId: "minecraft:villager_v2", location: [6, 1, 4] },
+    ],
+  });
+  assert.equal(modification.mode, "modify");
+  assert.deepEqual(modification.features, ["rooms", "second_floor", "decorations", "towers"]);
+  assert.equal(modification.primitives[0].blockId, "minecraft:air");
+  assert.deepEqual(modification.entities, [
+    { typeId: "minecraft:villager_v2", location: [4, 1, 4] },
+    { typeId: "minecraft:villager_v2", location: [6, 1, 4] },
+  ]);
+
+  const generatedModification = validateBuildStructurePlan({
+    ...customPlan,
+    mode: "modify",
+    features: ["rooms", "second_floor", "decorations"],
+    primitives: undefined,
+  });
+  assert.equal(generatedModification.mode, "modify");
+  assert.equal(generatedModification.primitives, undefined);
+
+  assert.throws(() => validateBuildStructurePlan({
+    ...customPlan,
+    materials: { ...customPlan.materials, primary: "minecraft:air" },
+  }), /materials\.primary is not allowed/);
+  assert.throws(() => validateBuildStructurePlan({ ...customPlan, mode: "replace" }), /mode must be modify/);
+  assert.throws(() => validateBuildStructurePlan({
+    ...customPlan,
+    entities: [{ typeId: "minecraft:zombie", location: [1, 1, 1] }],
+  }), /typeId is not allowed/);
+  assert.throws(() => validateBuildStructurePlan({
+    ...customPlan,
+    entities: [{ typeId: "minecraft:villager_v2", location: [12, 1, 1] }],
+  }), /outside the requested dimensions/);
+  assert.throws(() => validateBuildStructurePlan({
+    ...customPlan,
+    entities: [{ typeId: "minecraft:villager_v2", location: [1.5, 1, 1] }],
+  }), /outside the requested dimensions/);
+  assert.throws(() => validateBuildStructurePlan({
+    ...customPlan,
+    entities: Array.from({ length: 9 }, () => ({
+      typeId: "minecraft:villager_v2",
+      location: [1, 1, 1],
+    })),
+  }), /0-8 entries/);
+});
+
+test("preserves a provider-authored shape while appending a follow-up detail", () => {
+  const action = classifyAction("add a balcony to the dragon statue", [{
+    question: "Build a 12x8x10 dragon statue",
+    answer: "The dragon statue is complete.",
+    action: { type: "build_structure", version: 1, plan: customPlan },
+  }]);
+  const plan = validateBuildStructurePlan(action.plan);
+  assert.equal(plan.mode, "modify");
+  assert.deepEqual(plan.primitives.slice(0, customPlan.primitives.length), customPlan.primitives);
+  assert.ok(plan.primitives.length > customPlan.primitives.length);
+  assert.equal(plan.primitives.filter(({ phase }) => phase === "details").length, 4);
+});
+
+test("an expansion removes only the wizard's obsolete exterior shell and roof", () => {
+  const oldOperations = [
+    { phase: "foundation", blockId: "minecraft:stone_bricks", from: [0, 0, 0], to: [11, 0, 7] },
+    { phase: "shell", blockId: "minecraft:stone_bricks", from: [0, 1, 0], to: [11, 6, 0] },
+    { phase: "shell", blockId: "minecraft:oak_planks", from: [1, 1, 4], to: [10, 6, 4] },
+    { phase: "shell", blockId: "minecraft:oak_planks", from: [1, 3, 1], to: [10, 3, 6] },
+    { phase: "roof", blockId: "minecraft:spruce_planks", from: [0, 7, 0], to: [11, 7, 7] },
+    { phase: "details", blockId: "minecraft:glass", from: [2, 2, 0], to: [2, 2, 0] },
+    { phase: "details", blockId: "minecraft:sea_lantern", from: [5, 2, 4], to: [5, 2, 4] },
+  ];
+  const expanded = {
+    ...customPlan,
+    dimensions: { width: 20, depth: 16, height: 12 },
+  };
+  const cleanup = obsoleteExpansionOperations(customPlan, expanded, oldOperations);
+  assert.ok(cleanup.length >= 3);
+  assert.ok(cleanup.every(({ phase, blockId, replaceBlockId }) => (
+    phase === "cleanup" && blockId === "minecraft:air" && replaceBlockId !== "minecraft:air"
+  )));
+  assert.deepEqual(
+    new Set(cleanup.map(({ replaceBlockId }) => replaceBlockId)),
+    new Set(["minecraft:stone_bricks", "minecraft:spruce_planks", "minecraft:glass"]),
+  );
+  assert.equal(cleanup.some(({ from, to }) => from[2] === 4 && to[2] === 4), false);
+  assert.equal(cleanup.some(({ from, to }) => from[1] === 3 && to[1] === 3 && from[2] === 1), false);
+  assert.deepEqual(obsoleteExpansionOperations(customPlan, customPlan, oldOperations), []);
+  const expansionClears = expansionClearOperations(customPlan, expanded);
+  assert.ok(expansionClears.length >= 3);
+  assert.ok(expansionClears.every(({ blockId, from, to }) => (
+    blockId === "minecraft:air" && from.every((value, axis) => value <= to[axis])
+  )));
+  assert.deepEqual(expansionClearOperations(customPlan, customPlan), []);
+
+  const shrunk = { ...customPlan, dimensions: { width: 8, depth: 6, height: 6 } };
+  const shrinkCleanup = obsoleteExpansionOperations(customPlan, shrunk, oldOperations);
+  assert.ok(shrinkCleanup.some(({ from, to }) => from[1] === 0 && to[1] === 0));
+  assert.ok(shrinkCleanup.some(({ from, to }) => from[2] === 4 && to[2] === 4));
+  assert.ok(shrinkCleanup.some(({ from, to }) => from[1] === 2 && to[1] === 2));
+});
+
 test("asks the model for an unusual exact-size structure instead of making a generic box", async () => {
   assert.equal(classifyAction("Build a 12x8x10 dragon statue"), null);
   assert.equal(classifyAction("Build a 14x12 treehouse"), null);
@@ -82,14 +221,63 @@ test("asks the model for an unusual exact-size structure instead of making a gen
   assert.doesNotMatch(result.answer, /house|generic|prototype|pad/i);
 });
 
-test("the structured response and Bedrock executor require and consume model primitives", () => {
+test("the structured response lets ordinary buildings omit primitives while validating authored geometry", () => {
   const schema = JSON.parse(readFileSync(new URL("../schemas/wizard-response.schema.json", import.meta.url), "utf8"));
   const structureAction = schema.properties.action.anyOf.find((candidate) => (
     candidate.properties?.type?.const === "build_structure"
   ));
-  assert.ok(structureAction.properties.plan.required.includes("primitives"));
+  assert.equal(structureAction.properties.plan.required.includes("primitives"), false);
+  assert.equal(structureAction.properties.plan.properties.primitives.minItems, 1);
+  const solidRequirements = structureAction.properties.plan.allOf[0]
+    .then.properties.primitives.allOf;
+  assert.deepEqual(solidRequirements.map(({ contains }) => contains.$ref), [
+    "#/$defs/solidFoundationPrimitive",
+    "#/$defs/solidShellPrimitive",
+    "#/$defs/solidRoofPrimitive",
+    "#/$defs/solidDetailsPrimitive",
+  ]);
+  assert.ok(solidRequirements.every(({ contains }) => (
+    schema.$defs[contains.$ref.split("/").at(-1)].properties.blockId.not.const === "minecraft:air"
+  )));
   const pack = readFileSync(new URL("../bedrock/behavior_packs/mc_wizard/scripts/main.js", import.meta.url), "utf8");
-  assert.match(pack, /plan\.primitives\?\.length \? primitiveStructureOperations\(plan\) : structureOperations\(plan\)/);
+  assert.match(pack, /function structurePlanOperations\(plan\)/);
+  assert.match(pack, /\[\.\.\.structureOperations\(plan\), \.\.\.primitives\]/);
+  assert.match(pack, /obsoleteExpansionOperations\(modificationSite\.previous\.plan, plan, previousOperations\)/);
+  assert.match(pack, /worldStructureBox\(\s*modificationSite\.previous\.origin,/);
+  assert.match(pack, /\[\.\.\.obsoleteWorldOperations, \.\.\.operations\.flatMap/);
+  assert.match(pack, /replaceBlockId \? ` replace \$\{replaceBlockId\}`/);
+});
+
+test("runtime replaces an unusual provider structure that omits authored primitives", async () => {
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "I’ll build the dragon statue now.",
+      action: {
+        type: "build_structure",
+        version: 1,
+        plan: {
+          title: "Dragon Statue",
+          kind: "dragon statue",
+          dimensions: { width: 12, depth: 8, height: 10 },
+          materials: {
+            primary: "minecraft:green_concrete",
+            accent: "minecraft:dark_prismarine",
+            roof: "minecraft:orange_concrete"
+          },
+          features: ["floor"],
+          phases: ["foundation", "shell", "roof", "details"]
+        }
+      }
+    }) } }] }), { status: 200 }),
+  });
+
+  const result = await wizard.ask({ player: "BuilderKid", question: "Build a 12x8x10 dragon statue" });
+  assert.equal(result.mode, "local-structure-fallback");
+  assert.equal(result.action.plan.kind, "dragon statue");
+  assert.deepEqual(result.action.plan.dimensions, { width: 12, depth: 8, height: 10 });
+  assert.ok(result.action.plan.primitives.length >= 4);
 });
 
 test("wires a bounded live scope that verifies an exact-size dragon in the world", () => {

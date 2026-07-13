@@ -88,7 +88,7 @@ test("rejects unsafe machine items, arbitrary breaking, and unbounded directions
   }), /itemId is not allowed/);
 });
 
-test("accepts model-authored sugar-cane and flying-machine actions while fixed skills still win", async () => {
+test("uses the local sugar-cane fallback and accepts model-authored long-tail machines", async () => {
   const ask = async (question, plan) => {
     let providerCalled = false;
     const wizard = createWizard({
@@ -110,7 +110,20 @@ test("accepts model-authored sugar-cane and flying-machine actions while fixed s
     return result;
   };
 
-  await ask("Build me a sugar cane farm", sugarCanePlan);
+  let sugarProviderCalled = false;
+  const sugarWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      sugarProviderCalled = true;
+      throw new Error("the local farm should win");
+    },
+  });
+  const sugar = await sugarWizard.ask({ player: "sugar", question: "Build me a sugar cane farm" });
+  assert.equal(sugarProviderCalled, false);
+  assert.equal(sugar.mode, "local-skill");
+  assert.equal(sugar.action.type, "build_machine");
+  assert.equal(sugar.action.plan.kind, "automatic sugar cane farm");
   await ask("Build me a flying machine", flyingMachinePlan);
   assert.equal(classifyAction("Build an automatic smelter").id, "automatic_smelter");
   assert.equal(classifyAction("Build me a piston door").id, "two_by_two_piston_door");

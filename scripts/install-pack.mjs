@@ -52,8 +52,8 @@ const e2eScope = (process.env.MC_WIZARD_E2E_SCOPE || "full").trim();
 if (e2eEnabled && !e2eRun) {
   throw new Error("MC_WIZARD_E2E_RUN is required when MC_WIZARD_E2E=1");
 }
-if (!new Set(["full", "machines", "arbitrary", "child"]).has(e2eScope)) {
-  throw new Error("MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, or child");
+if (!new Set(["full", "machines", "arbitrary", "child", "refinement", "farms", "kelp"]).has(e2eScope)) {
+  throw new Error("MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, child, refinement, farms, or kelp");
 }
 const loopbackBrain = parsedUrl.hostname === "localhost"
   || parsedUrl.hostname === "[::1]"

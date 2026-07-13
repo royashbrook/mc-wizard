@@ -1,0 +1,122 @@
+[
+  {
+    "id": "live-greeting",
+    "observed": "success",
+    "question": "hey",
+    "history": [],
+    "expected": { "type": null }
+  },
+  {
+    "id": "live-cat-question",
+    "observed": "success",
+    "question": "tell me about cats",
+    "history": [],
+    "expected": { "type": null }
+  },
+  {
+    "id": "live-skeleton-damage-question",
+    "observed": "success",
+    "question": "how many hearts of damage do skeletons do to me?",
+    "history": [],
+    "expected": { "type": null }
+  },
+  {
+    "id": "exact-tapered-tower",
+    "observed": "success",
+    "question": "build a 7x7 tower around me where i'm in the center. make it tapered and 20 blocks tall at it's peak",
+    "history": [],
+    "expected": { "type": "build_structure", "kind": "tower", "mode": "new", "width": 7, "depth": 7, "height": 20 }
+  },
+  {
+    "id": "decorate-existing-tower",
+    "observed": "failure-built-a-second-tower",
+    "question": "wow that was great. can you decorate it with some more things on the inside and outside?",
+    "history": [
+      {
+        "question": "build a 7x7 tower around me where i'm in the center. make it tapered and 20 blocks tall at it's peak",
+        "answer": "7x7 tower is complete."
+      }
+    ],
+    "expected": { "type": "build_structure", "kind": "tower", "mode": "modify", "width": 7, "depth": 7, "height": 20, "feature": "decorations" }
+  },
+  {
+    "id": "splash-potion-rain",
+    "observed": "failure-treated-as-weather",
+    "question": "can you make it rain splash potions?",
+    "history": [],
+    "expected": { "type": "potion_rain" }
+  },
+  {
+    "id": "clarified-splash-potion-rain",
+    "observed": "failure-treated-as-weather-chatter",
+    "question": "yes, but i want you to simulate raining, but with splash postions falling everywhere from the sky",
+    "history": [
+      { "question": "can you make it rain splash potions?", "answer": "Done—I've changed rain weather." }
+    ],
+    "expected": { "type": "potion_rain" }
+  },
+  {
+    "id": "automatic-wool-farm",
+    "observed": "failure-built-a-wood-sculpture",
+    "question": "make me a automatic wool farm using sheep",
+    "history": [
+      { "question": "build a 7x7 tower that is 20 blocks tall", "answer": "7x7 tower is complete." }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "wool-farm-correction",
+    "observed": "failure-promised-without-action",
+    "question": "no i need a farm that makes wool. so like it would have sheep who eat grass and grow wool and automatically it would shear the sheep sometimes and pickup the wool automatically.",
+    "history": [
+      { "question": "make me an automatic wool farm using sheep", "answer": "7x7 wool farm is complete." }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "live-dispenser-wool-correction",
+    "observed": "partial-correct-plan-promised-without-action",
+    "question": "you should be able to use a dispensor or something i think to shear the sheep automatically. you can lookup online how to make it",
+    "history": [
+      { "question": "make me a automatic wool farm using sheep", "answer": "I built the wrong sculpture." },
+      { "question": "no i need a farm that makes wool. so like it would have sheep who eat grass and grow wool and automatically it would shear the sheep sometimes and pickup the wool automatically.", "answer": "I cannot automate shearing.", "action": null }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "live-ok-do-it-wool-farm",
+    "observed": "failure-repeated-promise-without-action",
+    "question": "ok do it",
+    "history": [
+      { "question": "make me a automatic wool farm using sheep", "answer": "I built the wrong sculpture." },
+      { "question": "you should be able to use a dispensor or something i think to shear the sheep automatically. you can lookup online how to make it", "answer": "I'll build the complete automatic sheep wool farm beside your tower.", "action": null }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "resume-promised-wool-farm",
+    "observed": "failure-repeated-promise-without-action",
+    "question": "ok go",
+    "history": [
+      { "question": "make me an automatic wool farm using sheep", "answer": "I made the wrong kind of farm." },
+      { "question": "use a dispenser with shears and collect the wool automatically", "answer": "I'll build the complete automatic sheep wool farm beside your tower.", "action": null }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "fancy-castle",
+    "observed": "success",
+    "question": "build a 20x20 castle right here. make it fancy",
+    "history": [],
+    "expected": { "type": "build_structure", "kind": "castle", "mode": "new", "width": 20, "depth": 20, "height": 9 }
+  },
+  {
+    "id": "upgrade-existing-castle",
+    "observed": "failure-built-a-separate-wood-structure",
+    "question": "can you give it some rooms inside, a second floor, and some guard towers on the corners. also, place some villagers inside trapped in key spots so it looks like they work/live here.",
+    "history": [
+      { "question": "build a 20x20 castle right here. make it fancy", "answer": "20x20 castle is complete." }
+    ],
+    "expected": { "type": "build_structure", "kind": "castle", "mode": "modify", "width": 20, "depth": 20, "height": 9, "features": ["rooms", "second_floor", "towers"], "entity": "minecraft:villager_v2" }
+  }
+]

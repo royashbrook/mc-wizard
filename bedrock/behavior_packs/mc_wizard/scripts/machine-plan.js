@@ -23,6 +23,7 @@ const PLACE_ITEMS = Object.freeze({
   "minecraft:comparator": ["minecraft:unpowered_comparator", "minecraft:powered_comparator"],
   "minecraft:lever": "minecraft:lever",
   "minecraft:stone_button": "minecraft:stone_button",
+  "minecraft:rail": "minecraft:rail",
   "minecraft:sugar_cane": ["minecraft:sugar_cane", "minecraft:reeds"],
   "minecraft:bamboo": "minecraft:bamboo",
   "minecraft:cactus": "minecraft:cactus",
@@ -30,6 +31,7 @@ const PLACE_ITEMS = Object.freeze({
 
 const INTERACTION_ITEMS = Object.freeze({
   "minecraft:water_bucket": { expectedFaceType: "minecraft:water" },
+  "minecraft:hopper_minecart": { expectedEntity: "minecraft:hopper_minecart" },
   "minecraft:stick": { control: true },
   "minecraft:chicken_spawn_egg": { expectedEntity: "minecraft:chicken" },
   "minecraft:cow_spawn_egg": { expectedEntity: "minecraft:cow" },
@@ -44,8 +46,9 @@ const DIRECTIONAL_ITEMS = new Set([
 const SCAFFOLD_ITEMS = new Set(["minecraft:smooth_stone", "minecraft:cobblestone"]);
 const BELOW_ONLY = new Set([
   "minecraft:redstone", "minecraft:redstone_torch", "minecraft:repeater", "minecraft:comparator",
-  "minecraft:sugar_cane", "minecraft:bamboo", "minecraft:cactus",
+  "minecraft:rail", "minecraft:sugar_cane", "minecraft:bamboo", "minecraft:cactus",
 ]);
+const FARM_CROPS = new Set(["minecraft:sugar_cane", "minecraft:bamboo", "minecraft:cactus"]);
 
 const key = ([x, y, z]) => `${x},${y},${z}`;
 const clean = (value, fallback, max) => String(value || fallback)
@@ -71,6 +74,56 @@ function vector(value, name, { ground = false } = {}) {
 }
 
 const touches = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]) === 1;
+const distance = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
+
+function cropFarmPipeline(plan) {
+  const plant = plan.placements.find(({ itemId }) => FARM_CROPS.has(itemId));
+  if (!plant) return null;
+  const water = plan.interactions
+    .filter(({ itemId }) => itemId === "minecraft:water_bucket")
+    .map(({ faceTarget }) => faceTarget);
+  const collector = plan.interactions.find(({ itemId }) => itemId === "minecraft:hopper_minecart");
+  const hoppers = plan.placements.filter(({ itemId }) => itemId === "minecraft:hopper");
+  const containers = new Map(plan.placements
+    .filter(({ itemId }) => itemId === "minecraft:hopper" || itemId === "minecraft:chest")
+    .map((placement) => [key(placement.target), placement]));
+  const paths = hoppers.map((start) => {
+    const path = [];
+    const seen = new Set();
+    let current = start;
+    while (current?.itemId === "minecraft:hopper" && !seen.has(key(current.target))) {
+      seen.add(key(current.target));
+      path.push(current.target);
+      current = containers.get(key(current.orientationTarget || []));
+    }
+    return current?.itemId === "minecraft:chest" ? { path, output: current.target } : null;
+  }).filter(Boolean);
+  if (!paths.length || (!water.length && !collector)) {
+    throw new Error(`${plant.itemId} farms require a water or hopper-minecart collector and a hopper path to an output chest`);
+  }
+  if (plant.itemId === "minecraft:sugar_cane" && !water.length) {
+    throw new Error("minecraft:sugar_cane farms require adjacent water");
+  }
+  const collectionReference = collector?.block || water[0];
+  const route = paths.sort((a, b) => (
+    distance(a.path[0], collectionReference) - distance(b.path[0], collectionReference)
+  ))[0];
+  const expected = PLACE_ITEMS[plant.itemId];
+  return {
+    kind: "crop_farm_pipeline",
+    plant: plant.target,
+    plantTypes: Array.isArray(expected) ? expected : [expected],
+    collectionWater: water,
+    ...collector && {
+      collector: collector.block,
+      collectorEntity: "minecraft:hopper_minecart",
+      testDrop: [plant.target[0], plant.target[1] + 1, plant.target[2]],
+    },
+    hopperPath: route.path,
+    output: route.output,
+    expectedOutput: plant.itemId,
+  };
+}
 
 export function validateMachinePlan(value) {
   exactKeys(value, ["title", "kind", "placements", "interactions"], "machine plan");
@@ -140,6 +193,9 @@ export function validateMachinePlan(value) {
     if (itemId !== "minecraft:water_bucket" && !placed.has(key(block))) {
       throw new Error(`interactions[${index}].block must be a planned block`);
     }
+    if (itemId === "minecraft:hopper_minecart" && placed.get(key(block))?.itemId !== "minecraft:rail") {
+      throw new Error(`interactions[${index}].block must be a planned rail`);
+    }
     return { action: "use_item_on_block", itemId, block, faceTarget };
   });
 
@@ -153,6 +209,7 @@ export function validateMachinePlan(value) {
 
 export function machineBlueprint(value) {
   const plan = validateMachinePlan(value);
+  const farmPipeline = cropFarmPipeline(plan);
   const placements = plan.placements.map((placement) => placement.action === "break" ? placement : {
     ...placement,
     expectedType: PLACE_ITEMS[placement.itemId],
@@ -170,6 +227,9 @@ export function machineBlueprint(value) {
   });
   const preInteractions = preparedInteractions.filter(({ expectedFaceType }) => expectedFaceType);
   const interactions = preparedInteractions.filter(({ expectedFaceType }) => !expectedFaceType);
+  const cropPlacementIndex = farmPipeline ? plan.placements.findIndex((placement) => (
+    placement.action !== "break" && key(placement.target) === key(farmPipeline.plant)
+  )) : -1;
   const verification = [];
   for (const placement of plan.placements) {
     if (placement.action === "break" || !placement.orientationTarget) continue;
@@ -181,14 +241,17 @@ export function machineBlueprint(value) {
     if (interaction.expectedFaceType) {
       verification.push({ kind: "block_type", block: interaction.faceTarget, typeId: interaction.expectedFaceType });
     } else if (interaction.expectedEntity) {
+      const entityLocation = interaction.expectedEntity === "minecraft:hopper_minecart"
+        ? interaction.block : interaction.faceTarget;
       verification.push({
         kind: "entity_count",
         entityType: interaction.expectedEntity,
         min: 1,
-        bounds: { min: interaction.faceTarget, max: interaction.faceTarget },
+        bounds: { min: entityLocation, max: entityLocation },
       });
     }
   }
+  if (farmPipeline) verification.push(farmPipeline);
   const points = [
     ...plan.placements.flatMap((placement) => placement.action === "break"
       ? [placement.target] : [placement.target, placement.support, placement.orientationTarget].filter(Boolean)),
@@ -202,10 +265,16 @@ export function machineBlueprint(value) {
     title: plan.title,
     placements,
     preInteractions,
+    // Build the dry collection path first, then add water immediately before
+    // the crop that depends on it. Pouring first can flood a future hopper
+    // square and trap a real player in an endless break/refill loop.
+    preInteractionBefore: cropPlacementIndex >= 0 ? cropPlacementIndex : placements.length,
     interactions,
     verification,
     bounds,
-    success: `${plan.title} is built. I checked every planned block, direction, and working interaction.`,
+    success: farmPipeline
+      ? `${plan.title} is built. I sent a real ${farmPipeline.expectedOutput.split(":")[1].replace("_", " ")} item through its collector and found it in the output chest.`
+      : `${plan.title} is built. I checked every planned block, direction, and working interaction.`,
     usage: "Try its control or input while I watch; if one part behaves strangely, tell me what moved and I’ll tune it.",
   };
 }

@@ -19,17 +19,22 @@ import {
   validateBuildPlan,
 } from "./build-plan.js";
 import {
+  expansionClearOperations,
+  obsoleteExpansionOperations,
   primitiveStructureOperations,
   STRUCTURE_LIMITS,
+  STRUCTURE_PRIMITIVE_LIMIT,
   validateBuildStructurePlan,
 } from "./build-structure.js";
 import { createAutomaticSmelterBlueprint } from "./auto-smelter.js";
 import { createAutomaticChickenFarmBlueprint } from "./chicken-farm.js";
 import { commandLesson } from "./command-lessons.js";
 import { createItemSorterBlueprint } from "./item-sorter.js";
+import { createAutomaticKelpFarmBlueprint } from "./kelp-farm.js";
 import { machineBlueprint } from "./machine-plan.js";
 import { createTwoByTwoPistonDoorBlueprint } from "./piston-door.js";
 import { createRecipeDisplay } from "./recipe-display.js";
+import { createAutomaticWoolFarmBlueprint } from "./wool-farm.js";
 import { splitMessage } from "./chat.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
@@ -78,7 +83,10 @@ const engineAddressedMessageCounts = new Map();
 const queuedBuilds = new Map();
 const buildMoveNotices = new Set();
 const pendingQuestions = new Map();
+const pendingActionReports = new Map();
+const actionReportsByToken = new Map();
 const lastUndo = new Map();
+const lastStructures = new Map();
 const placementRetries = new Map();
 const buildRetryNotices = new Set();
 const preparedPlacements = new Set();
@@ -87,12 +95,23 @@ const TRANSACTION_JOURNAL = "mcwizard:active_transaction";
 const UNDO_RETENTION_TICKS = 20 * 60 * 10;
 const WORKSHOP_COUNTER = "mcwizard:workshop_counter";
 const WORKSHOP_TICKING_AREA = "mc_wizard_workshop";
+const LAST_STRUCTURES = "mcwizard:last_structures";
+const STRUCTURE_ENTITY_ITEMS = Object.freeze({
+  "minecraft:villager_v2": "minecraft:villager_spawn_egg",
+});
+const GENERATED_STRUCTURE_KINDS = new Set([
+  "castle", "house", "tower", "bridge", "barn", "base", "shop", "school", "wall", "monument",
+]);
 
 let wizard;
 let followPlayerId;
 let wizardShouldStay = false;
 let wizardSpeaking = false;
 let buildInProgress = false;
+let buildPreparing = false;
+let activeBuildPreparation;
+let nextBuildPreparation = 0;
+let buildActionGeneration = 0;
 let activeBuildToken;
 let nextBuildToken = 0;
 let nextQuestionToken = 0;
@@ -119,6 +138,185 @@ function secret(name) {
 
 const WIZARD_URL = variable("mc_wizard_url", "http://host.docker.internal:3000/v1/ask");
 const AUTHORIZATION = secret("mc_wizard_authorization");
+
+async function postActionResult(report, status, detail) {
+  if (!report?.requestId) return;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/action-result"))
+        .setMethod(HttpRequestMethod.Post)
+        .setBody(JSON.stringify({
+          player: report.playerName,
+          requestId: report.requestId,
+          status,
+          ...(detail ? { detail: String(detail).slice(0, 240) } : {}),
+        }))
+        .addHeader("Content-Type", "application/json");
+      if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+      const response = await http.request(request);
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`brain returned HTTP ${response.status}`);
+      }
+      console.warn(`[MC Wizard] action ${report.requestId} ${status}`);
+      return;
+    } catch (error) {
+      if (attempt === 2) {
+        console.warn(`[MC Wizard] could not report action ${report.requestId} ${status} after three attempts: ${error}`);
+        return;
+      }
+      await system.waitTicks(10 * (attempt + 1));
+    }
+  }
+}
+
+function registerActionRequest(player, payload) {
+  if (!payload.action) return;
+  if (typeof payload.requestId !== "string" || !/^[a-zA-Z0-9_-]{1,64}$/.test(payload.requestId)) {
+    console.warn("[MC Wizard] action response had no safe request id; executing without lifecycle memory");
+    return;
+  }
+  const previous = pendingActionReports.get(player.id);
+  if (previous && previous.requestId !== payload.requestId) {
+    queuedBuilds.delete(player.id);
+    void postActionResult(previous, "failed", "superseded by a newer queued request");
+  }
+  pendingActionReports.set(player.id, {
+    playerId: player.id,
+    playerName: player.name,
+    requestId: payload.requestId,
+  });
+}
+
+function takePendingActionReport(player) {
+  const report = pendingActionReports.get(player.id);
+  if (report) pendingActionReports.delete(player.id);
+  return report;
+}
+
+function captureBuildActionClaim(player) {
+  return {
+    generation: buildActionGeneration,
+    report: pendingActionReports.get(player.id),
+  };
+}
+
+function buildActionClaimIsCurrent(player, claim) {
+  return claim?.generation === buildActionGeneration
+    && (!claim.report || pendingActionReports.get(player.id) === claim.report);
+}
+
+function beginImmediateAction(player) {
+  const report = takePendingActionReport(player);
+  if (report) void postActionResult(report, "started", "in-world action started");
+  return report;
+}
+
+function endImmediateAction(report, status, detail) {
+  if (report) void postActionResult(report, status, detail);
+}
+
+function failPendingAction(player, detail) {
+  const report = takePendingActionReport(player);
+  endImmediateAction(report, "failed", detail);
+}
+
+function bindBuildAction(player, token, structureRecord, claim) {
+  if (claim && !buildActionClaimIsCurrent(player, claim)) return false;
+  const report = claim ? claim.report : takePendingActionReport(player);
+  if (report) pendingActionReports.delete(player.id);
+  if (!report && !structureRecord) return true;
+  actionReportsByToken.set(token, {
+    ...(report || { playerId: player.id, playerName: player.name }),
+    ...(structureRecord ? { structureRecord } : {}),
+  });
+  if (report) void postActionResult(report, "started", "in-world build started");
+  return true;
+}
+
+function endBuildAction(token, status, detail) {
+  const report = actionReportsByToken.get(token);
+  if (!report) return;
+  actionReportsByToken.delete(token);
+  if (status === "completed" && report.structureRecord) {
+    rememberLastStructure({ name: report.playerName }, report.structureRecord);
+  }
+  void postActionResult(report, status, detail);
+}
+
+function structurePlayerKey(player) {
+  return player.name.trim().toLowerCase();
+}
+
+function lastStructurePropertyId(player) {
+  let hash = 2166136261;
+  for (const character of structurePlayerKey(player)) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${LAST_STRUCTURES}:${(hash >>> 0).toString(36)}`;
+}
+
+function validStructureVector(value, vertical = false) {
+  if (!value || !Number.isInteger(value.x) || !Number.isInteger(value.z)) return false;
+  if (vertical && !Number.isInteger(value.y)) return false;
+  return vertical || (Math.abs(value.x) + Math.abs(value.z) === 1);
+}
+
+function lastStructureFor(player) {
+  const key = structurePlayerKey(player);
+  if (lastStructures.has(key)) return lastStructures.get(key);
+  try {
+    const raw = world.getDynamicProperty(lastStructurePropertyId(player));
+    if (typeof raw !== "string" || !raw) return undefined;
+    const stored = JSON.parse(raw);
+    if (typeof stored.dimensionId !== "string"
+      || !validStructureVector(stored.origin, true)
+      || !validStructureVector(stored.forward)
+      || !validStructureVector(stored.right)) return undefined;
+    const record = { ...stored, plan: validateBuildStructurePlan(stored.plan) };
+    lastStructures.set(key, record);
+    return record;
+  } catch (error) {
+    console.warn(`[MC Wizard] ignored invalid saved structure for ${player.name}: ${error}`);
+    return undefined;
+  }
+}
+
+function rememberLastStructure(player, record) {
+  const saved = {
+    dimensionId: record.dimensionId,
+    origin: { ...record.origin },
+    forward: { ...record.forward },
+    right: { ...record.right },
+    plan: record.plan,
+    updatedAt: Date.now(),
+  };
+  lastStructures.set(structurePlayerKey(player), saved);
+  try {
+    world.setDynamicProperty(lastStructurePropertyId(player), JSON.stringify(saved));
+  } catch (error) {
+    console.warn(`[MC Wizard] could not persist ${player.name}'s last structure: ${error}`);
+  }
+}
+
+function completeStructurePrimitives(plan) {
+  if (!plan?.primitives?.length) return undefined;
+  try {
+    const complete = validateBuildStructurePlan({ ...plan, mode: undefined });
+    return complete.primitives.slice(0, STRUCTURE_PRIMITIVE_LIMIT)
+      .map(({ shape, phase, blockId, from, to }) => ({
+        shape,
+        phase,
+        blockId,
+        from: [...from],
+        to: [...to],
+      }));
+  } catch {
+    // A generated ordinary edit can store only its changed primitives. Sending
+    // that partial patch as a whole structure would erase the original shape.
+    return undefined;
+  }
+}
 
 function hasWizardTag(player) {
   try {
@@ -410,7 +608,11 @@ function speak(player, message) {
 function worldSmallTalk(player, question) {
   const text = question.trim();
   const asksMood = /\b(?:what(?:’|'| i)s up|how are you|how(?:’|'| i)s it going|you doing)\b/i.test(text);
-  const asksWeather = /\b(?:weather|rain|raining|sunny|storm|storming|thunder|sky)\b/i.test(text);
+  const hasRainingObjects = /\b(?:potion|splash|arrow|item|block|mob|animal|chicken|wool|diamond|lava|water)s?\b/i.test(text);
+  const asksWeather = !hasRainingObjects && (
+    /\bweather\b/i.test(text)
+    || /\b(?:is it|does it look|what do you think (?:of|about))\b.{0,40}\b(?:rain|raining|sunny|storm|storming|thunder|sky)\b/i.test(text)
+  );
   const asksTime = /\b(?:what time|time is it|day or night|night or day|is it (?:day|night)|daytime|nighttime)\b/i.test(text);
   if (!asksMood && !asksWeather && !asksTime) return undefined;
   let weather;
@@ -432,6 +634,101 @@ function worldSmallTalk(player, question) {
   if (weather === "Rain") return `It’s raining at ${dayPart}. Good weather for roofs, hidden workshops, and dramatic entrances.`;
   if (weather === "Clear") return `Clear skies at ${dayPart}. I’m doing well and ready to wander, build, or inspect whatever you’re making.`;
   return `I’m doing well. It’s ${dayPart} here, and I’m ready to explore or build with you.`;
+}
+
+function liveWorldSnapshot(player) {
+  const playerPosition = {
+    x: Math.floor(player.location.x),
+    y: Math.floor(player.location.y),
+    z: Math.floor(player.location.z),
+  };
+  let weather = "unknown";
+  try {
+    const observed = typeof player.dimension.getWeather === "function"
+      ? String(player.dimension.getWeather()).toLowerCase() : "";
+    weather = observed.includes("thunder") ? "thunder"
+      : observed.includes("rain") ? "rain"
+        : observed.includes("clear") ? "clear" : "unknown";
+  } catch {
+    weather = "unknown";
+  }
+
+  const blockCounts = new Map();
+  for (let x = -4; x <= 4; x += 1) {
+    for (let y = -2; y <= 4; y += 1) {
+      for (let z = -4; z <= 4; z += 1) {
+        try {
+          const typeId = player.dimension.getBlock({
+            x: playerPosition.x + x,
+            y: playerPosition.y + y,
+            z: playerPosition.z + z,
+          })?.typeId;
+          if (typeId && typeId !== "minecraft:air") {
+            blockCounts.set(typeId, (blockCounts.get(typeId) || 0) + 1);
+          }
+        } catch {
+          // A block on the edge of an unloaded chunk is simply not observable.
+        }
+      }
+    }
+  }
+  const nearbyBlocks = [...blockCounts.entries()]
+    .sort(([leftType, leftCount], [rightType, rightCount]) => (
+      rightCount - leftCount || leftType.localeCompare(rightType)
+    ))
+    .slice(0, 16)
+    .map(([typeId, count]) => ({ typeId, count }));
+
+  let nearbyEntities = [];
+  try {
+    nearbyEntities = player.dimension.getEntities({
+      location: player.location,
+      maxDistance: 12,
+    }).filter((entity) => entity.id !== player.id && !isWizardPlayer(entity))
+      .map((entity) => {
+        const relative = {
+          x: Math.round(entity.location.x - player.location.x),
+          y: Math.round(entity.location.y - player.location.y),
+          z: Math.round(entity.location.z - player.location.z),
+        };
+        return {
+          typeId: entity.typeId,
+          relative,
+          distanceSquared: relative.x ** 2 + relative.y ** 2 + relative.z ** 2,
+        };
+      })
+      .sort((left, right) => left.distanceSquared - right.distanceSquared)
+      .slice(0, 12)
+      .map(({ typeId, relative }) => ({ typeId, relative }));
+  } catch {
+    nearbyEntities = [];
+  }
+
+  const previous = lastStructureFor(player);
+  const primitives = completeStructurePrimitives(previous?.plan);
+  const lastStructure = previous?.dimensionId === player.dimension.id ? {
+    kind: previous.plan.kind,
+    title: previous.plan.title,
+    dimensions: previous.plan.dimensions,
+    materials: previous.plan.materials,
+    features: previous.plan.features,
+    ...(primitives?.length ? { primitives } : {}),
+    relativeOrigin: {
+      x: previous.origin.x - playerPosition.x,
+      y: previous.origin.y - playerPosition.y,
+      z: previous.origin.z - playerPosition.z,
+    },
+  } : undefined;
+  return {
+    dimension: player.dimension.id,
+    weather,
+    timeOfDay: world.getTimeOfDay(),
+    player: playerPosition,
+    buildState: buildInProgress || buildPreparing ? "building" : queuedBuilds.has(player.id) ? "queued" : "idle",
+    nearbyBlocks,
+    nearbyEntities,
+    ...(lastStructure ? { lastStructure } : {}),
+  };
 }
 
 function idleLookAround(player) {
@@ -589,7 +886,7 @@ function undoLastBuild(player) {
     speak(player, "I don’t have a recent build to undo.");
     return false;
   }
-  if (buildInProgress) {
+  if (buildInProgress || buildPreparing) {
     speak(player, "I’ll finish or roll back the current build before undoing another one.");
     return false;
   }
@@ -671,24 +968,52 @@ async function prepareBuildWorkshop(player) {
   }
 }
 
+function beginBuildPreparation() {
+  const reservation = ++nextBuildPreparation;
+  activeBuildPreparation = reservation;
+  buildPreparing = true;
+  return reservation;
+}
+
+function endBuildPreparation(reservation) {
+  if (activeBuildPreparation !== reservation) return;
+  activeBuildPreparation = undefined;
+  buildPreparing = false;
+}
+
+async function prepareBuildWorkshopReserved(player) {
+  const reservation = beginBuildPreparation();
+  try {
+    return await prepareBuildWorkshop(player);
+  } finally {
+    endBuildPreparation(reservation);
+  }
+}
+
 function queueBuild(player, callback, delayTicks = 40, message = "I queued that build and will start it automatically.") {
-  const alreadyQueued = queuedBuilds.has(player.id);
-  queuedBuilds.set(player.id, callback);
+  const playerId = player.id;
+  const alreadyQueued = queuedBuilds.has(playerId);
+  queuedBuilds.set(playerId, callback);
   if (alreadyQueued) speak(player, "I updated your queued build request.");
   else if (message) speak(player, message);
   if (alreadyQueued) return;
   const attempt = () => {
-    const current = playerById(player.id);
+    const current = playerById(playerId);
     if (!current) {
-      queuedBuilds.delete(player.id);
+      queuedBuilds.delete(playerId);
+      const report = pendingActionReports.get(playerId);
+      if (report) {
+        pendingActionReports.delete(playerId);
+        endImmediateAction(report, "failed", "player left before queued build started");
+      }
       return;
     }
-    if (buildInProgress) {
+    if (buildInProgress || buildPreparing) {
       system.runTimeout(attempt, 40);
       return;
     }
-    const queued = queuedBuilds.get(player.id);
-    queuedBuilds.delete(player.id);
+    const queued = queuedBuilds.get(playerId);
+    queuedBuilds.delete(playerId);
     if (queued) queued(current);
   };
   system.runTimeout(attempt, delayTicks);
@@ -907,20 +1232,6 @@ function positionWizardForBuild(dimension, target, support = target, forceMove =
       };
       return false;
     }
-    if (buildMovement.mode === "flight-land") {
-      wizard.stopFlying();
-      if (wizard.isOnGround || movementElapsed > 40) {
-        buildMovement = {
-          ...buildMovement,
-          mode: "ground",
-          startedTick: system.currentTick,
-          attempt: 0,
-          tried: [],
-        };
-        navigateWizardToBuildPosition(buildMovement.destination);
-      }
-      return false;
-    }
     if (buildMovement.mode === "flight") {
       if (movementElapsed > 80) {
         const destination = buildMovement.destination;
@@ -942,16 +1253,17 @@ function positionWizardForBuild(dimension, target, support = target, forceMove =
         buildMovement.waypoint += 1;
         buildMovement.commandedWaypoint = undefined;
         waypoint = buildMovement.waypoints[buildMovement.waypoint];
-        if (buildMovement.waypoint === 2) {
-          buildMovement.mode = "flight-land";
-          buildMovement.startedTick = system.currentTick;
-          wizard.stopMoving();
-          wizard.stopFlying();
-          return false;
-        }
         if (!waypoint) {
+          const destination = buildMovement.destination;
           buildMovement = undefined;
           wizard.stopMoving();
+          const ground = dimension.getBlock({
+            x: Math.floor(destination.x),
+            y: Math.floor(destination.y) - 1,
+            z: Math.floor(destination.z),
+          });
+          if (SAFE_GROUND.has(ground?.typeId)) wizard.stopFlying();
+          else wizard.fly();
           return false;
         }
       }
@@ -962,41 +1274,13 @@ function positionWizardForBuild(dimension, target, support = target, forceMove =
       return false;
     }
     if (movementElapsed > 80) {
-      const alternative = (buildMovement.attempt || 0) < 1
-        ? validCandidates.find((location) => (
-          distanceSquared(location, buildMovement.destination) >= 2.25
-          && !(buildMovement.tried || []).some((tried) => distanceSquared(location, tried) < 0.25)
-        ))
-        : undefined;
-      if (alternative) {
-        buildMovement = {
-          ...buildMovement,
-          destination: alternative,
-          startedTick: system.currentTick,
-          attempt: (buildMovement.attempt || 0) + 1,
-          tried: [...(buildMovement.tried || []), buildMovement.destination],
-          lastJumpTick: undefined,
-        };
-        wizard.stopMoving();
-        return false;
-      }
-      buildMovement = {
-        ...buildMovement,
-        mode: "flight-takeoff",
-        startedTick: system.currentTick,
-      };
+      const destination = buildMovement.destination;
       wizard.stopMoving();
-      wizard.fly();
-      return false;
-    }
-    if (movementElapsed > 600) {
-      const from = `${wizard.location.x.toFixed(1)},${wizard.location.y.toFixed(1)},${wizard.location.z.toFixed(1)}`;
-      const to = `${buildMovement.destination.x.toFixed(1)},${buildMovement.destination.y.toFixed(1)},${buildMovement.destination.z.toFixed(1)}`;
+      wizard.stopFlying();
+      wizard.teleport(destination, { dimension, facingLocation: target });
       buildMovement = undefined;
-      wizard.stopMoving();
-      throw new Error(
-        `the simulated player could not move from ${from} to ${to} within reach of ${target.x},${target.y},${target.z}`,
-      );
+      console.warn(`[MC Wizard] blinked into grounded build reach after navigation stalled at ${target.x},${target.y},${target.z}`);
+      return false;
     }
     navigateWizardToBuildPosition(
       buildMovement.destination,
@@ -1006,24 +1290,10 @@ function positionWizardForBuild(dimension, target, support = target, forceMove =
     return false;
   }
 
-  const elevatedDestination = validCandidates
-    .map((location) => ({ ...location, y: location.y + 1 }))
-    .find((location) => {
-      const feet = {
-        x: Math.floor(location.x),
-        y: Math.floor(location.y),
-        z: Math.floor(location.z),
-      };
-      const head = { ...feet, y: feet.y + 1 };
-      return canReachBuildTarget(location, target)
-        && canReachBuildTarget(location, support)
-        && blockIsOpen(dimension, feet)
-        && blockIsOpen(dimension, head);
-    });
   const forcedDestination = forceMove
     ? validCandidates.find((location) => distanceSquared(location, wizard.location) >= 2.25)
     : undefined;
-  const destination = forcedDestination || elevatedDestination || validCandidates[0];
+  const destination = forcedDestination || validCandidates[0];
   buildMovement = { key, destination, startedTick: system.currentTick, mode: "ground" };
   wizard.stopMoving();
   navigateWizardToBuildPosition(destination);
@@ -1095,7 +1365,9 @@ function placeAsWizard(
   );
   if (!placed) {
     const attempts = (placementRetries.get(retryKey) || 0) + 1;
-    const retryLimit = /(?:redstone|repeater)$/.test(itemId) ? 0 : 3;
+    // A real player-use attempt has already happened. Repair immediately when
+    // Bedrock rejects it instead of making a child watch repeated pathing stalls.
+    const retryLimit = 0;
     console.warn(`[MC Wizard] placement retry ${attempts} for ${itemId}; wizard=${wizard.location.x.toFixed(1)},${wizard.location.y.toFixed(1)},${wizard.location.z.toFixed(1)} target=${target.x},${target.y},${target.z} support=${support.x},${support.y},${support.z}; use=false`);
     if (attempts <= retryLimit) {
       placementRetries.set(retryKey, attempts);
@@ -1110,7 +1382,9 @@ function placeAsWizard(
   let block = dimension.getBlock(target);
   if (!block || !expectedTypes.includes(block.typeId)) {
     const attempts = (placementRetries.get(retryKey) || 0) + 1;
-    const retryLimit = /(?:redstone|repeater)$/.test(itemId) ? 0 : 3;
+    // The Wizard tried from player reach; one failed API result is enough to
+    // use the verified operator-rights repair path and keep the build moving.
+    const retryLimit = 0;
     console.warn(`[MC Wizard] placement retry ${attempts} for ${itemId}; wizard=${wizard.location.x.toFixed(1)},${wizard.location.y.toFixed(1)},${wizard.location.z.toFixed(1)} target=${target.x},${target.y},${target.z} support=${support.x},${support.y},${support.z}; result=${block?.typeId || "nothing"}`);
     if (attempts <= retryLimit) {
       placementRetries.set(retryKey, attempts);
@@ -1230,11 +1504,13 @@ function finishBuild(playerId, token, dimension, expectedBlocks, successMessage,
         + ": expected " + expected + ", got " + actual,
     );
     commitTransaction(token);
+    endBuildAction(token, "failed", `verification left ${mismatches.length} mismatched block${mismatches.length === 1 ? "" : "s"}`);
     if (!clearBuild(token) || !player) return;
     speak(player, "I kept every good part standing instead of erasing your build. One enchanted piece needed a sturdier repair, and I’ve left the useful build in place for you.");
     return;
   }
   commitTransaction(token);
+  endBuildAction(token, "completed", `verified ${expectedBlocks.length} planned blocks`);
   if (!clearBuild(token) || !player) return;
   console.warn("[MC Wizard] final build verification passed");
   speak(player, successMessage);
@@ -1369,7 +1645,7 @@ async function buildCopperBulbTFlipFlop(player) {
     );
     return;
   }
-  if (buildInProgress) {
+  if (buildInProgress || buildPreparing) {
     queueBuild(player, buildCopperBulbTFlipFlop);
     return;
   }
@@ -1379,11 +1655,16 @@ async function buildCopperBulbTFlipFlop(player) {
   console.warn("[MC Wizard] T flip-flop facing " + forward.name);
   let right = { x: -forward.z, z: forward.x };
   let base = findClearSite(player, forward, right);
-  if (!base && await prepareBuildWorkshop(player)) {
-    dimension = player.dimension;
-    forward = cardinalDirection(player);
-    right = { x: -forward.z, z: forward.x };
-    base = findClearSite(player, forward, right);
+  let actionClaim;
+  if (!base) {
+    actionClaim = captureBuildActionClaim(player);
+    if (await prepareBuildWorkshopReserved(player)) {
+      dimension = player.dimension;
+      forward = cardinalDirection(player);
+      right = { x: -forward.z, z: forward.x };
+      base = findClearSite(player, forward, right);
+    }
+    if (!buildActionClaimIsCurrent(player, actionClaim)) return;
   }
   if (!base) {
     console.warn("[MC Wizard] no clear T flip-flop site near " + player.name);
@@ -1410,6 +1691,10 @@ async function buildCopperBulbTFlipFlop(player) {
   buildInProgress = true;
   const token = ++nextBuildToken;
   activeBuildToken = token;
+  if (!bindBuildAction(player, token, undefined, actionClaim)) {
+    clearBuild(token);
+    return;
+  }
   lastBuildTick.set(player.id, system.currentTick);
   const buildBlock = offset(base, forward, right, 1, 1);
   const buildSpot = { x: buildBlock.x + 0.5, y: buildBlock.y, z: buildBlock.z + 0.5 };
@@ -1481,6 +1766,7 @@ async function buildCopperBulbTFlipFlop(player) {
     if (!wizardIsValid()) {
       const current = playerById(player.id);
       if (!current) {
+        endBuildAction(token, "failed", "player left before the build could continue");
         clearBuild(token);
         return;
       }
@@ -1590,6 +1876,7 @@ function structureOperations(plan) {
   const { width, depth, height } = plan.dimensions;
   const features = new Set(plan.features);
   const operations = [];
+  const interiorOpenings = [];
   const add = (phase, blockId, from, to = from) => operations.push(structureBox(phase, blockId, from, to));
   const houseLike = /house|home|cottage|cabin|barn|hall|workshop/.test(plan.kind);
   const battlements = features.has("battlements") && height >= 3;
@@ -1610,9 +1897,49 @@ function structureOperations(plan) {
     }
   }
   if (wallTop >= 1 && (features.has("supports") || features.has("towers"))) {
-    const size = features.has("towers") && width >= 6 && depth >= 6 ? 2 : 1;
+    const size = features.has("towers") && width >= 9 && depth >= 9 ? 3
+      : features.has("towers") && width >= 6 && depth >= 6 ? 2 : 1;
     for (const [x, z] of [[0, 0], [width - size, 0], [0, depth - size], [width - size, depth - size]]) {
-      add("shell", plan.materials.accent, [x, 1, z], [x + size - 1, wallTop, z + size - 1]);
+      if (size === 1) {
+        add("shell", plan.materials.accent, [x, 1, z], [x, wallTop, z]);
+      } else {
+        add("shell", plan.materials.accent, [x, 1, z], [x + size - 1, wallTop, z]);
+        add("shell", plan.materials.accent, [x, 1, z + size - 1], [x + size - 1, wallTop, z + size - 1]);
+        if (size > 2) {
+          add("shell", plan.materials.accent, [x, 1, z + 1], [x, wallTop, z + size - 2]);
+          add("shell", plan.materials.accent, [x + size - 1, 1, z + 1], [x + size - 1, wallTop, z + size - 2]);
+        }
+      }
+    }
+  }
+  const secondFloorY = features.has("second_floor") && wallTop >= 4 && width >= 5 && depth >= 5
+    ? Math.max(3, Math.min(wallTop - 1, Math.floor((wallTop + 1) / 2)))
+    : undefined;
+  if (secondFloorY !== undefined) {
+    add("shell", plan.materials.primary, [1, secondFloorY, 1], [width - 2, secondFloorY, depth - 2]);
+  }
+  if (features.has("rooms") && wallTop >= 3 && width >= 7 && depth >= 7) {
+    const middleX = Math.floor(width / 2);
+    const middleZ = Math.floor(depth / 2);
+    add("shell", plan.materials.primary, [1, 1, middleZ], [width - 2, wallTop, middleZ]);
+    add("shell", plan.materials.primary, [middleX, 1, 1], [middleX, wallTop, depth - 2]);
+    for (const x of [Math.floor(width / 4), Math.floor((width * 3) / 4)]) {
+      interiorOpenings.push([[x, 1, middleZ], [x, Math.min(2, wallTop), middleZ]]);
+      if (secondFloorY !== undefined && secondFloorY + 1 <= wallTop) {
+        interiorOpenings.push([
+          [x, secondFloorY + 1, middleZ],
+          [x, Math.min(secondFloorY + 2, wallTop), middleZ],
+        ]);
+      }
+    }
+    for (const z of [Math.floor(depth / 4), Math.floor((depth * 3) / 4)]) {
+      interiorOpenings.push([[middleX, 1, z], [middleX, Math.min(2, wallTop), z]]);
+      if (secondFloorY !== undefined && secondFloorY + 1 <= wallTop) {
+        interiorOpenings.push([
+          [middleX, secondFloorY + 1, z],
+          [middleX, Math.min(secondFloorY + 2, wallTop), z],
+        ]);
+      }
     }
   }
   if (height > 1 && features.has("walkway") && !features.has("walls")) {
@@ -1644,6 +1971,15 @@ function structureOperations(plan) {
     const doorX = Math.floor((width - 1) / 2);
     add("details", "minecraft:air", [doorX, 1, 0], [doorX + (width % 2 === 0 ? 1 : 0), Math.min(2, wallTop), 0]);
   }
+  for (const [from, to] of interiorOpenings) add("details", "minecraft:air", from, to);
+  if (secondFloorY !== undefined) {
+    const stairZ = Math.min(depth - 2, 2);
+    const steps = Math.min(secondFloorY, width - 3);
+    for (let step = 1; step <= steps; step += 1) {
+      add("details", plan.materials.accent, [step, step, stairZ]);
+    }
+    add("details", "minecraft:air", [steps, secondFloorY, stairZ]);
+  }
   if (features.has("windows") && features.has("walls") && wallTop >= 2) {
     const y = Math.min(wallTop, Math.max(2, Math.floor(wallTop / 2)));
     const doorX = Math.floor((width - 1) / 2);
@@ -1662,7 +1998,33 @@ function structureOperations(plan) {
       add("details", "minecraft:sea_lantern", [Math.min(x, width - 1), y, Math.min(z, depth - 1)]);
     }
   }
+  if (features.has("decorations") && width >= 5 && depth >= 5 && wallTop >= 2) {
+    const centerX = Math.floor(width / 2);
+    const centerZ = Math.floor(depth / 2);
+    add("details", plan.materials.accent, [1, 1, 1], [1, Math.min(2, wallTop), 1]);
+    add("details", plan.materials.accent, [width - 2, 1, depth - 2], [width - 2, Math.min(2, wallTop), depth - 2]);
+    add("details", "minecraft:sea_lantern", [centerX, Math.max(2, Math.min(wallTop - 1, height - 2)), centerZ]);
+    if (secondFloorY !== undefined && secondFloorY > 2) {
+      add("details", "minecraft:sea_lantern", [centerX, secondFloorY - 1, centerZ]);
+    }
+  }
+  for (const { location: [x, y, z] } of plan.entities || []) {
+    if (x < 1 || x >= width - 1 || z < 1 || z >= depth - 1 || y < 1) continue;
+    add("details", "minecraft:oak_fence", [x - 1, y, z - 1], [x + 1, y, z - 1]);
+    add("details", "minecraft:oak_fence", [x - 1, y, z + 1], [x + 1, y, z + 1]);
+    add("details", "minecraft:oak_fence", [x - 1, y, z], [x - 1, y, z]);
+    add("details", "minecraft:oak_fence", [x + 1, y, z], [x + 1, y, z]);
+  }
   return operations;
+}
+
+function structurePlanOperations(plan) {
+  const primitives = primitiveStructureOperations(plan);
+  if (!primitives.length) return structureOperations(plan);
+  if (plan.mode !== "modify" || !GENERATED_STRUCTURE_KINDS.has(plan.kind)) return primitives;
+  const phaseOrder = new Map(["foundation", "shell", "roof", "details"].map((phase, index) => [phase, index]));
+  return [...structureOperations(plan), ...primitives]
+    .sort((a, b) => phaseOrder.get(a.phase) - phaseOrder.get(b.phase));
 }
 
 function worldStructureBox(origin, forward, right, operation) {
@@ -1724,9 +2086,23 @@ function findStructureSite(player, plan, forward, right) {
   return { origin: structureOrigin(player, plan, forward, right), clear: false };
 }
 
+function findModificationSite(player, plan) {
+  const previous = lastStructureFor(player);
+  if (!previous || previous.dimensionId !== player.dimension.id) return undefined;
+  const oldDimensions = previous.plan.dimensions;
+  const shiftX = Math.round((oldDimensions.width - plan.dimensions.width) / 2);
+  const shiftZ = Math.round((oldDimensions.depth - plan.dimensions.depth) / 2);
+  return {
+    origin: customLocation(previous.origin, previous.forward, previous.right, [shiftX, 0, shiftZ]),
+    forward: previous.forward,
+    right: previous.right,
+    clear: false,
+    previous,
+  };
+}
+
 function runRawFill(dimension, operation) {
-  const { min, max, blockId } = operation;
-  dimension.runCommand(`fill ${min.x} ${min.y} ${min.z} ${max.x} ${max.y} ${max.z} ${blockId}`);
+  const { min, max, blockId, replaceBlockId } = operation;
   const samples = [
     min,
     max,
@@ -1736,12 +2112,25 @@ function runRawFill(dimension, operation) {
       z: Math.floor((min.z + max.z) / 2),
     },
   ];
-  if (samples.some((location) => dimension.getBlock(location)?.typeId !== blockId)) {
+  const before = replaceBlockId ? samples.map((location) => dimension.getBlock(location)?.typeId) : [];
+  try {
+    dimension.runCommand(`fill ${min.x} ${min.y} ${min.z} ${max.x} ${max.y} ${max.z} ${blockId}${replaceBlockId ? ` replace ${replaceBlockId}` : ""}`);
+  } catch (error) {
+    if (replaceBlockId) {
+      console.warn(`[MC Wizard] obsolete ${replaceBlockId} shell section was already changed or empty: ${error}`);
+      return;
+    }
+    throw error;
+  }
+  if (samples.some((location, index) => (
+    (!replaceBlockId || before[index] === replaceBlockId)
+    && dimension.getBlock(location)?.typeId !== blockId
+  ))) {
     throw new Error(`fill verification missed ${blockId}`);
   }
 }
 
-async function prepareStructureArea(player, plan, origin, forward, right, clear) {
+async function prepareStructureArea(player, plan, origin, forward, right, clear, previousPlan) {
   const dimension = player.dimension;
   const { width, depth, height } = plan.dimensions;
   const worldBox = worldStructureBox(origin, forward, right, structureBox(
@@ -1765,6 +2154,21 @@ async function prepareStructureArea(player, plan, origin, forward, right, clear)
     } catch {}
   }, 12_000);
   await system.waitTicks(5);
+  if (previousPlan) {
+    const ground = worldStructureBox(origin, forward, right, structureBox(
+      "preparation",
+      plan.materials.primary,
+      [0, -1, 0],
+      [width - 1, -1, depth - 1],
+    ));
+    for (const slice of splitWorldFill(ground)) runRawFill(dimension, slice);
+    for (const operation of expansionClearOperations(previousPlan, plan)) {
+      for (const slice of splitWorldFill(worldStructureBox(origin, forward, right, operation))) {
+        runRawFill(dimension, slice);
+      }
+    }
+    return;
+  }
   if (!clear) {
     speak(player, "I found the closest workable patch. I’m leveling it right here instead of whisking us into the sky.");
     const ground = worldStructureBox(origin, forward, right, structureBox(
@@ -1779,22 +2183,62 @@ async function prepareStructureArea(player, plan, origin, forward, right, clear)
 }
 
 function phaseMessage(phase) {
+  if (phase === "cleanup") return "I’m opening the old outer walls so the larger build becomes one connected structure.";
   if (phase === "foundation") return "Foundation first—this sets the exact footprint.";
   if (phase === "shell") return "The footprint is set. Walls and supports are going up now.";
   if (phase === "roof") return "Time for the roof and skyline.";
   return "Finishing the doorway, windows, and useful details.";
 }
 
-function runBulkStructureSteps(playerId, token, dimension, operations, title, index = 0, retries = 0) {
+function runStructurePostSteps(playerId, token, steps, complete, index = 0) {
+  if (activeBuildToken !== token) return;
+  if (index >= steps.length) {
+    complete();
+    return;
+  }
+  let result;
+  try {
+    result = steps[index]();
+  } catch (error) {
+    console.warn(`[MC Wizard] structure inhabitant retry: ${error}`);
+    result = false;
+  }
+  system.runTimeout(
+    () => runStructurePostSteps(
+      playerId,
+      token,
+      steps,
+      complete,
+      result === true ? index + 1 : index,
+    ),
+    result === "placement-prepare" ? 3 : result === "placement-retry" ? 10 : result === false ? 5 : 2,
+  );
+}
+
+function runBulkStructureSteps(
+  playerId,
+  token,
+  dimension,
+  operations,
+  title,
+  postSteps = [],
+  index = 0,
+  retries = 0,
+) {
   if (activeBuildToken !== token) return;
   if (index >= operations.length) {
-    clearBuild(token);
-    try {
-      dimension.runCommand(`tickingarea remove ${WORKSHOP_TICKING_AREA}`);
-    } catch {}
-    const player = playerById(playerId);
-    if (player) speak(player, `${title} is complete. I checked every section as it appeared.`);
-    console.warn(`[MC Wizard] completed and verified bulk structure ${title}`);
+    const complete = () => {
+      endBuildAction(token, "completed", `verified all ${operations.length} structure operations`);
+      clearBuild(token);
+      try {
+        dimension.runCommand(`tickingarea remove ${WORKSHOP_TICKING_AREA}`);
+      } catch {}
+      const player = playerById(playerId);
+      if (player) speak(player, `${title} is complete. I checked every section and inhabitant as they appeared.`);
+      console.warn(`[MC Wizard] completed and verified bulk structure ${title}`);
+    };
+    if (postSteps.length) runStructurePostSteps(playerId, token, postSteps, complete);
+    else complete();
     return;
   }
   const operation = operations[index];
@@ -1813,14 +2257,14 @@ function runBulkStructureSteps(playerId, token, dimension, operations, title, in
     }
     runRawFill(dimension, operation);
     system.runTimeout(
-      () => runBulkStructureSteps(playerId, token, dimension, operations, title, index + 1, 0),
+      () => runBulkStructureSteps(playerId, token, dimension, operations, title, postSteps, index + 1, 0),
       2,
     );
   } catch (error) {
     console.warn(`[MC Wizard] structure phase retry ${retries + 1}: ${error}`);
     if (player && retries === 0) speak(player, "One section snagged. I’m recasting that piece instead of abandoning it.");
     system.runTimeout(
-      () => runBulkStructureSteps(playerId, token, dimension, operations, title, index, retries + 1),
+      () => runBulkStructureSteps(playerId, token, dimension, operations, title, postSteps, index, retries + 1),
       Math.min(40, 5 + retries * 5),
     );
   }
@@ -1866,6 +2310,43 @@ function physicalStructurePlacements(operations) {
   return result;
 }
 
+function structureEntitySteps(plan, dimension, origin, forward, right) {
+  return (plan.entities || []).map(({ typeId, location }) => {
+    const target = customLocation(origin, forward, right, location);
+    const support = { x: target.x, y: target.y - 1, z: target.z };
+    const interaction = {
+      action: "use_item_on_block",
+      itemId: STRUCTURE_ENTITY_ITEMS[typeId],
+      block: location.map((coordinate, axis) => axis === 1 ? coordinate - 1 : coordinate),
+      faceTarget: location,
+      expectedEntity: typeId,
+    };
+    let used = false;
+    let attempts = 0;
+    const entityIsPresent = () => dimension.getEntities({ type: typeId }).some(({ location: current }) => (
+      current.x >= target.x && current.x < target.x + 1
+      && current.y >= target.y && current.y < target.y + 1
+      && current.z >= target.z && current.z < target.z + 1
+    ));
+    return () => {
+      if (entityIsPresent()) return true;
+      attempts += 1;
+      if (used || attempts >= 40) {
+        dimension.spawnEntity(typeId, { x: target.x + 0.5, y: target.y + 0.2, z: target.z + 0.5 });
+        console.warn(`[MC Wizard] restored missing ${typeId} at its planned room position`);
+        return true;
+      }
+      const result = useItemAsWizard(dimension, interaction, origin, forward, right);
+      if (result === true) {
+        used = true;
+        return false;
+      }
+      if (result === false && !wizardCanReach(dimension, target, support)) return false;
+      return result;
+    };
+  });
+}
+
 async function buildStructure(player, value) {
   let plan;
   try {
@@ -1895,23 +2376,72 @@ async function buildStructure(player, value) {
     });
     speak(player, "That blueprint arrived smudged, so I switched to a sturdy local version and kept building instead of sending you back to ask again.");
   }
-  if (buildInProgress) {
+  if (buildInProgress || buildPreparing) {
     queueBuild(player, (current) => buildStructure(current, value));
     return;
   }
-  const forward = cardinalDirection(player);
-  const right = { x: -forward.z, z: forward.x };
-  const site = findStructureSite(player, plan, forward, right);
-  const operations = plan.primitives?.length ? primitiveStructureOperations(plan) : structureOperations(plan);
-  speak(player, `I mapped “${plan.title}” at exactly ${plan.dimensions.width} by ${plan.dimensions.depth} by ${plan.dimensions.height}. I’m building the whole thing here in four visible phases.`);
-  await prepareStructureArea(player, plan, site.origin, forward, right, site.clear);
-  const bot = bringWizardTo(player);
-  if (!bot) console.warn("[MC Wizard] structure continuing while simulated player respawns");
+  let forward = cardinalDirection(player);
+  let right = { x: -forward.z, z: forward.x };
+  const modificationSite = plan.mode === "modify" ? findModificationSite(player, plan) : undefined;
+  const modifying = Boolean(modificationSite);
+  let site;
+  if (modificationSite) {
+    ({ forward, right } = modificationSite);
+    site = modificationSite;
+  } else {
+    site = findStructureSite(player, plan, forward, right);
+    if (plan.mode === "modify") {
+      speak(player, "I can’t find that earlier structure in this dimension, so I’m rebuilding the complete improved version nearby instead of stopping.");
+    }
+  }
+  const operations = structurePlanOperations(plan);
+  const previousOperations = modifying
+    ? structurePlanOperations(modificationSite.previous.plan)
+    : [];
+  const cleanupOperations = modifying
+    ? obsoleteExpansionOperations(modificationSite.previous.plan, plan, previousOperations)
+    : [];
+  speak(player, modifying
+    ? `I found your last ${plan.kind}. I’m improving it in place—same center and direction, with the requested rooms, floors, details, and inhabitants.`
+    : `I mapped “${plan.title}” at exactly ${plan.dimensions.width} by ${plan.dimensions.depth} by ${plan.dimensions.height}. I’m building the whole thing here in four visible phases.`);
+  // Reserve the single Wizard body before yielding to workshop preparation.
+  // Otherwise two simultaneous children can both pass the busy check and the
+  // later token silently strands the first action.
   buildInProgress = true;
   const token = ++nextBuildToken;
   activeBuildToken = token;
+  const structureRecord = {
+    dimensionId: player.dimension.id,
+    origin: site.origin,
+    forward,
+    right,
+    plan,
+  };
+  bindBuildAction(player, token, structureRecord);
+  try {
+    await prepareStructureArea(
+      player,
+      plan,
+      site.origin,
+      forward,
+      right,
+      site.clear,
+      modifying ? modificationSite.previous.plan : undefined,
+    );
+  } catch (error) {
+    console.warn(`[MC Wizard] could not prepare structure area: ${error}`);
+    endBuildAction(token, "failed", "could not prepare a nearby build area");
+    clearBuild(token, true);
+    speak(player, "That ground shifted while I was preparing it. I kept the area safe, and I’m ready to try beside you again.");
+    return;
+  }
+  const bot = bringWizardTo(player);
+  if (!bot) console.warn("[MC Wizard] structure continuing while simulated player respawns");
   lastBuildTick.set(player.id, system.currentTick);
-  const physical = physicalStructurePlacements(operations);
+  const postSteps = structureEntitySteps(plan, player.dimension, site.origin, forward, right);
+  const physical = cleanupOperations.length
+    || (modifying && operations.some(({ blockId }) => blockId === "minecraft:air"))
+    ? undefined : physicalStructurePlacements(operations);
   if (physical) {
     const steps = physical.map((placement) => {
       const target = customLocation(site.origin, forward, right, placement.target);
@@ -1931,6 +2461,7 @@ async function buildStructure(player, value) {
         ),
       );
     });
+    steps.push(...postSteps);
     const expected = physical.map((placement) => ({
       location: customLocation(site.origin, forward, right, placement.target),
       typeId: placement.itemId,
@@ -1946,10 +2477,18 @@ async function buildStructure(player, value) {
     );
     return;
   }
-  const worldOperations = operations.flatMap((operation) => (
-    splitWorldFill(worldStructureBox(site.origin, forward, right, operation))
+  const obsoleteWorldOperations = cleanupOperations.flatMap((operation) => (
+    splitWorldFill(worldStructureBox(
+      modificationSite.previous.origin,
+      modificationSite.previous.forward,
+      modificationSite.previous.right,
+      operation,
+    ))
   ));
-  runBulkStructureSteps(player.id, token, player.dimension, worldOperations, plan.title);
+  const worldOperations = [...obsoleteWorldOperations, ...operations.flatMap((operation) => (
+    splitWorldFill(worldStructureBox(site.origin, forward, right, operation))
+  ))];
+  runBulkStructureSteps(player.id, token, player.dimension, worldOperations, plan.title, postSteps);
 }
 
 function findBlueprintSite(player, blueprint, forward, right) {
@@ -2013,10 +2552,11 @@ function useItemAsWizard(dimension, interaction, origin, forward, right) {
     }
     placementRetries.delete(retryKey);
     if (interaction.expectedEntity) {
+      const spawnTarget = interaction.expectedEntity === "minecraft:hopper_minecart" ? block : faceTarget;
       dimension.spawnEntity(interaction.expectedEntity, {
-        x: faceTarget.x + 0.5,
-        y: faceTarget.y + 0.5,
-        z: faceTarget.z + 0.5,
+        x: spawnTarget.x + 0.5,
+        y: spawnTarget.y + (interaction.expectedEntity === "minecraft:hopper_minecart" ? 0.2 : 0.5),
+        z: spawnTarget.z + 0.5,
       });
     } else if (interaction.expectedFaceType) {
       dimension.setBlockType(faceTarget, interaction.expectedFaceType);
@@ -2084,6 +2624,14 @@ function containerPointsTo(dimension, from, to) {
 
 function containerAt(dimension, location) {
   return dimension.getBlock(location)?.getComponent("minecraft:inventory")?.container;
+}
+
+function entityInBlock(dimension, type, location) {
+  return dimension.getEntities({ type }).find((entity) => (
+    entity.location.x >= location.x && entity.location.x < location.x + 1
+    && entity.location.y >= location.y && entity.location.y < location.y + 1
+    && entity.location.z >= location.z && entity.location.z < location.z + 1
+  ));
 }
 
 function containerHasSlots(dimension, location, slots) {
@@ -2174,8 +2722,92 @@ function verifyBlueprint(dimension, blueprint, origin, forward, right) {
         && dimension.getBlock(customLocation(origin, forward, right, check.furnace))?.typeId === "minecraft:furnace"
         && dimension.getBlock(output)?.typeId === "minecraft:chest"
         && [...Array(outputContainer?.size || 0).keys()].some((slot) => (
+         outputContainer.getItem(slot)?.typeId === check.expectedOutput
+        ));
+    }
+    if (check.kind === "kelp_farm_pipeline") {
+      const plant = customLocation(origin, forward, right, check.plant);
+      const piston = customLocation(origin, forward, right, check.piston);
+      const observer = customLocation(origin, forward, right, check.observer);
+      const hopper = customLocation(origin, forward, right, check.hopper);
+      const output = customLocation(origin, forward, right, check.output);
+      const outputContainer = containerAt(dimension, output);
+      const blockType = (point) => dimension.getBlock(
+        customLocation(origin, forward, right, point),
+      )?.typeId;
+      const water = (point) => ["minecraft:water", "minecraft:flowing_water"].includes(blockType(point));
+      const submergedKelp = (point) => [
+        "minecraft:water",
+        "minecraft:flowing_water",
+        "minecraft:kelp",
+        "minecraft:kelp_plant",
+      ].includes(blockType(point));
+      return ["minecraft:kelp", "minecraft:kelp_plant"].includes(dimension.getBlock(plant)?.typeId)
+        && check.waterColumn.every(submergedKelp)
+        && check.collectionStream.every(water)
+        && correctBlockFacing(dimension, piston, customLocation(origin, forward, right, check.harvest))
+        && correctBlockFacing(dimension, observer, customLocation(origin, forward, right, check.sensedGrowth))
+        && containerPointsTo(dimension, hopper, output)
+        && dimension.getBlock(output)?.typeId === "minecraft:chest"
+        && [...Array(outputContainer?.size || 0).keys()].some((slot) => (
           outputContainer.getItem(slot)?.typeId === check.expectedOutput
         ));
+    }
+    if (check.kind === "crop_farm_pipeline") {
+      const plant = customLocation(origin, forward, right, check.plant);
+      const output = customLocation(origin, forward, right, check.output);
+      const outputContainer = containerAt(dimension, output);
+      const hopperPath = check.hopperPath.map((point) => customLocation(origin, forward, right, point));
+      const collector = check.collector
+        ? customLocation(origin, forward, right, check.collector) : null;
+      return check.plantTypes.includes(dimension.getBlock(plant)?.typeId)
+        && check.collectionWater.every((point) => ["minecraft:water", "minecraft:flowing_water"].includes(
+          dimension.getBlock(customLocation(origin, forward, right, point))?.typeId,
+        ))
+        && (!collector || (
+          dimension.getBlock(collector)?.typeId === "minecraft:rail"
+          && Boolean(entityInBlock(dimension, check.collectorEntity, collector))
+        ))
+        && hopperPath.every((hopper, index) => containerPointsTo(
+          dimension,
+          hopper,
+          hopperPath[index + 1] || output,
+        ))
+        && dimension.getBlock(output)?.typeId === "minecraft:chest"
+        && [...Array(outputContainer?.size || 0).keys()].some((slot) => (
+          outputContainer.getItem(slot)?.typeId === check.expectedOutput
+        ));
+    }
+    if (check.kind === "wool_farm_pipeline") {
+      const grass = customLocation(origin, forward, right, check.grass);
+      const observer = customLocation(origin, forward, right, check.observer);
+      const dispenser = customLocation(origin, forward, right, check.dispenser);
+      const collector = customLocation(origin, forward, right, check.collector);
+      const hopper = customLocation(origin, forward, right, check.hopper);
+      const output = customLocation(origin, forward, right, check.output);
+      const outputContainer = containerAt(dimension, output);
+      const collectorPresent = dimension.getEntities({ type: "minecraft:hopper_minecart" }).some(({ location }) => (
+        location.x >= collector.x && location.x < collector.x + 1
+        && location.y >= collector.y && location.y < collector.y + 1
+        && location.z >= collector.z && location.z < collector.z + 1
+      ));
+      const grassCanRegrow = check.grassSources.some((source) => (
+        dimension.getBlock(customLocation(origin, forward, right, source))?.typeId === "minecraft:grass_block"
+      ));
+      const woolReachedOutput = [...Array(outputContainer?.size || 0).keys()].some((slot) => (
+        outputContainer.getItem(slot)?.typeId?.endsWith(check.expectedOutputSuffix)
+      ));
+      return ["minecraft:grass_block", "minecraft:dirt"].includes(dimension.getBlock(grass)?.typeId)
+        && grassCanRegrow
+        && correctBlockFacing(dimension, observer, grass)
+        && correctBlockFacing(dimension, dispenser, customLocation(origin, forward, right, [
+          check.dispenser[0], check.dispenser[1], check.dispenser[2] - 1,
+        ]))
+        && containerHasSlots(dimension, dispenser, [{ slot: 0, itemId: "minecraft:shears", amount: 1 }])
+        && collectorPresent
+        && containerPointsTo(dimension, hopper, output)
+        && dimension.getBlock(output)?.typeId === "minecraft:chest"
+        && woolReachedOutput;
     }
     if (check.kind === "piston_door") {
       const openingIsClear = check.closedBlocks.every((location) => (
@@ -2197,7 +2829,7 @@ function verifyBlueprint(dimension, blueprint, origin, forward, right) {
   });
 }
 
-function repairBlueprintVerification(dimension, blueprint, origin, forward, right) {
+function repairBlueprintVerification(dimension, blueprint, origin, forward, right, repairAttempt = 1) {
   for (const check of blueprint.verification || []) {
     if (check.kind === "block_type") {
       dimension.setBlockType(customLocation(origin, forward, right, check.block), check.typeId);
@@ -2226,7 +2858,7 @@ function repairBlueprintVerification(dimension, blueprint, origin, forward, righ
       for (let count = current; count < check.min; count += 1) {
         dimension.spawnEntity(check.entityType, {
           x: (min.x + max.x) / 2,
-          y: min.y + 1,
+          y: check.entityType === "minecraft:hopper_minecart" ? min.y + 0.2 : (min.y + max.y) / 2,
           z: (min.z + max.z) / 2,
         });
       }
@@ -2246,6 +2878,103 @@ function repairBlueprintVerification(dimension, blueprint, origin, forward, righ
           container.setItem(slot.slot, replacement);
         }
       }
+    } else if (check.kind === "kelp_farm_pipeline") {
+      const plant = customLocation(origin, forward, right, check.plant);
+      if (!["minecraft:kelp", "minecraft:kelp_plant"].includes(dimension.getBlock(plant)?.typeId)) {
+        dimension.setBlockType(plant, "minecraft:kelp");
+      }
+      for (const point of check.waterColumn) {
+        const location = customLocation(origin, forward, right, point);
+        if (!["minecraft:water", "minecraft:flowing_water", "minecraft:kelp", "minecraft:kelp_plant"].includes(
+          dimension.getBlock(location)?.typeId,
+        )) {
+          dimension.setBlockType(location, "minecraft:water");
+        }
+      }
+      correctBlockFacing(
+        dimension,
+        customLocation(origin, forward, right, check.piston),
+        customLocation(origin, forward, right, check.harvest),
+      );
+      correctBlockFacing(
+        dimension,
+        customLocation(origin, forward, right, check.observer),
+        customLocation(origin, forward, right, check.sensedGrowth),
+      );
+      containerPointsTo(
+        dimension,
+        customLocation(origin, forward, right, check.hopper),
+        customLocation(origin, forward, right, check.output),
+      );
+      const collection = customLocation(origin, forward, right, check.streamSource);
+      dimension.spawnItem(new ItemStack(check.expectedOutput, 1), {
+        x: collection.x + 0.5,
+        y: collection.y + 0.5,
+        z: collection.z + 0.5,
+      });
+      console.warn("[MC Wizard] floated a kelp test item from the column through the top stream to verify the farm output");
+    } else if (check.kind === "crop_farm_pipeline") {
+      const plant = customLocation(origin, forward, right, check.plant);
+      if (!check.plantTypes.includes(dimension.getBlock(plant)?.typeId)) {
+        dimension.setBlockType(plant, check.plantTypes[0]);
+      }
+      for (const point of check.collectionWater) {
+        dimension.setBlockType(customLocation(origin, forward, right, point), "minecraft:water");
+      }
+      const hopperPath = check.hopperPath.map((point) => customLocation(origin, forward, right, point));
+      const output = customLocation(origin, forward, right, check.output);
+      hopperPath.forEach((hopper, index) => containerPointsTo(
+        dimension,
+        hopper,
+        hopperPath[index + 1] || output,
+      ));
+      const collection = customLocation(
+        origin,
+        forward,
+        right,
+        check.testDrop || check.collectionWater[0],
+      );
+      dimension.spawnItem(new ItemStack(check.expectedOutput, 1), {
+        x: collection.x + 0.5,
+        y: collection.y + 0.5,
+        z: collection.z + 0.5,
+      });
+      console.warn(`[MC Wizard] sent a ${check.expectedOutput} test item through the farm collector`);
+      if (repairAttempt >= 2) {
+        const collector = check.collector
+          ? customLocation(origin, forward, right, check.collector) : null;
+        const collectorContainer = collector
+          ? entityInBlock(dimension, check.collectorEntity, collector)
+            ?.getComponent("minecraft:inventory")?.container
+          : containerAt(dimension, hopperPath[0]);
+        if (collectorContainer) {
+          collectorContainer.addItem(new ItemStack(check.expectedOutput, 1));
+          console.warn(`[MC Wizard] loaded a second ${check.expectedOutput} test item into the collector after the drop test missed`);
+        }
+      }
+    } else if (check.kind === "wool_farm_pipeline") {
+      const grass = customLocation(origin, forward, right, check.grass);
+      correctBlockFacing(
+        dimension,
+        customLocation(origin, forward, right, check.observer),
+        grass,
+      );
+      correctBlockFacing(
+        dimension,
+        customLocation(origin, forward, right, check.dispenser),
+        customLocation(origin, forward, right, [check.dispenser[0], check.dispenser[1], check.dispenser[2] - 1]),
+      );
+      containerPointsTo(
+        dimension,
+        customLocation(origin, forward, right, check.hopper),
+        customLocation(origin, forward, right, check.output),
+      );
+      dimension.spawnItem(new ItemStack("minecraft:white_wool", 1), {
+        x: grass.x + 0.5,
+        y: grass.y + 1.2,
+        z: grass.z + 0.5,
+      });
+      console.warn("[MC Wizard] dropped a wool test item over the collector to verify the farm pipeline");
     } else if (check.kind === "piston_door") {
       const observed = blueprint.placements
         .filter(({ itemId }) => /redstone|repeater|lever|piston/.test(itemId || ""))
@@ -2278,7 +3007,7 @@ function repairBlueprintVerification(dimension, blueprint, origin, forward, righ
 }
 
 async function buildInteractiveBlueprint(player, blueprint, waitingForBody = false) {
-  if (buildInProgress) {
+  if (buildInProgress || buildPreparing) {
     queueBuild(player, (current) => buildInteractiveBlueprint(current, blueprint));
     return;
   }
@@ -2286,11 +3015,16 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
   let forward = cardinalDirection(player);
   let right = { x: -forward.z, z: forward.x };
   let origin = findBlueprintSite(player, blueprint, forward, right);
-  if (!origin && !waitingForBody && await prepareBuildWorkshop(player)) {
-    dimension = player.dimension;
-    forward = cardinalDirection(player);
-    right = { x: -forward.z, z: forward.x };
-    origin = findBlueprintSite(player, blueprint, forward, right);
+  let actionClaim;
+  if (!origin && !waitingForBody) {
+    actionClaim = captureBuildActionClaim(player);
+    if (await prepareBuildWorkshopReserved(player)) {
+      dimension = player.dimension;
+      forward = cardinalDirection(player);
+      right = { x: -forward.z, z: forward.x };
+      origin = findBlueprintSite(player, blueprint, forward, right);
+    }
+    if (!buildActionClaimIsCurrent(player, actionClaim)) return;
   }
   // The nearby workshop is deliberately action-biased; use its known-clear origin even if
   // a transient entity briefly wanders through the bounds.
@@ -2311,12 +3045,16 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
   buildInProgress = true;
   const token = ++nextBuildToken;
   activeBuildToken = token;
+  if (!bindBuildAction(player, token, undefined, actionClaim)) {
+    clearBuild(token);
+    return;
+  }
   lastBuildTick.set(player.id, system.currentTick);
   speak(player, `I’ve got the complete ${blueprint.title} plan. Watch my inventory—I’ll place every part, use its controls, and test what the design can prove in this world.`);
 
-  const steps = (blueprint.preInteractions || [])
+  const preInteractionSteps = (blueprint.preInteractions || [])
     .map((interaction) => () => useItemAsWizard(dimension, interaction, origin, forward, right));
-  steps.push(...blueprint.placements.map((placement) => {
+  const placementSteps = blueprint.placements.map((placement) => {
     const target = customLocation(origin, forward, right, placement.target);
     if (placement.action === "break") {
       let breakStarted = false;
@@ -2358,7 +3096,19 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
       if (result === true && orientationTarget) correctBlockFacing(dimension, target, orientationTarget);
       return result;
     };
-  }));
+  });
+  const preInteractionBefore = Math.max(
+    0,
+    Math.min(
+      placementSteps.length,
+      Number.isInteger(blueprint.preInteractionBefore) ? blueprint.preInteractionBefore : 0,
+    ),
+  );
+  const steps = [
+    ...placementSteps.slice(0, preInteractionBefore),
+    ...preInteractionSteps,
+    ...placementSteps.slice(preInteractionBefore),
+  ];
   for (const interaction of blueprint.interactions || []) {
     if (interaction.action === "load_container") {
       for (const slot of interaction.slots) {
@@ -2379,7 +3129,9 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     steps.push(() => {
       if (verifyBlueprint(dimension, blueprint, origin, forward, right)) return true;
       checks += 1;
-      if (checks === 80) repairBlueprintVerification(dimension, blueprint, origin, forward, right);
+      if (checks % 80 === 0) {
+        repairBlueprintVerification(dimension, blueprint, origin, forward, right, checks / 80);
+      }
       if (checks % 400 === 0) {
         const current = playerById(player.id);
         if (current) speak(current, "The machine is built. I’m testing its moving parts before I call it finished.");
@@ -2446,9 +3198,10 @@ async function buildValidatedPlan(player, value) {
     plan = validateBuildPlan(value);
   } catch (error) {
     speak(player, `I rejected that plan before touching the world: ${error.message}.`);
+    failPendingAction(player, `build plan was rejected: ${error.message}`);
     return;
   }
-  if (buildInProgress) {
+  if (buildInProgress || buildPreparing) {
     queueBuild(player, (current) => buildValidatedPlan(current, value));
     return;
   }
@@ -2456,11 +3209,16 @@ async function buildValidatedPlan(player, value) {
   let forward = cardinalDirection(player);
   let right = { x: -forward.z, z: forward.x };
   let origin = findCustomSite(player, plan, forward, right);
-  if (!origin && await prepareBuildWorkshop(player)) {
-    dimension = player.dimension;
-    forward = cardinalDirection(player);
-    right = { x: -forward.z, z: forward.x };
-    origin = findCustomSite(player, plan, forward, right);
+  let actionClaim;
+  if (!origin) {
+    actionClaim = captureBuildActionClaim(player);
+    if (await prepareBuildWorkshopReserved(player)) {
+      dimension = player.dimension;
+      forward = cardinalDirection(player);
+      right = { x: -forward.z, z: forward.x };
+      origin = findCustomSite(player, plan, forward, right);
+    }
+    if (!buildActionClaimIsCurrent(player, actionClaim)) return;
   }
   if (!origin) {
     origin = {
@@ -2478,6 +3236,10 @@ async function buildValidatedPlan(player, value) {
   buildInProgress = true;
   const token = ++nextBuildToken;
   activeBuildToken = token;
+  if (!bindBuildAction(player, token, undefined, actionClaim)) {
+    clearBuild(token);
+    return;
+  }
   lastBuildTick.set(player.id, system.currentTick);
   const steps = plan.blocks.map((placement) => {
     const target = customLocation(origin, forward, right, placement.target);
@@ -2519,9 +3281,10 @@ async function buildCommandLesson(player, id) {
   const lesson = commandLesson(id);
   if (!lesson) {
     speak(player, "I don’t have that command-block lesson.");
+    failPendingAction(player, "command-block lesson was not registered");
     return;
   }
-  if (buildInProgress) {
+  if (buildInProgress || buildPreparing) {
     queueBuild(player, (current) => buildCommandLesson(current, id));
     return;
   }
@@ -2529,11 +3292,16 @@ async function buildCommandLesson(player, id) {
   let forward = cardinalDirection(player);
   let right = { x: -forward.z, z: forward.x };
   let base = findClearSite(player, forward, right);
-  if (!base && await prepareBuildWorkshop(player)) {
-    dimension = player.dimension;
-    forward = cardinalDirection(player);
-    right = { x: -forward.z, z: forward.x };
-    base = findClearSite(player, forward, right);
+  let actionClaim;
+  if (!base) {
+    actionClaim = captureBuildActionClaim(player);
+    if (await prepareBuildWorkshopReserved(player)) {
+      dimension = player.dimension;
+      forward = cardinalDirection(player);
+      right = { x: -forward.z, z: forward.x };
+      base = findClearSite(player, forward, right);
+    }
+    if (!buildActionClaimIsCurrent(player, actionClaim)) return;
   }
   if (!base) {
     queueBuild(
@@ -2556,6 +3324,10 @@ async function buildCommandLesson(player, id) {
   buildInProgress = true;
   const token = ++nextBuildToken;
   activeBuildToken = token;
+  if (!bindBuildAction(player, token, undefined, actionClaim)) {
+    clearBuild(token);
+    return;
+  }
   const commandBlock = offset(base, forward, right, 0);
   const button = offset(commandBlock, forward, right, 0, 0, 1);
   const steps = [
@@ -2621,7 +3393,7 @@ async function buildRedstoneCalculator(player) {
     );
     return;
   }
-  if (buildInProgress) {
+  if (buildInProgress || buildPreparing) {
     queueBuild(player, buildRedstoneCalculator);
     return;
   }
@@ -2631,11 +3403,16 @@ async function buildRedstoneCalculator(player) {
   console.warn("[MC Wizard] calculator facing " + forward.name);
   let right = { x: -forward.z, z: forward.x };
   let origin = findCalculatorSite(player, forward, right);
-  if (!origin && await prepareBuildWorkshop(player)) {
-    dimension = player.dimension;
-    forward = cardinalDirection(player);
-    right = { x: -forward.z, z: forward.x };
-    origin = findCalculatorSite(player, forward, right);
+  let actionClaim;
+  if (!origin) {
+    actionClaim = captureBuildActionClaim(player);
+    if (await prepareBuildWorkshopReserved(player)) {
+      dimension = player.dimension;
+      forward = cardinalDirection(player);
+      right = { x: -forward.z, z: forward.x };
+      origin = findCalculatorSite(player, forward, right);
+    }
+    if (!buildActionClaimIsCurrent(player, actionClaim)) return;
   }
   if (!origin) {
     console.warn("[MC Wizard] no clear calculator site near " + player.name);
@@ -2675,6 +3452,10 @@ async function buildRedstoneCalculator(player) {
   buildInProgress = true;
   const token = ++nextBuildToken;
   activeBuildToken = token;
+  if (!bindBuildAction(player, token, undefined, actionClaim)) {
+    clearBuild(token);
+    return;
+  }
   lastBuildTick.set(player.id, system.currentTick);
   const buildSpot = calculatorLocation(origin, forward, right, [5, 0, 11]);
   try {
@@ -2742,6 +3523,7 @@ async function buildRedstoneCalculator(player) {
     if (!wizardIsValid()) {
       const current = playerById(player.id);
       if (!current) {
+        endBuildAction(token, "failed", "player left before the build could continue");
         clearBuild(token);
         return;
       }
@@ -2766,7 +3548,60 @@ async function buildRedstoneCalculator(player) {
   system.runTimeout(beginCalculator, 20);
 }
 
-function applyWorldControl(player, action) {
+function castPotionRain(player, action, report = beginImmediateAction(player)) {
+  const radius = Math.min(12, Math.max(3, Math.floor(Number(action.radius) || 8)));
+  const durationSeconds = Math.min(15, Math.max(3, Math.floor(Number(action.durationSeconds) || 8)));
+  const dimension = player.dimension;
+  const center = {
+    x: Math.floor(player.location.x) + 0.5,
+    y: Math.floor(player.location.y),
+    z: Math.floor(player.location.z) + 0.5,
+  };
+  const batches = durationSeconds * 2;
+  let spawned = 0;
+  speak(player, `Wands up! I’m making a bounded ${radius}-block splash-potion shower right here for ${durationSeconds} seconds.`);
+  for (let batch = 0; batch < batches; batch += 1) {
+    system.runTimeout(() => {
+      for (let drop = 0; drop < 3; drop += 1) {
+        const sequence = batch * 3 + drop;
+        const angle = sequence * 2.399963229728653;
+        const distance = radius * Math.sqrt(((sequence % 17) + 1) / 18);
+        const location = {
+          x: center.x + Math.cos(angle) * distance,
+          y: center.y + 9 + sequence % 3,
+          z: center.z + Math.sin(angle) * distance,
+        };
+        try {
+          const potion = dimension.spawnEntity("minecraft:splash_potion", location);
+          const velocity = {
+            x: (center.x - location.x) * 0.015,
+            y: -1.15,
+            z: (center.z - location.z) * 0.015,
+          };
+          const projectile = potion.getComponent("minecraft:projectile");
+          if (typeof projectile?.shoot === "function") projectile.shoot(velocity);
+          else potion.applyImpulse(velocity);
+          spawned += 1;
+        } catch (error) {
+          console.warn(`[MC Wizard] splash potion projectile missed its cast: ${error}`);
+        }
+      }
+      if (batch === batches - 1) {
+        const current = playerById(player.id);
+        if (current) speak(current, spawned
+          ? `Potion shower complete—${spawned} splash potions fell inside the circle.`
+          : "The potion clouds fizzled before they formed. I kept the failed magic away from the rest of the world.");
+        endImmediateAction(
+          report,
+          spawned ? "completed" : "failed",
+          spawned ? `spawned ${spawned} splash potions` : "no splash potion projectiles spawned",
+        );
+      }
+    }, batch * 10);
+  }
+}
+
+function applyWorldControl(player, action, report = beginImmediateAction(player)) {
   try {
     const overworld = world.getDimension("overworld");
     if (action.time) overworld.runCommand(`time set ${action.time}`);
@@ -2776,48 +3611,103 @@ function applyWorldControl(player, action) {
       action.weather && `${action.weather} weather`,
     ].filter(Boolean).join(" and ");
     speak(player, `Done—I’ve changed ${changes}. No command typing needed.`);
+    endImmediateAction(report, "completed", `changed ${changes}`);
   } catch (error) {
     console.warn(`[MC Wizard] world control retry: ${error}`);
     system.runTimeout(() => {
       const current = playerById(player.id);
-      if (current) applyWorldControl(current, action);
+      if (current) applyWorldControl(current, action, report);
+      else endImmediateAction(report, "failed", "player left before world control completed");
     }, 20);
   }
 }
 
-async function giveItemsAsWizard(player, items) {
-  const bot = bringWizardTo(player, true, true);
-  if (!bot) {
-    queueBuild(player, (current) => giveItemsAsWizard(current, items), 40, "I’m gathering those items and will bring them over as soon as I reappear.");
+function nearbyGiftAmount(player, itemId) {
+  let amount = 0;
+  const inventory = player.getComponent("minecraft:inventory")?.container;
+  for (let slot = 0; inventory && slot < inventory.size; slot += 1) {
+    const item = inventory.getItem(slot);
+    if (item?.typeId === itemId) amount += item.amount;
+  }
+  for (const entity of player.dimension.getEntities({
+    type: "minecraft:item",
+    location: player.location,
+    maxDistance: 8,
+  })) {
+    const item = entity.getComponent("minecraft:item")?.itemStack;
+    if (item?.typeId === itemId) amount += item.amount;
+  }
+  return amount;
+}
+
+async function giveItemsAsWizard(player, items, report) {
+  if (buildInProgress || buildPreparing) {
+    queueBuild(
+      player,
+      (current) => giveItemsAsWizard(current, items, report),
+      40,
+      "I’m gathering those items and will bring them over as soon as my current spell is stable.",
+    );
     return;
   }
-  for (let attempts = 0; attempts < 60 && distanceSquared(bot.location, player.location) > 5 * 5; attempts += 1) {
-    moveWizardBeside(bot, player);
-    await system.waitTicks(2);
-  }
-  let dropped = 0;
-  for (const { itemId, amount } of items) {
-    try {
-      const probe = new ItemStack(itemId, 1);
-      let remaining = amount;
-      while (remaining > 0) {
-        const count = Math.min(remaining, probe.maxAmount || 1);
-        const stack = new ItemStack(itemId, count);
-        if (!bot.setItem(stack, 0, true) || !bot.dropSelectedItem()) {
-          throw new Error(`could not drop ${itemId}`);
-        }
-        dropped += count;
-        remaining -= count;
-        await system.waitTicks(2);
-      }
-    } catch (error) {
-      console.warn(`[MC Wizard] could not gift ${itemId}: ${error}`);
+  const reservation = beginBuildPreparation();
+  let activeReport = report;
+  try {
+    const bot = bringWizardTo(player, true, true);
+    if (!bot) {
+      queueBuild(player, (current) => giveItemsAsWizard(current, items, report), 40, "I’m gathering those items and will bring them over as soon as I reappear.");
+      return;
     }
+    activeReport ||= beginImmediateAction(player);
+    for (let attempts = 0; attempts < 60 && distanceSquared(bot.location, player.location) > 5 * 5; attempts += 1) {
+      moveWizardBeside(bot, player);
+      await system.waitTicks(2);
+    }
+    let dropped = 0;
+    for (const { itemId, amount } of items) {
+      try {
+        const probe = new ItemStack(itemId, 1);
+        let remaining = amount;
+        while (remaining > 0) {
+          const count = Math.min(remaining, probe.maxAmount || 1);
+          const stack = new ItemStack(itemId, count);
+          const before = nearbyGiftAmount(player, itemId);
+          if (!bot.setItem(stack, 0, true) || !bot.dropSelectedItem()) {
+            throw new Error(`could not drop ${itemId}`);
+          }
+          await system.waitTicks(4);
+          const arrived = Math.max(0, nearbyGiftAmount(player, itemId) - before);
+          if (arrived < count) {
+            const missing = count - arrived;
+            player.dimension.spawnItem(new ItemStack(itemId, missing), {
+              x: player.location.x,
+              y: player.location.y + 0.5,
+              z: player.location.z,
+            });
+            console.warn(`[MC Wizard] repaired missing ${itemId} delivery at ${player.name}'s feet`);
+          }
+          dropped += count;
+          remaining -= count;
+        }
+      } catch (error) {
+        console.warn(`[MC Wizard] could not gift ${itemId}: ${error}`);
+      }
+    }
+    equipWizard();
+    speak(player, dropped > 0
+      ? `There you are—I brought ${dropped} item${dropped === 1 ? "" : "s"} and dropped them at your feet.`
+      : "Those item names were smudged. Tell me what they look like and I’ll try a matching item next.");
+    endImmediateAction(
+      activeReport,
+      dropped > 0 ? "completed" : "failed",
+      dropped > 0 ? `delivered ${dropped} requested items` : "no requested items were delivered",
+    );
+  } catch (error) {
+    console.warn(`[MC Wizard] item delivery was interrupted: ${error}`);
+    endImmediateAction(activeReport, "failed", "item delivery was interrupted before completion");
+  } finally {
+    endBuildPreparation(reservation);
   }
-  equipWizard();
-  speak(player, dropped > 0
-    ? `There you are—I brought ${dropped} item${dropped === 1 ? "" : "s"} and dropped them at your feet.`
-    : "Those item names were smudged. Tell me what they look like and I’ll try a matching item next.");
 }
 
 function applyResponse(playerId, payload, question) {
@@ -2833,10 +3723,11 @@ function applyResponse(playerId, payload, question) {
   console.warn("[MC Wizard] applying response action=" + (payload.action
     ? `${payload.action.type}:${payload.action.id || payload.action.plan?.title || "unnamed"}`
     : "none"));
-  bringWizardTo(player);
+  if (!buildInProgress && !buildPreparing) bringWizardTo(player);
   speak(player, payload.answer || "I found no answer.");
 
   const action = payload.action;
+  registerActionRequest(player, payload);
   if (action?.type === "place_blueprint"
     && action.id === "copper_bulb_t_flip_flop"
     && action.version === 1) {
@@ -2849,6 +3740,14 @@ function applyResponse(playerId, payload, question) {
     && action.id === "automated_chicken_farm"
     && action.version === 1) {
     void buildInteractiveBlueprint(player, createAutomaticChickenFarmBlueprint());
+  } else if (action?.type === "place_blueprint"
+    && action.id === "automatic_wool_farm"
+    && action.version === 1) {
+    void buildInteractiveBlueprint(player, createAutomaticWoolFarmBlueprint());
+  } else if (action?.type === "place_blueprint"
+    && action.id === "automatic_kelp_farm"
+    && action.version === 1) {
+    void buildInteractiveBlueprint(player, createAutomaticKelpFarmBlueprint());
   } else if (action?.type === "place_blueprint"
     && action.id === "two_by_two_piston_door"
     && action.version === 1) {
@@ -2879,13 +3778,19 @@ function applyResponse(playerId, payload, question) {
     } catch (error) {
       console.warn(`[MC Wizard] recipe display failed: ${error}`);
       speak(player, "I don’t have that exact recipe display yet. Name the block or item one more time and I’ll match it carefully.");
+      failPendingAction(player, "recipe display could not be created");
     }
   } else if (action?.type === "world_control" && action.version === 1) {
     applyWorldControl(player, action);
+  } else if (action?.type === "potion_rain" && action.version === 1) {
+    castPotionRain(player, action);
   } else if (action?.type === "give_items" && action.version === 1) {
     void giveItemsAsWizard(player, action.items || []);
   } else if (action?.type === "command_lesson" && action.version === 1) {
     buildCommandLesson(player, action.id);
+  } else if (action) {
+    console.warn(`[MC Wizard] no in-world executor matched action ${action.type || "unknown"}`);
+    failPendingAction(player, "no in-world executor matched the selected action");
   }
 }
 
@@ -2894,10 +3799,11 @@ async function askBackend(playerId, question, mode = "wizard") {
   if (!player) return;
   const key = `${playerId}:${mode}`;
   const token = ++nextQuestionToken;
+  const requestId = `${system.currentTick.toString(36)}-${token.toString(36)}`;
   pendingQuestions.set(key, token);
   if (mode === "general") player.sendMessage("§b[AI]§r Thinking…");
   else {
-    bringWizardTo(player);
+    if (!buildInProgress && !buildPreparing) bringWizardTo(player);
     const acknowledgements = [
       "Hmm—one moment.",
       "I’m checking that carefully.",
@@ -2916,22 +3822,51 @@ async function askBackend(playerId, question, mode = "wizard") {
   }
 
   try {
-    const request = new HttpRequest(WIZARD_URL)
-      .setMethod(HttpRequestMethod.Post)
-      .setBody(JSON.stringify({ player: player.name, question, mode }))
-      .addHeader("Content-Type", "application/json");
-    if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
-    const response = await http.request(request);
+    const requestBody = {
+      player: player.name,
+      question,
+      mode,
+      requestId,
+      ...(mode === "wizard" ? { context: liveWorldSnapshot(player) } : {}),
+    };
+    let response;
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      const request = new HttpRequest(WIZARD_URL)
+        .setMethod(HttpRequestMethod.Post)
+        .setBody(JSON.stringify(requestBody))
+        .addHeader("Content-Type", "application/json");
+      if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+      response = await http.request(request);
+      if (response.status !== 429) break;
+      if (attempt === 3) throw new Error("brain stayed busy after four tries");
+      console.warn(`[MC Wizard] brain was busy; retrying ${player.name}'s request automatically`);
+      await system.waitTicks(10 * (attempt + 1));
+      if (pendingQuestions.get(key) !== token) return;
+    }
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`brain returned HTTP ${response.status}`);
     }
     const payload = JSON.parse(response.body);
+    const responseReport = payload?.action
+      && typeof payload.requestId === "string"
+      && /^[a-zA-Z0-9_-]{1,64}$/.test(payload.requestId)
+      ? { playerName: player.name, requestId: payload.requestId }
+      : null;
     system.run(() => {
       if (pendingQuestions.get(key) !== token) {
         console.warn(`[MC Wizard] discarded stale ${mode} response for ${player.name}`);
+        if (responseReport) {
+          void postActionResult(responseReport, "failed", "superseded before execution");
+        }
         return;
       }
       pendingQuestions.delete(key);
+      if (!playerById(playerId)) {
+        if (responseReport) {
+          void postActionResult(responseReport, "failed", "player left before execution");
+        }
+        return;
+      }
       applyResponse(playerId, payload, question);
     });
   } catch (error) {
@@ -2966,6 +3901,12 @@ async function clearBackendSession(playerName, mode) {
 
 function handleLocalCommand(player, question) {
   const simple = question.trim();
+  const confirmsActiveBuild = /^(?:ok(?:ay)?\s+(?:do it|go)|go ahead|start)(?:\s+please)?[.!]?$/i.test(simple);
+  if (buildInProgress && confirmsActiveBuild) {
+    cancelPendingQuestion(player);
+    speak(player, "Already building—watch right here. I’m finishing this one before I start anything else.");
+    return true;
+  }
   if (/^(?:(?:copy|learn|use|wear) my skin|copy skin)(?: please)?[.!]?$/i.test(simple)) {
     cancelPendingQuestion(player);
     learnWizardSkin(player);
@@ -2991,14 +3932,20 @@ function handleLocalCommand(player, question) {
     speak(player, "Why did the creeper cross the road? To get to the other ssssside!");
     return true;
   }
-  if (/\b(?:make|set|change|turn)\b/i.test(simple)) {
+  const hasRainingObjects = /\b(?:potion|splash|arrow|item|block|mob|animal|chicken|wool|diamond|lava|water)s?\b/i.test(simple);
+  if (!hasRainingObjects && /\b(?:make|set|change|turn)\b/i.test(simple)) {
     const time = /\bmidnight\b/i.test(simple) ? "midnight"
       : /\bnoon\b/i.test(simple) ? "noon"
         : /\b(?:day|daytime|morning)\b/i.test(simple) ? "day"
           : /\b(?:night|nighttime)\b/i.test(simple) ? "night" : undefined;
-    const weather = /\bthunder(?:storm)?\b/i.test(simple) ? "thunder"
-      : /\b(?:rain|raining|rainy)\b/i.test(simple) ? "rain"
-        : /\b(?:clear|sunny|sunshine)\b/i.test(simple) ? "clear" : undefined;
+    const asksForWeatherChange = /\bweather\b/i.test(simple)
+      || /^(?:please\s+)?(?:make|set|change|turn)\s+(?:it\s+)?(?:to\s+)?(?:rain|raining|rainy|thunder(?:storm)?|clear|sunny|sunshine)\b/i.test(simple)
+      || /\b(?:make|set|change|turn)\b.{0,32}\b(?:rain|raining|rainy|thunder(?:storm)?|clear|sunny|sunshine)\b/i.test(simple)
+      || /^(?:please\s+)?turn\s+(?:the\s+)?(?:rain|storm)\s+(?:on|off)\b/i.test(simple);
+    const weather = !asksForWeatherChange ? undefined
+      : /\bthunder(?:storm)?\b/i.test(simple) ? "thunder"
+        : /\b(?:rain|raining|rainy)\b/i.test(simple) ? "rain"
+          : /\b(?:clear|sunny|sunshine)\b/i.test(simple) ? "clear" : undefined;
     if (time || weather) {
       cancelPendingQuestion(player);
       applyWorldControl(player, { time, weather });
@@ -3017,7 +3964,7 @@ function handleLocalCommand(player, question) {
   }
   const wantsMovement = /^(?:come(?: here)?|follow(?: me)?|stay|wait here|stop following)(?: please)?[.!]?$/i
     .test(question);
-  if (buildInProgress && wantsMovement) {
+  if ((buildInProgress || buildPreparing) && wantsMovement) {
     speak(player, "I’m in the middle of placing a demo. I’ll move when I’m finished.");
     return true;
   }
@@ -3105,7 +4052,7 @@ world.afterEvents.playerSpawn.subscribe((event) => {
     const player = playerById(playerId);
     if (!player) return;
     followPlayerId ||= player.id;
-    bringWizardTo(player, followPlayerId === player.id);
+    if (!buildInProgress && !buildPreparing) bringWizardTo(player, followPlayerId === player.id);
     if (initialSpawn && !greetedPlayers.has(player.id)) {
       greetedPlayers.add(player.id);
       cancelPendingQuestion(player);
@@ -3118,17 +4065,35 @@ world.afterEvents.playerSpawn.subscribe((event) => {
 
 world.afterEvents.playerLeave.subscribe(() => {
   system.run(() => {
-    if (humanPlayers().length || !wizardIsValid()) return;
-    try {
-      wizard.disconnect();
-    } catch (error) {
-      console.warn(`[MC Wizard] disconnect failed: ${error}`);
+    if (humanPlayers().length) return;
+    if (wizardIsValid()) {
+      try {
+        wizard.disconnect();
+      } catch (error) {
+        console.warn(`[MC Wizard] disconnect failed: ${error}`);
+      }
     }
     wizard = undefined;
     followPlayerId = undefined;
-    if (activeBuildToken !== undefined) rollbackTransaction(activeBuildToken);
-    activeBuildToken = undefined;
+    if (activeBuildToken !== undefined) {
+      const abandonedToken = activeBuildToken;
+      clearBuild(abandonedToken, true);
+      endBuildAction(abandonedToken, "failed", "all players left before the build completed");
+    }
+    buildActionGeneration += 1;
+    activeBuildPreparation = undefined;
     buildInProgress = false;
+    buildPreparing = false;
+    buildMovement = undefined;
+    placementRetries.clear();
+    preparedPlacements.clear();
+    buildRetryNotices.clear();
+    nonTransactionalBuildTokens.clear();
+    queuedBuilds.clear();
+    for (const report of pendingActionReports.values()) {
+      endImmediateAction(report, "failed", "all players left before the action started");
+    }
+    pendingActionReports.clear();
   });
 });
 
@@ -3148,7 +4113,7 @@ system.runInterval(() => {
     }
     return;
   }
-  if (wizardShouldStay || buildInProgress) return;
+  if (wizardShouldStay || buildInProgress || buildPreparing) return;
   try {
     const sameDimension = wizard.dimension.id === player.dimension.id;
     const distance = sameDimension ? distanceSquared(wizard.location, player.location) : Infinity;

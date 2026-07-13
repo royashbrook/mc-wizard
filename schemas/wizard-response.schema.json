@@ -14,8 +14,19 @@
           "required": ["type", "id", "version"],
           "properties": {
             "type": { "type": "string", "const": "place_blueprint" },
-            "id": { "type": "string", "enum": ["copper_bulb_t_flip_flop", "binary_adder_2bit", "automated_chicken_farm", "two_by_two_piston_door", "item_sorter", "automatic_smelter"] },
+            "id": { "type": "string", "enum": ["copper_bulb_t_flip_flop", "binary_adder_2bit", "automated_chicken_farm", "automatic_wool_farm", "automatic_kelp_farm", "two_by_two_piston_door", "item_sorter", "automatic_smelter"] },
             "version": { "type": "integer", "const": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "version", "radius", "durationSeconds"],
+          "properties": {
+            "type": { "type": "string", "const": "potion_rain" },
+            "version": { "type": "integer", "const": 1 },
+            "radius": { "type": "integer", "minimum": 3, "maximum": 12 },
+            "durationSeconds": { "type": "integer", "minimum": 3, "maximum": 15 }
           }
         },
         {
@@ -95,10 +106,29 @@
             "plan": {
               "type": "object",
               "additionalProperties": false,
-              "required": ["title", "kind", "dimensions", "materials", "features", "phases", "primitives"],
+              "required": ["title", "kind", "dimensions", "materials", "features", "phases"],
+              "allOf": [
+                {
+                  "if": { "not": { "required": ["mode"] } },
+                  "then": {
+                    "properties": {
+                      "primitives": {
+                        "minItems": 4,
+                        "allOf": [
+                          { "contains": { "$ref": "#/$defs/solidFoundationPrimitive" } },
+                          { "contains": { "$ref": "#/$defs/solidShellPrimitive" } },
+                          { "contains": { "$ref": "#/$defs/solidRoofPrimitive" } },
+                          { "contains": { "$ref": "#/$defs/solidDetailsPrimitive" } }
+                        ]
+                      }
+                    }
+                  }
+                }
+              ],
               "properties": {
                 "title": { "type": "string" },
                 "kind": { "type": "string" },
+                "mode": { "type": "string", "const": "modify" },
                 "dimensions": {
                   "type": "object",
                   "additionalProperties": false,
@@ -122,7 +152,7 @@
                 "features": {
                   "type": "array",
                   "minItems": 1,
-                  "items": { "type": "string", "enum": ["floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers", "supports", "walkway", "railings"] }
+                  "items": { "type": "string", "enum": ["floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers", "supports", "walkway", "railings", "rooms", "second_floor", "decorations"] }
                 },
                 "phases": {
                   "type": "array",
@@ -132,7 +162,7 @@
                 },
                 "primitives": {
                   "type": "array",
-                  "minItems": 4,
+                  "minItems": 1,
                   "maxItems": 96,
                   "items": {
                     "type": "object",
@@ -144,6 +174,19 @@
                       "blockId": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
                       "from": { "$ref": "#/$defs/vector" },
                       "to": { "$ref": "#/$defs/vector" }
+                    }
+                  }
+                },
+                "entities": {
+                  "type": "array",
+                  "maxItems": 8,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["typeId", "location"],
+                    "properties": {
+                      "typeId": { "type": "string", "const": "minecraft:villager_v2" },
+                      "location": { "$ref": "#/$defs/vector" }
                     }
                   }
                 }
@@ -241,6 +284,38 @@
     }
   },
   "$defs": {
+    "solidFoundationPrimitive": {
+      "type": "object",
+      "required": ["phase", "blockId"],
+      "properties": {
+        "phase": { "const": "foundation" },
+        "blockId": { "not": { "const": "minecraft:air" } }
+      }
+    },
+    "solidShellPrimitive": {
+      "type": "object",
+      "required": ["phase", "blockId"],
+      "properties": {
+        "phase": { "const": "shell" },
+        "blockId": { "not": { "const": "minecraft:air" } }
+      }
+    },
+    "solidRoofPrimitive": {
+      "type": "object",
+      "required": ["phase", "blockId"],
+      "properties": {
+        "phase": { "const": "roof" },
+        "blockId": { "not": { "const": "minecraft:air" } }
+      }
+    },
+    "solidDetailsPrimitive": {
+      "type": "object",
+      "required": ["phase", "blockId"],
+      "properties": {
+        "phase": { "const": "details" },
+        "blockId": { "not": { "const": "minecraft:air" } }
+      }
+    },
     "vector": {
       "type": "array",
       "minItems": 3,

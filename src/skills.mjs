@@ -23,6 +23,16 @@ export const WIZARD_SKILLS = [
     action: { type: "place_blueprint", id: "automated_chicken_farm", version: 1 },
   },
   {
+    name: "build_automatic_wool_farm",
+    description: "Physically build and test a real Bedrock automatic wool farm with a sheep on renewable grass, an observer-triggered dispenser loaded with shears, and hopper-minecart collection into a chest.",
+    action: { type: "place_blueprint", id: "automatic_wool_farm", version: 1 },
+  },
+  {
+    name: "build_automatic_kelp_farm",
+    description: "Physically build and test a real Bedrock automatic kelp farm with a source-water growth column, observer-triggered piston harvesting, and floating-item collection into a chest.",
+    action: { type: "place_blueprint", id: "automatic_kelp_farm", version: 1 },
+  },
+  {
     name: "build_two_by_two_piston_door",
     description: "Physically build and test a complete 2x2 Bedrock sticky-piston door with one lever.",
     action: { type: "place_blueprint", id: "two_by_two_piston_door", version: 1 },
@@ -41,6 +51,11 @@ export const WIZARD_SKILLS = [
     name: "control_world_time_and_weather",
     description: "Immediately change requested world time and weather instead of relaying a command. Include time, weather, or both.",
     action: { type: "world_control", version: 1, time: "day", weather: "clear" },
+  },
+  {
+    name: "cast_splash_potion_rain",
+    description: "Create a bounded shower of falling splash-potion projectiles around the player. Use this for imaginative requests to make splash potions rain from the sky; do not substitute ordinary weather rain.",
+    action: { type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 },
   },
   {
     name: "give_player_items",
@@ -85,6 +100,11 @@ export function allowedWizardAction(value) {
     const time = ["day", "night", "noon", "midnight"].includes(value.time) ? value.time : undefined;
     const weather = ["clear", "rain", "thunder"].includes(value.weather) ? value.weather : undefined;
     return time || weather ? { type: "world_control", version: 1, ...(time && { time }), ...(weather && { weather }) } : null;
+  }
+  if (value?.type === "potion_rain" && value.version === 1) {
+    const radius = Math.min(12, Math.max(3, Math.floor(Number(value.radius) || 8)));
+    const durationSeconds = Math.min(15, Math.max(3, Math.floor(Number(value.durationSeconds) || 8)));
+    return { type: "potion_rain", version: 1, radius, durationSeconds };
   }
   if (value?.type === "give_items" && value.version === 1 && Array.isArray(value.items)
     && value.items.length >= 1 && value.items.length <= 16) {

@@ -19,8 +19,8 @@ if [ ! -f "$ROOT/package.json" ]; then
   echo "Run from the MC Wizard repository root." >&2
   exit 1
 fi
-if [ "$E2E_SCOPE" != "full" ] && [ "$E2E_SCOPE" != "machines" ] && [ "$E2E_SCOPE" != "arbitrary" ] && [ "$E2E_SCOPE" != "child" ]; then
-  echo "MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, or child." >&2
+if [ "$E2E_SCOPE" != "full" ] && [ "$E2E_SCOPE" != "machines" ] && [ "$E2E_SCOPE" != "arbitrary" ] && [ "$E2E_SCOPE" != "child" ] && [ "$E2E_SCOPE" != "refinement" ] && [ "$E2E_SCOPE" != "farms" ] && [ "$E2E_SCOPE" != "kelp" ]; then
+  echo "MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, child, refinement, farms, or kelp." >&2
   exit 1
 fi
 if ! command -v container >/dev/null 2>&1; then
@@ -136,7 +136,10 @@ mkfifo "$FIFO"
 ) >"$FIFO" &
 LOG_PID=$!
 result=0
-if [ "$E2E_SCOPE" = "arbitrary" ]; then E2E_TIMEOUT_MS=300000; else E2E_TIMEOUT_MS=1800000; fi
+if [ "$E2E_SCOPE" = "arbitrary" ] || [ "$E2E_SCOPE" = "refinement" ]; then E2E_TIMEOUT_MS=300000
+elif [ "$E2E_SCOPE" = "farms" ]; then E2E_TIMEOUT_MS=600000
+else E2E_TIMEOUT_MS=1800000
+fi
 MC_WIZARD_E2E_RUN="$RUN_ID" E2E_TIMEOUT_MS="$E2E_TIMEOUT_MS" E2E_LOG_FILE="$ROOT/runtime/e2e-last.log" \
   node scripts/wait-e2e.mjs <"$FIFO" || result=$?
 kill "$LOG_PID" >/dev/null 2>&1 || true

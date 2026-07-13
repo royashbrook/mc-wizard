@@ -42,6 +42,7 @@ cp .env.example .env
 npm install
 npm run hooks:install
 npm test
+npm run eval:live-chat
 npm start
 ```
 
@@ -72,6 +73,10 @@ Open [http://127.0.0.1:3001](http://127.0.0.1:3001) on the server Mac. The desk 
 - recent container logs that refresh every four seconds and follow new output automatically;
 - a separate browser dialogue session for testing Wizard and general AI replies; and
 - hot-loaded prompt addenda, AI enable/disable, and output-token limits.
+
+### Live-chat refinement loop
+
+Do not tune the Wizard from a paraphrase. Inspect the latest persisted chat/session log, label each turn `success`, `partial`, or `failure`, and copy the exact child wording (including typos and follow-up history) into `test/fixtures/live-chat-regressions.json`. Run `npm run eval:live-chat` before and after a fix. The fixture is the durable replay set; adding a case is part of fixing a live failure, not optional cleanup.
 
 AI tuning is stored in ignored `runtime/admin/settings.json` and read on every request, so saving it does not restart Bedrock or the brain. The base safety, action, and book-format contracts remain in code. Console input uses the image's documented [`send-command`](https://github.com/itzg/docker-minecraft-bedrock-server#executing-server-commands) helper without invoking a shell.
 
@@ -265,14 +270,17 @@ npm run test:e2e:machines
 
 That run has Test Kid close and reopen the 2x2 piston door, waits for the automatic smelter to deliver an iron ingot, and confirms the item sorter sends a diamond and a feather to different output chests. It checks real blocks, inventories, hopper directions, and redstone movement rather than chat text.
 
-Two additional focused runs cover the open-ended child experience without rerunning the whole suite:
+Focused runs cover the open-ended child experience without rerunning the whole suite:
 
 ```bash
 npm run test:e2e:arbitrary
 npm run test:e2e:child
+npm run test:e2e:refinement
+npm run test:e2e:farms
+npm run test:e2e:kelp
 ```
 
-The arbitrary run verifies an unusual exact-size structure rather than a canned prototype. The child run verifies a sized house, working chicken farm, contextual time and weather, physical item delivery, and an in-world recipe lesson.
+The arbitrary run verifies an unusual exact-size structure rather than a canned prototype. The child run verifies a sized house, an in-place castle upgrade, working chicken, wool, and naturally harvested kelp farms, bounded splash-potion rain, contextual time and weather, physical item delivery, and an in-world recipe lesson. The refinement run keeps rooms, villagers, a balcony, enlargement, and a moat on the same castle. The farm run requires fresh sugar cane, bamboo, and cactus growth to reach the output chest; the kelp run isolates the same natural-growth-to-chest proof for its observer/piston circuit.
 
 It bootstraps a fresh Beta-APIs world under a unique `runtime/e2e/<run-id>` data root, launches a unique Apple container with no published port, and always stops/deletes that container. A passing world is deleted; a failing world is retained for diagnosis. Raw BDS output is saved to ignored `runtime/e2e-last.log`.
 
@@ -328,7 +336,7 @@ Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not 
 - The T flip-flop, calculator, command lessons, and validated plans are transactional and undoable. They require bounded clear areas, reject occupied/protected overlaps, and roll back on failure or disconnect.
 - The current documented Script API cannot safely program arbitrary command-block text. Prepared lesson definitions make the Wizard physically place the command block and button, then tell the child exactly what to paste; they deliberately do not `/structure load` a prebuilt result.
 - Official Microsoft documentation is not a complete gameplay encyclopedia. Fill gaps with versioned, self-authored mechanic cards backed by reproducible Bedrock tests. Do not ingest the community wiki by default without accepting its attribution, noncommercial, and share-alike requirements.
-- The operator desk is not a parental-control or child-chat-audit system. There is no durable child-chat audit policy, per-world protected region, semantic cache, embedding index, or broad retrieval evaluation set yet.
+- The operator desk is not a parental-control or child-chat-audit system. Dialogue sessions are bounded and stored under hashed player keys for continuity and regression promotion, but there is no retention/consent policy, per-world protected region, semantic cache, embedding index, or broad retrieval evaluation set yet.
 
 ## License
 

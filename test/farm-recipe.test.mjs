@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import test from "node:test";
 import { createAutomaticChickenFarmBlueprint } from "../bedrock/behavior_packs/mc_wizard/scripts/chicken-farm.js";
 import { createRecipeDisplay, recipeFor, recipeItemIds } from "../bedrock/behavior_packs/mc_wizard/scripts/recipe-display.js";
+import { createAutomaticWoolFarmBlueprint } from "../bedrock/behavior_packs/mc_wizard/scripts/wool-farm.js";
 
 const key = (point) => point.join(",");
 
@@ -37,6 +38,54 @@ test("automatic chicken farm physically collects eggs and starts with chickens",
   });
   assert.match(farm.success, /hopper moves every egg into the chest/i);
   assert.match(farm.usage, /five to ten minutes/i);
+});
+
+test("automatic wool farm shears one sheep and collects through grass", () => {
+  const farm = createAutomaticWoolFarmBlueprint();
+  assert.equal(farm.id, "automatic_wool_farm");
+  assert.deepEqual(farm.bounds, { min: [-1, -1, 1], max: [1, 4, 4] });
+
+  const placements = new Map(farm.placements
+    .filter(({ action }) => action !== "break")
+    .map((placement) => [key(placement.target), placement]));
+  assert.deepEqual(placements.get("0,0,2").facingTarget, [0, 0, 1]);
+  assert.equal(placements.get("0,0,1").itemId, "minecraft:chest");
+  assert.equal(placements.get("0,1,2").itemId, "minecraft:rail");
+  assert.equal(placements.get("0,2,2").itemId, "minecraft:grass_block");
+  assert.deepEqual(placements.get("0,2,2").expectedType, ["minecraft:grass_block", "minecraft:dirt"]);
+  for (const source of ["-1,2,2", "1,2,2", "0,2,1"]) {
+    assert.equal(placements.get(source).itemId, "minecraft:grass_block");
+  }
+  assert.deepEqual(placements.get("0,2,3").orientationTarget, [0, 2, 2]);
+  assert.deepEqual(placements.get("0,3,3").orientationTarget, [0, 3, 2]);
+  assert.equal(placements.get("0,3,4").expectedType, "minecraft:redstone_wire");
+  assert.ok(farm.placements.some(({ action, target }) => action === "break" && key(target) === "0,1,2"));
+
+  const dispenserLoad = farm.interactions.find(({ action, block }) => (
+    action === "load_container" && key(block) === "0,3,3"
+  ));
+  assert.deepEqual(dispenserLoad.slots, [{ slot: 0, itemId: "minecraft:shears", amount: 1 }]);
+  assert.ok(farm.interactions.some(({ itemId, block, expectedEntity }) => (
+    itemId === "minecraft:hopper_minecart"
+      && key(block) === "0,1,2"
+      && expectedEntity === "minecraft:hopper_minecart"
+  )));
+  assert.ok(farm.interactions.some(({ itemId, block, expectedEntity }) => (
+    itemId === "minecraft:sheep_spawn_egg"
+      && key(block) === "0,2,2"
+      && expectedEntity === "minecraft:sheep"
+  )));
+  assert.deepEqual(
+    farm.interactions.filter(({ expectedState }) => expectedState).map(({ expectedState }) => expectedState.value),
+    [true, false],
+  );
+
+  const pipeline = farm.verification.find(({ kind }) => kind === "wool_farm_pipeline");
+  assert.deepEqual(pipeline.grassSources, [[-1, 2, 2], [1, 2, 2], [0, 2, 1]]);
+  assert.deepEqual(pipeline.output, [0, 0, 1]);
+  assert.equal(pipeline.expectedOutputSuffix, "_wool");
+  assert.match(farm.success, /hopper minecart carries the wool into the front chest/i);
+  assert.match(farm.usage, /grass can grow back/i);
 });
 
 test("recipe catalog produces exact three-by-three ingredient displays", () => {
