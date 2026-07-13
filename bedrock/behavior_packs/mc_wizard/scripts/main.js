@@ -7,7 +7,7 @@ import {
   system,
   world,
 } from "@minecraft/server";
-import { LookDuration, spawnSimulatedPlayer } from "@minecraft/server-gametest";
+import { getPlayerSkin, LookDuration, spawnSimulatedPlayer } from "@minecraft/server-gametest";
 import { variables, secrets } from "@minecraft/server-admin";
 import { http, HttpRequest, HttpRequestMethod } from "@minecraft/server-net";
 import { startE2E } from "./e2e.js";
@@ -76,6 +76,7 @@ let nextQuestionToken = 0;
 let buildMovement;
 let activeTransaction;
 let lastAmbientTick = 0;
+let learnedWizardSkin;
 
 function variable(name, fallback) {
   try {
@@ -122,9 +123,19 @@ function wizardIsValid() {
   return Boolean(wizard?.isValid);
 }
 
+function logChat(player, channel, speaker, message) {
+  console.warn(`[MC Wizard][chat] ${JSON.stringify({
+    channel,
+    player: player.name,
+    speaker,
+    message: String(message),
+  })}`);
+}
+
 function deliverModelAnswer(player, payload, question) {
   const label = String(payload.label || "AI").replace(/[^a-zA-Z0-9 ._-]/g, "").slice(0, 24) || "AI";
   const answer = String(payload.answer || "I found no answer.").trim();
+  logChat(player, "general", label, answer);
   if (answer.length <= 700) {
     for (const line of splitMessage(answer)) player.sendMessage(`§b[${label}]§r ${line}`);
     return;
@@ -184,6 +195,44 @@ function equipWizard(itemId = "mcwizard:wand") {
   }
 }
 
+function applyLearnedWizardSkin() {
+  if (!wizardIsValid() || !learnedWizardSkin) return false;
+  try {
+    wizard.setSkin(learnedWizardSkin);
+    return true;
+  } catch (error) {
+    console.warn(`[MC Wizard] could not apply learned skin: ${error}`);
+    return false;
+  }
+}
+
+function learnWizardSkin(player) {
+  if (player.playerPermissionLevel !== 2) {
+    speak(player, "Only a server operator can teach me a new look.");
+    return;
+  }
+  const bot = ensureWizard(player);
+  if (!bot) {
+    speak(player, "I couldn’t appear long enough to try that skin. Please ask me again.");
+    return;
+  }
+  try {
+    learnedWizardSkin = getPlayerSkin(player);
+    bot.setSkin(learnedWizardSkin);
+    const pieceCount = learnedWizardSkin.personaPieces?.length || 0;
+    if (pieceCount > 0) {
+      speak(player, "I copied your Character Creator look. That should stay on me until this server restarts.");
+    } else {
+      speak(player, "I tried, but Bedrock did not expose any Character Creator pieces. Classic PNG skins cannot be copied to a simulated player, so I may still look default.");
+    }
+    console.warn(`[MC Wizard] operator skin-copy applied; personaPieces=${pieceCount}`);
+  } catch (error) {
+    learnedWizardSkin = undefined;
+    console.warn(`[MC Wizard] could not copy ${player.name}'s skin: ${error}`);
+    speak(player, "Bedrock would not let me copy that skin type. I’ll keep my current look.");
+  }
+}
+
 function removeOldCostume() {
   if (!wizardIsValid()) return;
   const equippable = wizard.getComponent("minecraft:equippable");
@@ -223,6 +272,7 @@ function ensureWizard(anchor) {
       GameMode.Creative,
     );
     wizard.addTag(WIZARD_TAG);
+    applyLearnedWizardSkin();
     equipWizard();
     removeOldCostume();
     wizard.lookAtEntity(anchor, LookDuration.UntilMove);
@@ -280,6 +330,7 @@ function bringWizardTo(player, follow = true, forceMovement = false) {
 
 function speak(player, message) {
   const bot = ensureWizard(player);
+  logChat(player, "wizard", WIZARD_NAME, message);
   for (const line of splitMessage(message)) {
     if (bot?.isValid) {
       try {
@@ -1645,6 +1696,11 @@ async function clearBackendSession(playerName, mode) {
 
 function handleLocalCommand(player, question) {
   const simple = question.trim();
+  if (/^(?:(?:copy|learn|use|wear) my skin|copy skin)(?: please)?[.!]?$/i.test(simple)) {
+    cancelPendingQuestion(player);
+    learnWizardSkin(player);
+    return true;
+  }
   if (/^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(simple)) {
     cancelPendingQuestion(player);
     speak(player, "Hi! I’m right here. What should we build or learn today?");
@@ -1713,6 +1769,7 @@ function routeAddressedMessage(player, message) {
   if (!match && !bareName && !implicit) return false;
   const playerId = player.id;
   const question = match ? match[1].trim() : bareName ? "" : trimmed;
+  logChat(player, "wizard", "player", trimmed);
   system.run(() => {
     const current = playerById(playerId);
     if (!current) return;
@@ -1732,6 +1789,7 @@ function routeAIMessage(player, message) {
   if (!match && !bareName) return false;
   const playerId = player.id;
   const question = match?.[1]?.trim();
+  logChat(player, "general", "player", trimmed);
   system.run(() => {
     const current = playerById(playerId);
     if (!current) return;

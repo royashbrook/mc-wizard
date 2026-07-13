@@ -82,6 +82,11 @@ test("drives the real wizard path with a headless test player", () => {
   assert.match(e2eScript, /spawnSimulatedPlayer/);
   assert.match(e2eScript, /kid\.chat\(message\)/);
   assert.match(e2eScript, /chatCallbacks\.routeAddressedMessage\(kid, message\)/);
+  assert.match(packScript, /\[MC Wizard\]\[chat\]/);
+  assert.match(packScript, /logChat\(player, "wizard", "player", trimmed\)/);
+  assert.match(packScript, /logChat\(player, "general", "player", trimmed\)/);
+  assert.match(packScript, /logChat\(player, "wizard", WIZARD_NAME, message\)/);
+  assert.match(packScript, /logChat\(player, "general", label, answer\)/);
   assert.match(e2eScript, /engine-event/);
   assert.match(e2eScript, /direct-harness-fallback/);
   assert.match(e2eScript, /async function setLever/);
@@ -146,6 +151,14 @@ test("ships a custom wand without covering the simulated player in costume geome
   assert.doesNotMatch(packScript, /function dressWizard/);
   assert.match(packScript, /function removeOldCostume/);
   assert.doesNotMatch(packScript, /new ItemStack\("(?:mcwizard:(?:hat|robe)|minecraft:leather_(?:helmet|chestplate))"/);
+});
+
+test("lets an operator probe Bedrock's supported simulated-player skin data", () => {
+  assert.match(packScript, /import \{ getPlayerSkin,/);
+  assert.match(packScript, /wizard\.setSkin\(learnedWizardSkin\)/);
+  assert.match(packScript, /player\.playerPermissionLevel !== 2/);
+  assert.match(packScript, /copy\|learn\|use\|wear/);
+  assert.match(packScript, /Classic PNG skins cannot be copied/);
 });
 
 test("prepares fixed command-block lessons and rejects unsafe generated commands", () => {

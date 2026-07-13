@@ -151,13 +151,16 @@ The behavior pack uses beta chat, HTTP, and [`@minecraft/server-gametest`](https
 
 When a real player joins, the behavior pack is set up to spawn one `MC Wizard` near that player. This is a server-side `SimulatedPlayer`, not a custom mob wearing a player-shaped model: it is an actual subclass of Bedrock's `Player`. It uses the normal player rendering path and can navigate, turn to look at a child, speak under its own name, carry selected items, and place or interact with blocks as a player.
 
-The embodiment does not need a second Xbox/Microsoft account. It requires a Beta-APIs-enabled world and the pre-release GameTest Script API. The original Astral Workshop Wizard skin is a standard 64x64 classic-arm skin under `bedrock/skin_packs/mc_wizard`; it intentionally replaces the old fake hat-and-robe shell. Run `npm run package:skin` to create `dist/mc-wizard-skin.mcpack` for Bedrock's Classic Skins picker. Applying that selected skin to a server-created `SimulatedPlayer` is a separate live Script API acceptance test and is not claimed as working yet.
+The embodiment does not need a second Xbox/Microsoft account. It requires a Beta-APIs-enabled world and the pre-release GameTest Script API. The original Astral Workshop Wizard skin is a standard 64x64 classic-arm skin under `bedrock/skin_packs/mc_wizard`; it intentionally replaces the old fake hat-and-robe shell. Run `npm run package:skin` to create `dist/mc-wizard-skin.mcpack` for Bedrock's Classic Skins picker.
+
+Bedrock does not automatically apply an installed skin pack to a server-created `SimulatedPlayer`. An operator can live-test the experimental skin-copy API by temporarily wearing Astral Workshop Wizard and chatting `wiz, copy my skin`. MC Wizard keeps copied skin data until the server restarts. The documented API exposes Character Creator pieces, arm size, and skin color, but not classic PNG texture bytes, so the command reports when Bedrock leaves a classic skin unavailable instead of claiming success.
 
 ![Astral Workshop Wizard skin preview](docs/assets/mc-wizard-skin-preview.png)
 
 Address the character in chat:
 
 - `wizard, <question or request>` asks a knowledge or build question.
+- `wizard, copy my skin` lets an operator test copying their current Character Creator look to MC Wizard.
 - `wizard, come here` asks MC Wizard to walk to the speaker and face them.
 - `wizard, stay` stops its current movement.
 
