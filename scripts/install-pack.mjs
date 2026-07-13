@@ -48,8 +48,12 @@ if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new Error("Brain UR
 const token = process.env.BRIDGE_TOKEN || "dev-only-change-me";
 const e2eEnabled = process.env.MC_WIZARD_E2E === "1";
 const e2eRun = (process.env.MC_WIZARD_E2E_RUN || "").trim();
+const e2eScope = (process.env.MC_WIZARD_E2E_SCOPE || "full").trim();
 if (e2eEnabled && !e2eRun) {
   throw new Error("MC_WIZARD_E2E_RUN is required when MC_WIZARD_E2E=1");
+}
+if (!new Set(["full", "machines", "arbitrary", "child"]).has(e2eScope)) {
+  throw new Error("MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, or child");
 }
 const loopbackBrain = parsedUrl.hostname === "localhost"
   || parsedUrl.hostname === "[::1]"
@@ -116,6 +120,7 @@ await writeFile(path.join(configTarget, "variables.json"), `${JSON.stringify({
   mc_wizard_url: brainUrl,
   mc_wizard_e2e: e2eEnabled,
   mc_wizard_e2e_run: e2eRun,
+  mc_wizard_e2e_scope: e2eScope,
 }, null, 2)}\n`);
 await writeFile(path.join(configTarget, "secrets.json"), `${JSON.stringify({
   mc_wizard_authorization: `Bearer ${token}`,

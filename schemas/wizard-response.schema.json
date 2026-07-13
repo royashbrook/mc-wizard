@@ -1,0 +1,251 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["answer", "action"],
+  "properties": {
+    "answer": { "type": "string", "minLength": 1 },
+    "action": {
+      "anyOf": [
+        { "type": "null" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "id", "version"],
+          "properties": {
+            "type": { "type": "string", "const": "place_blueprint" },
+            "id": { "type": "string", "enum": ["copper_bulb_t_flip_flop", "binary_adder_2bit", "automated_chicken_farm", "two_by_two_piston_door", "item_sorter", "automatic_smelter"] },
+            "version": { "type": "integer", "const": 1 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "version", "plan"],
+          "properties": {
+            "type": { "type": "string", "const": "build_machine" },
+            "version": { "type": "integer", "const": 1 },
+            "plan": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["title", "kind", "placements", "interactions"],
+              "properties": {
+                "title": { "type": "string" },
+                "kind": { "type": "string" },
+                "placements": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 96,
+                  "items": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["itemId", "target", "support", "orientationTarget"],
+                        "properties": {
+                          "itemId": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
+                          "target": { "$ref": "#/$defs/vector" },
+                          "support": { "$ref": "#/$defs/vector" },
+                          "orientationTarget": {
+                            "anyOf": [
+                              { "type": "null" },
+                              { "$ref": "#/$defs/vector" }
+                            ]
+                          }
+                        }
+                      },
+                      {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["action", "target"],
+                        "properties": {
+                          "action": { "type": "string", "const": "break" },
+                          "target": { "$ref": "#/$defs/vector" }
+                        }
+                      }
+                    ]
+                  }
+                },
+                "interactions": {
+                  "type": "array",
+                  "maxItems": 12,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["action", "itemId", "block", "faceTarget"],
+                    "properties": {
+                      "action": { "type": "string", "const": "use_item_on_block" },
+                      "itemId": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
+                      "block": { "$ref": "#/$defs/vector" },
+                      "faceTarget": { "$ref": "#/$defs/vector" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "version", "plan"],
+          "properties": {
+            "type": { "type": "string", "const": "build_structure" },
+            "version": { "type": "integer", "const": 1 },
+            "plan": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["title", "kind", "dimensions", "materials", "features", "phases", "primitives"],
+              "properties": {
+                "title": { "type": "string" },
+                "kind": { "type": "string" },
+                "dimensions": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["width", "depth", "height"],
+                  "properties": {
+                    "width": { "type": "integer", "minimum": 1, "maximum": 128 },
+                    "depth": { "type": "integer", "minimum": 1, "maximum": 128 },
+                    "height": { "type": "integer", "minimum": 1, "maximum": 64 }
+                  }
+                },
+                "materials": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["primary", "accent", "roof"],
+                  "properties": {
+                    "primary": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
+                    "accent": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
+                    "roof": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" }
+                  }
+                },
+                "features": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": { "type": "string", "enum": ["floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers", "supports", "walkway", "railings"] }
+                },
+                "phases": {
+                  "type": "array",
+                  "minItems": 4,
+                  "maxItems": 4,
+                  "items": { "type": "string", "enum": ["foundation", "shell", "roof", "details"] }
+                },
+                "primitives": {
+                  "type": "array",
+                  "minItems": 4,
+                  "maxItems": 96,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["shape", "phase", "blockId", "from", "to"],
+                    "properties": {
+                      "shape": { "type": "string", "enum": ["box", "line"] },
+                      "phase": { "type": "string", "enum": ["foundation", "shell", "roof", "details"] },
+                      "blockId": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
+                      "from": { "$ref": "#/$defs/vector" },
+                      "to": { "$ref": "#/$defs/vector" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "version", "plan"],
+          "properties": {
+            "type": { "type": "string", "const": "build_plan" },
+            "version": { "type": "integer", "const": 1 },
+            "plan": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["title", "blocks"],
+              "properties": {
+                "title": { "type": "string" },
+                "blocks": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 128,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["target", "support", "itemId"],
+                    "properties": {
+                      "target": { "$ref": "#/$defs/vector" },
+                      "support": { "$ref": "#/$defs/vector" },
+                      "itemId": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "version", "itemId"],
+          "properties": {
+            "type": { "type": "string", "const": "show_recipe" },
+            "version": { "type": "integer", "const": 1 },
+            "itemId": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "version", "time", "weather"],
+          "properties": {
+            "type": { "type": "string", "const": "world_control" },
+            "version": { "type": "integer", "const": 1 },
+            "time": { "type": ["string", "null"], "enum": ["day", "night", "noon", "midnight", null] },
+            "weather": { "type": ["string", "null"], "enum": ["clear", "rain", "thunder", null] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "version", "items"],
+          "properties": {
+            "type": { "type": "string", "const": "give_items" },
+            "version": { "type": "integer", "const": 1 },
+            "items": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 16,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["itemId", "amount"],
+                "properties": {
+                  "itemId": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
+                  "amount": { "type": "integer", "minimum": 1, "maximum": 64 }
+                }
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "id", "version"],
+          "properties": {
+            "type": { "type": "string", "const": "command_lesson" },
+            "id": { "type": "string", "enum": ["hello", "give_self"] },
+            "version": { "type": "integer", "const": 1 }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "vector": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "items": { "type": "integer" }
+    }
+  }
+}

@@ -10,6 +10,8 @@ const port = Number(process.env.MTOK_PORT) || 8790;
 const provider = process.env.MTOK_PROVIDER || "claude";
 const model = process.env.MTOK_MODEL || (provider === "codex" ? "gpt-5.5" : provider);
 const timeoutMs = Math.min(Math.max(Number(process.env.MTOK_TIMEOUT_MS) || 18_000, 5_000), 30_000);
+const wizardSchema = path.resolve("schemas/wizard-response.schema.json");
+const generalSchema = path.resolve("schemas/general-response.schema.json");
 let queue = Promise.resolve();
 const grokEnv = provider === "grok" ? isolatedGrokEnvironment() : process.env;
 const upstream = provider === "ollama"
@@ -84,6 +86,7 @@ function claudeUpstream(payload) {
 
 function codexUpstream(payload) {
   const { systemPrompt, prompt } = cliInput(payload);
+  const outputSchema = systemPrompt.includes("You are MC Wizard:") ? wizardSchema : generalSchema;
   return new Promise((resolve, reject) => {
     const startedAt = Date.now();
     const child = spawn("codex", [
@@ -97,6 +100,8 @@ function codexUpstream(payload) {
       "--disable", "shell_tool",
       "--disable", "apps",
       "--disable", "multi_agent",
+      "--output-schema", outputSchema,
+      "--config", 'model_reasoning_effort="none"',
       "--model", model,
       "-",
     ], { cwd: "/private/tmp", env: process.env, stdio: ["pipe", "pipe", "pipe"] });

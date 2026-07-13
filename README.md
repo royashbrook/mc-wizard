@@ -27,7 +27,7 @@ Ask `wizard, build me something that changes every time I press a button` and th
 - OpenAI Responses API support and an OpenAI-compatible Chat Completions mode for other providers.
 - A current Bedrock 26.30+ behavior pack using `@minecraft/server`, `@minecraft/server-gametest`, `@minecraft/server-net`, and `@minecraft/server-admin`.
 - A visible, server-created MC Wizard based on Bedrock's official [`SimulatedPlayer`](https://learn.microsoft.com/en-us/minecraft/creator/scriptapi/minecraft/server-gametest/simulatedplayer?view=minecraft-bedrock-experimental), which extends `Player` and can walk, look, chat, hold items, and perform player block interactions.
-- Two real build actions performed through the embodied wizard's player APIs: a bounded copper-bulb T flip-flop and a two-bit redstone calculator.
+- Embodied build actions for arbitrary bounded structures, houses, recipe displays, farms, common redstone machines, a copper-bulb T flip-flop, and a two-bit calculator.
 - A safe action boundary: model prose cannot become commands or JavaScript. Fixed skills and bounded validated build plans are the only executable output.
 - A loopback-only operator desk for live AI tuning, health, Bedrock console commands, logs, and browser-based dialogue tests.
 - Journaled snapshots, rollback on failure/disconnect/restart, recent-build protection, and `wizard undo`.
@@ -256,6 +256,23 @@ The pack can run its real chat-to-build path without an Xbox login. With the bra
 ```bash
 npm run test:e2e:bds
 ```
+
+For a shorter live acceptance focused only on the three common redstone machines:
+
+```bash
+npm run test:e2e:machines
+```
+
+That run has Test Kid close and reopen the 2x2 piston door, waits for the automatic smelter to deliver an iron ingot, and confirms the item sorter sends a diamond and a feather to different output chests. It checks real blocks, inventories, hopper directions, and redstone movement rather than chat text.
+
+Two additional focused runs cover the open-ended child experience without rerunning the whole suite:
+
+```bash
+npm run test:e2e:arbitrary
+npm run test:e2e:child
+```
+
+The arbitrary run verifies an unusual exact-size structure rather than a canned prototype. The child run verifies a sized house, working chicken farm, contextual time and weather, physical item delivery, and an in-world recipe lesson.
 
 It bootstraps a fresh Beta-APIs world under a unique `runtime/e2e/<run-id>` data root, launches a unique Apple container with no published port, and always stops/deletes that container. A passing world is deleted; a failing world is retained for diagnosis. Raw BDS output is saved to ignored `runtime/e2e-last.log`.
 

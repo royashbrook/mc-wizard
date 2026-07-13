@@ -5,6 +5,7 @@ ROOT=$(pwd -P)
 WORLD_NAME="mc-wizard-e2e"
 IMAGE="docker.io/itzg/minecraft-bedrock-server@sha256:45c8f292b289659c0be469b2eaaebfc1fbfefdf5c060a0df5ed53fe9e2e7c563"
 RUN_ID=$(openssl rand -hex 12)
+E2E_SCOPE=${MC_WIZARD_E2E_SCOPE:-full}
 DATA="$ROOT/runtime/e2e/$RUN_ID"
 WORLD="$DATA/worlds/$WORLD_NAME/level.dat"
 BOOT_NAME="mc-wizard-e2e-bootstrap-$RUN_ID"
@@ -16,6 +17,10 @@ LOG_PID=
 
 if [ ! -f "$ROOT/package.json" ]; then
   echo "Run from the MC Wizard repository root." >&2
+  exit 1
+fi
+if [ "$E2E_SCOPE" != "full" ] && [ "$E2E_SCOPE" != "machines" ] && [ "$E2E_SCOPE" != "arbitrary" ] && [ "$E2E_SCOPE" != "child" ]; then
+  echo "MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, or child." >&2
   exit 1
 fi
 if ! command -v container >/dev/null 2>&1; then
@@ -71,6 +76,7 @@ container run --detach \
   --env EULA=TRUE \
   --env VERSION=1.26.33.2 \
   --env LEVEL_NAME="$WORLD_NAME" \
+  --env LEVEL_TYPE=FLAT \
   --env GAMEMODE=creative \
   --env FORCE_GAMEMODE=true \
   --env DIFFICULTY=peaceful \
@@ -95,7 +101,7 @@ container delete "$BOOT_NAME" >/dev/null
 BOOT_CREATED=0
 python3 "$ROOT/scripts/enable-beta-apis.py" "$WORLD" >/dev/null
 
-MC_WIZARD_E2E=1 MC_WIZARD_E2E_RUN="$RUN_ID" npm run install:pack -- \
+MC_WIZARD_E2E=1 MC_WIZARD_E2E_RUN="$RUN_ID" MC_WIZARD_E2E_SCOPE="$E2E_SCOPE" npm run install:pack -- \
   "$DATA" "$WORLD_NAME" "$BRAIN_URL" >/dev/null
 
 CREATED=1
@@ -109,6 +115,7 @@ container run --detach \
   --env VERSION=1.26.33.2 \
   --env SERVER_NAME="MC Wizard E2E" \
   --env LEVEL_NAME="$WORLD_NAME" \
+  --env LEVEL_TYPE=FLAT \
   --env GAMEMODE=creative \
   --env FORCE_GAMEMODE=true \
   --env DIFFICULTY=peaceful \
@@ -129,7 +136,8 @@ mkfifo "$FIFO"
 ) >"$FIFO" &
 LOG_PID=$!
 result=0
-MC_WIZARD_E2E_RUN="$RUN_ID" E2E_TIMEOUT_MS=1800000 E2E_LOG_FILE="$ROOT/runtime/e2e-last.log" \
+if [ "$E2E_SCOPE" = "arbitrary" ]; then E2E_TIMEOUT_MS=300000; else E2E_TIMEOUT_MS=1800000; fi
+MC_WIZARD_E2E_RUN="$RUN_ID" E2E_TIMEOUT_MS="$E2E_TIMEOUT_MS" E2E_LOG_FILE="$ROOT/runtime/e2e-last.log" \
   node scripts/wait-e2e.mjs <"$FIFO" || result=$?
 kill "$LOG_PID" >/dev/null 2>&1 || true
 LOG_PID=
