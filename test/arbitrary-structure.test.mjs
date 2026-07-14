@@ -152,8 +152,10 @@ test("preserves a provider-authored shape while appending a follow-up detail", (
   const plan = validateBuildStructurePlan(action.plan);
   assert.equal(plan.mode, "modify");
   assert.deepEqual(plan.primitives.slice(0, customPlan.primitives.length), customPlan.primitives);
-  assert.ok(plan.primitives.length > customPlan.primitives.length);
-  assert.equal(plan.primitives.filter(({ phase }) => phase === "details").length, 4);
+  const balcony = plan.primitives.slice(customPlan.primitives.length);
+  assert.ok(balcony.length >= 6);
+  assert.ok(balcony.every(({ phase }) => phase === "details"));
+  assert.ok(balcony.some(({ from, to }) => from[2] < 0 || to[2] < 0));
 });
 
 test("an expansion removes only the wizard's obsolete exterior shell and roof", () => {
@@ -194,6 +196,26 @@ test("an expansion removes only the wizard's obsolete exterior shell and roof", 
   assert.ok(shrinkCleanup.some(({ from, to }) => from[1] === 0 && to[1] === 0));
   assert.ok(shrinkCleanup.some(({ from, to }) => from[2] === 4 && to[2] === 4));
   assert.ok(shrinkCleanup.some(({ from, to }) => from[1] === 2 && to[1] === 2));
+});
+
+test("a full same-size build removes every first-pass marker before rebuilding", () => {
+  const firstPass = {
+    ...customPlan,
+    title: "First pass dragon statue",
+  };
+  const markerOperations = [
+    { phase: "foundation", blockId: "minecraft:green_concrete", from: [0, 0, 0], to: [11, 0, 0] },
+    { phase: "shell", blockId: "minecraft:green_concrete", from: [0, 0, 0], to: [0, 0, 7] },
+    { phase: "roof", blockId: "minecraft:green_concrete", from: [0, 0, 0], to: [0, 9, 0] },
+    { phase: "details", blockId: "minecraft:light_blue_concrete", from: [11, 0, 7], to: [11, 0, 7] },
+  ];
+  const cleanup = obsoleteExpansionOperations(firstPass, customPlan, markerOperations);
+  assert.ok(markerOperations.every((marker) => cleanup.some((operation) => (
+    operation.replaceBlockId === marker.blockId
+    && operation.from.every((coordinate, axis) => coordinate === marker.from[axis])
+    && operation.to.every((coordinate, axis) => coordinate === marker.to[axis])
+  ))));
+  assert.ok(cleanup.every(({ phase, blockId }) => phase === "cleanup" && blockId === "minecraft:air"));
 });
 
 test("asks the model for an unusual exact-size structure instead of making a generic box", async () => {
@@ -278,6 +300,63 @@ test("runtime replaces an unusual provider structure that omits authored primiti
   assert.equal(result.action.plan.kind, "dragon statue");
   assert.deepEqual(result.action.plan.dimensions, { width: 12, depth: 8, height: 10 });
   assert.ok(result.action.plan.primitives.length >= 4);
+});
+
+test("rejects a line-only provider scaffold that only names the requested subject", async () => {
+  const scaffold = {
+    ...customPlan,
+    title: "Fake Dragon", kind: "dragon statue",
+    primitives: [
+      { shape: "line", phase: "foundation", blockId: "minecraft:stone", from: [0, 0, 3], to: [11, 0, 3] },
+      { shape: "line", phase: "shell", blockId: "minecraft:green_concrete", from: [5, 4, 0], to: [5, 4, 7] },
+      { shape: "line", phase: "roof", blockId: "minecraft:lime_concrete", from: [5, 0, 3], to: [5, 9, 3] },
+      { shape: "box", phase: "details", blockId: "minecraft:white_concrete", from: [5, 7, 2], to: [5, 7, 2] },
+    ],
+  };
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "I’ll build the complete dragon now.",
+      action: { type: "build_structure", version: 1, plan: scaffold },
+    }) } }] }), { status: 200 }),
+  });
+  const result = await wizard.ask({ player: "ScaffoldKid", question: "Build a 12x8x10 dragon statue" });
+  assert.equal(result.mode, "local-structure-fallback");
+  assert.notDeepEqual(result.action.plan.primitives, validateBuildStructurePlan(scaffold).primitives);
+  assert.ok(result.action.plan.primitives.some(({ shape, from, to }) => (
+    shape === "box" && from.every((coordinate, axis) => to[axis] > coordinate)
+  )));
+});
+
+test("rejects a generic full-envelope room labeled as a sculpture", async () => {
+  const fakeDuck = {
+    title: "Giant Rubber Duck", kind: "giant rubber duck",
+    dimensions: { width: 11, depth: 7, height: 6 },
+    materials: {
+      primary: "minecraft:yellow_concrete", accent: "minecraft:orange_concrete", roof: "minecraft:yellow_concrete",
+    },
+    features: ["supports"], phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:yellow_concrete", from: [0, 0, 0], to: [10, 0, 6] },
+      { shape: "hollow_box", phase: "shell", blockId: "minecraft:yellow_concrete", from: [0, 0, 0], to: [10, 5, 6] },
+      { shape: "box", phase: "roof", blockId: "minecraft:yellow_concrete", from: [0, 5, 0], to: [10, 5, 6] },
+      { shape: "box", phase: "details", blockId: "minecraft:orange_concrete", from: [5, 3, 6], to: [5, 3, 6] },
+    ],
+  };
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "I’ll build the whole duck now.",
+      action: { type: "build_structure", version: 1, plan: fakeDuck },
+    }) } }] }), { status: 200 }),
+  });
+  const result = await wizard.ask({ player: "RoomDuckKid", question: "Build me an 11x7x6 giant rubber duck" });
+  assert.notEqual(result.mode, "chat:model");
+  assert.notDeepEqual(result.action?.plan?.primitives, validateBuildStructurePlan(fakeDuck).primitives);
+  assert.equal(result.goal.status, "active");
 });
 
 test("wires a bounded live scope that verifies an exact-size dragon in the world", () => {

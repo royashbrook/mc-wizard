@@ -22,7 +22,6 @@ import {
   expansionClearOperations,
   obsoleteExpansionOperations,
   primitiveStructureOperations,
-  STRUCTURE_LIMITS,
   STRUCTURE_PRIMITIVE_LIMIT,
   validateBuildStructurePlan,
 } from "./build-structure.js";
@@ -31,7 +30,7 @@ import { createAutomaticChickenFarmBlueprint } from "./chicken-farm.js";
 import { commandLesson } from "./command-lessons.js";
 import { createItemSorterBlueprint } from "./item-sorter.js";
 import { createAutomaticKelpFarmBlueprint } from "./kelp-farm.js";
-import { machineBlueprint } from "./machine-plan.js";
+import { foldPlacementSteps, machineBlueprint } from "./machine-plan.js";
 import { createTwoByTwoPistonDoorBlueprint } from "./piston-door.js";
 import { createRecipeDisplay } from "./recipe-display.js";
 import { createAutomaticWoolFarmBlueprint } from "./wool-farm.js";
@@ -87,6 +86,7 @@ const pendingActionReports = new Map();
 const actionReportsByToken = new Map();
 const lastUndo = new Map();
 const lastStructures = new Map();
+const lastProjects = new Map();
 const placementRetries = new Map();
 const buildRetryNotices = new Set();
 const preparedPlacements = new Set();
@@ -95,10 +95,38 @@ const TRANSACTION_JOURNAL = "mcwizard:active_transaction";
 const UNDO_RETENTION_TICKS = 20 * 60 * 10;
 const WORKSHOP_COUNTER = "mcwizard:workshop_counter";
 const WORKSHOP_TICKING_AREA = "mc_wizard_workshop";
+const TRAVEL_TICKING_AREA = "mc_wizard_travel";
+const E2E_TRAVEL_FAULT_PROPERTY = "mcwizard:e2e_travel_fault";
 const LAST_STRUCTURES = "mcwizard:last_structures";
+const LAST_PROJECTS = "mcwizard:last_projects";
+const PROJECT_PLACEMENT_LIMIT = 128;
+const PROJECT_INTERACTION_LIMIT = 24;
+const PROJECT_COORDINATE_LIMIT = 64;
+const TRAVEL_PARTY_DISTANCE_SQUARED = 16 * 16;
+const TRAVEL_DIMENSIONS = Object.freeze({
+  overworld: { id: "minecraft:overworld", name: "overworld", label: "Overworld" },
+  nether: { id: "minecraft:nether", name: "nether", label: "Nether" },
+  the_end: { id: "minecraft:the_end", name: "the_end", label: "End" },
+});
+const TRAVEL_GROUND_HAZARDS = new Set([
+  "minecraft:campfire",
+  "minecraft:cactus",
+  "minecraft:fire",
+  "minecraft:lava",
+  "minecraft:magma",
+  "minecraft:powder_snow",
+  "minecraft:soul_campfire",
+]);
 const STRUCTURE_ENTITY_ITEMS = Object.freeze({
   "minecraft:villager_v2": "minecraft:villager_spawn_egg",
 });
+// Entity spawns can be visible for a tick and then disappear if the target is
+// blocked or the mob walks out. Require five seconds of aggregate presence
+// before the structure is allowed to report completion.
+const STRUCTURE_ENTITY_STABLE_POLLS = 20;
+const STRUCTURE_ENTITY_REACH_POLLS = 20;
+const MAX_BULK_STRUCTURE_RETRIES = 8;
+const MAX_STRUCTURE_POST_RETRIES = 120;
 const GENERATED_STRUCTURE_KINDS = new Set([
   "castle", "house", "tower", "bridge", "barn", "base", "shop", "school", "wall", "monument",
 ]);
@@ -119,6 +147,7 @@ let buildMovement;
 let activeTransaction;
 let lastAmbientTick = 0;
 let learnedWizardSkin;
+const lastCompletedBuildTokens = new Map();
 
 function variable(name, fallback) {
   try {
@@ -139,8 +168,64 @@ function secret(name) {
 const WIZARD_URL = variable("mc_wizard_url", "http://host.docker.internal:3000/v1/ask");
 const AUTHORIZATION = secret("mc_wizard_authorization");
 
+function actionResultRetry(value) {
+  if (!value || typeof value !== "object" || typeof value.question !== "string") return undefined;
+  const question = value.question.trim();
+  const goalId = typeof value.goalId === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(value.goalId)
+    ? value.goalId : undefined;
+  if (!question || question.length > 500
+    || !goalId
+    || (value.reason !== "failed-action" && value.reason !== "staged-progress")) return undefined;
+  return { question, reason: value.reason, goalId };
+}
+
+function hasNewerAction(playerId, requestId) {
+  const pending = pendingActionReports.get(playerId);
+  if (pending && pending.requestId !== requestId) return true;
+  return [...actionReportsByToken.values()].some((active) => (
+    active.playerId === playerId && active.requestId !== requestId
+  ));
+}
+
+function withCurrentActionPlayer(report, callback) {
+  system.run(() => {
+    const player = (report.playerId ? playerById(report.playerId) : undefined)
+      || humanPlayers().find((candidate) => candidate.name === report.playerName);
+    if (!player) return;
+    const questionKey = `${player.id}:wizard`;
+    if (pendingQuestions.has(questionKey) || hasNewerAction(player.id, report.requestId)) {
+      console.warn(`[MC Wizard] skipped automatic continuation for ${report.requestId}: newer player work exists`);
+      return;
+    }
+    callback(player, questionKey);
+  });
+}
+
+function scheduleActionResultRetry(report, retry) {
+  withCurrentActionPlayer(report, (player, questionKey) => {
+    const retryToken = ++nextQuestionToken;
+    pendingQuestions.set(questionKey, retryToken);
+    speak(player, retry.reason === "failed-action"
+      ? "That attempt didn’t hold, but our goal is still active. I’m revising the plan and trying again now."
+      : "That first pass is in place and our goal is still active. I’m planning the next part now.");
+    system.runTimeout(() => {
+      if (pendingQuestions.get(questionKey) !== retryToken) return;
+      const current = playerById(player.id);
+      if (!current || hasNewerAction(player.id, report.requestId)) {
+        pendingQuestions.delete(questionKey);
+        return;
+      }
+      void askBackend(player.id, retry.question, "wizard", 0, retryToken, retry.goalId);
+    }, 40);
+  });
+}
+
 async function postActionResult(report, status, detail) {
   if (!report?.requestId) return;
+  const actionPlayer = (report.playerId ? playerById(report.playerId) : undefined)
+    || humanPlayers().find((candidate) => candidate.name === report.playerName);
+  const context = status === "completed" && actionPlayer
+    ? liveWorldSnapshot(actionPlayer) : undefined;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
       const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/action-result"))
@@ -150,6 +235,7 @@ async function postActionResult(report, status, detail) {
           requestId: report.requestId,
           status,
           ...(detail ? { detail: String(detail).slice(0, 240) } : {}),
+          ...(context ? { context } : {}),
         }))
         .addHeader("Content-Type", "application/json");
       if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
@@ -157,7 +243,60 @@ async function postActionResult(report, status, detail) {
       if (response.status < 200 || response.status >= 300) {
         throw new Error(`brain returned HTTP ${response.status}`);
       }
+      const result = JSON.parse(response.body || "{}");
       console.warn(`[MC Wizard] action ${report.requestId} ${status}`);
+      const terminal = status === "completed" || status === "failed";
+      const abandoned = /\b(?:superseded|player left|all players left|server stopp)/i.test(detail || "");
+      if (!terminal || result.updated === false || abandoned
+        || result.superseded || result.replan?.superseded) return;
+      if (result.reviewLimitReached || result.retryLimitReached) {
+        withCurrentActionPlayer(report, (player) => speak(
+          player,
+          "Our goal is still active, but I’ve reached my automatic retry limit. Come take a look and tell me what to change; I’ll continue from there.",
+        ));
+        return;
+      }
+      const executableReplan = result.replan?.action && result.replan?.requestId
+        && typeof result.replan.requestId === "string"
+        && /^[a-zA-Z0-9_-]{1,64}$/.test(result.replan.requestId);
+      if (executableReplan) {
+        const replan = result.replan;
+        const player = actionPlayer
+          || humanPlayers().find((candidate) => candidate.name === report.playerName);
+        if (!player) {
+          console.warn(`[MC Wizard] could not apply replan ${replan.requestId}: player ${report.playerName} left`);
+          return;
+        }
+        system.run(() => {
+          if (!playerById(player.id)) {
+            console.warn(`[MC Wizard] could not apply replan ${replan.requestId}: player ${report.playerName} left`);
+            return;
+          }
+          if (pendingQuestions.has(`${player.id}:wizard`)
+            || hasNewerAction(player.id, report.requestId)) {
+            console.warn(`[MC Wizard] skipped automatic replan ${replan.requestId}: newer player work exists`);
+            return;
+          }
+          applyResponse(player.id, replan, status === "failed"
+            ? "automatic retry after an in-world action failed"
+            : "automatic continuation after checking the active goal");
+        });
+        return;
+      }
+      const retry = actionResultRetry(result.retry);
+      if (result.retry && !retry) {
+        console.warn(`[MC Wizard] ignored invalid action-result retry for ${report.requestId}`);
+      }
+      if (retry) {
+        scheduleActionResultRetry(report, retry);
+      } else if (status === "failed") {
+        withCurrentActionPlayer(report, (player) => speak(
+          player,
+          "That attempt didn’t hold, but our goal is still active. Tell me what to change and I’ll keep working from here.",
+        ));
+      } else if (result.reviewDeferred || result.review?.goal?.status === "active") {
+        withCurrentActionPlayer(report, (player) => speak(player, "I’ve finished this pass and kept our project active. Come take a look—tell me what to change, and I’ll keep working on this same build."));
+      }
       return;
     } catch (error) {
       if (attempt === 2) {
@@ -233,18 +372,37 @@ function bindBuildAction(player, token, structureRecord, claim) {
   return true;
 }
 
+function bindBuildProject(player, token, projectRecord) {
+  actionReportsByToken.set(token, {
+    ...(actionReportsByToken.get(token) || { playerId: player.id, playerName: player.name }),
+    projectRecord,
+  });
+}
+
 function endBuildAction(token, status, detail) {
   const report = actionReportsByToken.get(token);
   if (!report) return;
   actionReportsByToken.delete(token);
+  if (status === "completed" && report.playerId) lastCompletedBuildTokens.set(report.playerId, token);
   if (status === "completed" && report.structureRecord) {
     rememberLastStructure({ name: report.playerName }, report.structureRecord);
+  }
+  if (status === "completed" && report.projectRecord) {
+    rememberLastProject({ name: report.playerName }, report.projectRecord);
   }
   void postActionResult(report, status, detail);
 }
 
 function structurePlayerKey(player) {
   return player.name.trim().toLowerCase();
+}
+
+function newStructureInhabitantTag(token) {
+  return `mcwizard_inhabitant_${Date.now().toString(36)}_${token}`;
+}
+
+function validStructureInhabitantTag(value) {
+  return typeof value === "string" && /^mcwizard_inhabitant_[a-z0-9_]{1,64}$/.test(value);
 }
 
 function lastStructurePropertyId(player) {
@@ -260,6 +418,155 @@ function validStructureVector(value, vertical = false) {
   if (!value || !Number.isInteger(value.x) || !Number.isInteger(value.z)) return false;
   if (vertical && !Number.isInteger(value.y)) return false;
   return vertical || (Math.abs(value.x) + Math.abs(value.z) === 1);
+}
+
+function lastProjectPropertyId(player) {
+  let hash = 2166136261;
+  for (const character of structurePlayerKey(player)) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${LAST_PROJECTS}:${(hash >>> 0).toString(36)}`;
+}
+
+function projectVector(value) {
+  if (!Array.isArray(value) || value.length !== 3 || !value.every(Number.isInteger)) return undefined;
+  if (value.some((coordinate) => Math.abs(coordinate) > PROJECT_COORDINATE_LIMIT)) return undefined;
+  return [...value];
+}
+
+function projectText(value, fallback, maxLength) {
+  const cleaned = String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, maxLength);
+  return cleaned || fallback;
+}
+
+function projectItemId(value) {
+  const itemId = String(value || "").trim().slice(0, 96);
+  return /^[a-z0-9_.-]+:[a-z0-9_./-]+$/i.test(itemId) ? itemId : undefined;
+}
+
+function projectBlueprintSummary(blueprint) {
+  const placements = [];
+  for (const placement of foldPlacementSteps(blueprint?.placements)) {
+    if (placements.length >= PROJECT_PLACEMENT_LIMIT) break;
+    const itemId = projectItemId(placement?.itemId);
+    const target = projectVector(placement?.target);
+    const support = projectVector(placement?.support || placement?.facingTarget);
+    if (!itemId || !target || !support) continue;
+    const expectedType = Array.isArray(placement.expectedType)
+      ? placement.expectedType[0] : placement.expectedType;
+    placements.push({
+      itemId,
+      typeId: projectItemId(placement.typeId || expectedType) || itemId,
+      target,
+      support,
+      orientationTarget: projectVector(placement.orientationTarget || placement.facingTarget) || null,
+    });
+  }
+
+  const interactions = [];
+  for (const interaction of [
+    ...(blueprint?.preInteractions || []),
+    ...(blueprint?.interactions || []),
+  ]) {
+    if (interactions.length >= PROJECT_INTERACTION_LIMIT) break;
+    const action = projectText(interaction?.action, "", 32);
+    const itemId = projectItemId(interaction?.itemId);
+    const block = projectVector(interaction?.block);
+    const faceTarget = projectVector(interaction?.faceTarget);
+    if (!action || !itemId || !block || !faceTarget) continue;
+    interactions.push({ action, itemId, block, faceTarget });
+  }
+
+  const suppliedMin = projectVector(blueprint?.bounds?.min);
+  const suppliedMax = projectVector(blueprint?.bounds?.max);
+  const points = placements.flatMap(({ target, support, orientationTarget }) => (
+    [target, support, orientationTarget].filter(Boolean)
+  ));
+  const calculatedMin = points.length
+    ? [0, 1, 2].map((axis) => Math.min(...points.map((point) => point[axis])))
+    : [0, 0, 0];
+  const calculatedMax = points.length
+    ? [0, 1, 2].map((axis) => Math.max(...points.map((point) => point[axis])))
+    : [0, 0, 0];
+  const bounds = suppliedMin && suppliedMax
+    && suppliedMin.every((coordinate, axis) => coordinate <= suppliedMax[axis])
+    ? { min: suppliedMin, max: suppliedMax }
+    : { min: calculatedMin, max: calculatedMax };
+
+  return {
+    title: projectText(blueprint?.title, "Working Project", 64),
+    kind: projectText(blueprint?.kind || blueprint?.id, "project", 64).toLowerCase(),
+    bounds,
+    placements,
+    interactions,
+  };
+}
+
+function obsoleteProjectPlacements(previous, next) {
+  const retained = new Set(next.placements.map(({ target }) => target.join(",")));
+  return previous.placements.filter(({ target }) => !retained.has(target.join(",")));
+}
+
+function projectPlacementStillOwned(dimension, location, placement) {
+  const actual = dimension.getBlock(location)?.typeId;
+  const expected = new Set([placement.itemId, placement.typeId]);
+  if (placement.itemId === "minecraft:repeater") {
+    expected.add("minecraft:unpowered_repeater");
+    expected.add("minecraft:powered_repeater");
+  } else if (placement.itemId === "minecraft:comparator") {
+    expected.add("minecraft:unpowered_comparator");
+    expected.add("minecraft:powered_comparator");
+  } else if (placement.itemId === "minecraft:redstone") {
+    expected.add("minecraft:redstone_wire");
+  } else if (placement.itemId === "minecraft:sugar_cane") {
+    expected.add("minecraft:reeds");
+  }
+  return expected.has(actual);
+}
+
+function lastProjectFor(player) {
+  const key = structurePlayerKey(player);
+  if (lastProjects.has(key)) return lastProjects.get(key);
+  try {
+    const raw = world.getDynamicProperty(lastProjectPropertyId(player));
+    if (typeof raw !== "string" || !raw) return undefined;
+    const stored = JSON.parse(raw);
+    if (typeof stored.dimensionId !== "string"
+      || !validStructureVector(stored.origin, true)
+      || !validStructureVector(stored.forward)
+      || !validStructureVector(stored.right)) return undefined;
+    const record = {
+      ...projectBlueprintSummary(stored),
+      dimensionId: stored.dimensionId,
+      origin: { ...stored.origin },
+      forward: { ...stored.forward },
+      right: { ...stored.right },
+      updatedAt: Number(stored.updatedAt) || 0,
+    };
+    lastProjects.set(key, record);
+    return record;
+  } catch (error) {
+    console.warn(`[MC Wizard] ignored invalid saved project for ${player.name}: ${error}`);
+    return undefined;
+  }
+}
+
+function rememberLastProject(player, record) {
+  const saved = {
+    ...projectBlueprintSummary(record),
+    dimensionId: record.dimensionId,
+    origin: { ...record.origin },
+    forward: { ...record.forward },
+    right: { ...record.right },
+    updatedAt: Date.now(),
+  };
+  lastProjects.set(structurePlayerKey(player), saved);
+  try {
+    world.setDynamicProperty(lastProjectPropertyId(player), JSON.stringify(saved));
+  } catch (error) {
+    console.warn(`[MC Wizard] could not persist ${player.name}'s last project: ${error}`);
+  }
 }
 
 function lastStructureFor(player) {
@@ -289,6 +596,8 @@ function rememberLastStructure(player, record) {
     forward: { ...record.forward },
     right: { ...record.right },
     plan: record.plan,
+    ...(validStructureInhabitantTag(record.inhabitantTag)
+      ? { inhabitantTag: record.inhabitantTag } : {}),
     updatedAt: Date.now(),
   };
   lastStructures.set(structurePlayerKey(player), saved);
@@ -706,18 +1015,64 @@ function liveWorldSnapshot(player) {
 
   const previous = lastStructureFor(player);
   const primitives = completeStructurePrimitives(previous?.plan);
+  let verifiedInhabitants;
+  if (previous?.dimensionId === player.dimension.id && previous.plan.entities?.length) {
+    try {
+      const bounds = structureEntityBounds(previous.plan, previous.origin, previous.forward, previous.right);
+      const typeIds = [...new Set(previous.plan.entities.map(({ typeId }) => typeId))];
+      verifiedInhabitants = Object.fromEntries(typeIds.map((typeId) => {
+        const inside = structureEntitiesInside(player.dimension, typeId, bounds);
+        const managed = validStructureInhabitantTag(previous.inhabitantTag)
+          ? inside.filter((entity) => entityHasTag(entity, previous.inhabitantTag)) : inside;
+        return [typeId, managed.length];
+      }));
+    } catch {
+      verifiedInhabitants = undefined;
+    }
+  }
   const lastStructure = previous?.dimensionId === player.dimension.id ? {
     kind: previous.plan.kind,
     title: previous.plan.title,
     dimensions: previous.plan.dimensions,
     materials: previous.plan.materials,
     features: previous.plan.features,
+    ...(previous.plan.entities?.length ? {
+      entities: previous.plan.entities.map(({ typeId, location }) => ({
+        typeId,
+        location: [...location],
+      })),
+    } : {}),
+    ...(verifiedInhabitants ? { verifiedInhabitants } : {}),
     ...(primitives?.length ? { primitives } : {}),
     relativeOrigin: {
       x: previous.origin.x - playerPosition.x,
       y: previous.origin.y - playerPosition.y,
       z: previous.origin.z - playerPosition.z,
     },
+  } : undefined;
+  const project = lastProjectFor(player);
+  const lastProject = project?.dimensionId === player.dimension.id ? {
+    title: project.title,
+    kind: project.kind,
+    dimensionId: project.dimensionId,
+    relativeOrigin: {
+      x: project.origin.x - playerPosition.x,
+      y: project.origin.y - playerPosition.y,
+      z: project.origin.z - playerPosition.z,
+    },
+    bounds: { min: [...project.bounds.min], max: [...project.bounds.max] },
+    placements: project.placements.map(({ itemId, target, support, orientationTarget }) => ({
+      itemId,
+      target: [...target],
+      support: [...support],
+      orientationTarget: orientationTarget ? [...orientationTarget] : null,
+    })),
+    interactions: project.interactions.map(({ action, itemId, block, faceTarget }) => ({
+      action,
+      itemId,
+      block: [...block],
+      faceTarget: [...faceTarget],
+    })),
   } : undefined;
   return {
     dimension: player.dimension.id,
@@ -728,6 +1083,7 @@ function liveWorldSnapshot(player) {
     nearbyBlocks,
     nearbyEntities,
     ...(lastStructure ? { lastStructure } : {}),
+    ...(lastProject ? { lastProject } : {}),
   };
 }
 
@@ -1504,14 +1860,16 @@ function finishBuild(playerId, token, dimension, expectedBlocks, successMessage,
         + ": expected " + expected + ", got " + actual,
     );
     commitTransaction(token);
+    if (!clearBuild(token)) return;
     endBuildAction(token, "failed", `verification left ${mismatches.length} mismatched block${mismatches.length === 1 ? "" : "s"}`);
-    if (!clearBuild(token) || !player) return;
+    if (!player) return;
     speak(player, "I kept every good part standing instead of erasing your build. One enchanted piece needed a sturdier repair, and I’ve left the useful build in place for you.");
     return;
   }
   commitTransaction(token);
+  if (!clearBuild(token)) return;
   endBuildAction(token, "completed", `verified ${expectedBlocks.length} planned blocks`);
-  if (!clearBuild(token) || !player) return;
+  if (!player) return;
   console.warn("[MC Wizard] final build verification passed");
   speak(player, successMessage);
 }
@@ -1575,6 +1933,14 @@ function runBuildSteps(
   let stepComplete;
   try {
     stepComplete = steps[index]();
+    if (stepComplete === "interaction-failed") {
+      commitTransaction(token);
+      endBuildAction(token, "failed", "required player interaction could not be verified");
+      const player = playerById(playerId);
+      if (!clearBuild(token) || !player) return;
+      speak(player, "The useful build is standing, but that last interaction did not actually work. I marked it unfinished so I can redraw and retry it instead of pretending it passed.");
+      return;
+    }
     if (stepComplete !== false
       && stepComplete !== "placement-retry"
       && stepComplete !== "placement-prepare"
@@ -2020,11 +2386,22 @@ function structureOperations(plan) {
 
 function structurePlanOperations(plan) {
   const primitives = primitiveStructureOperations(plan);
-  if (!primitives.length) return structureOperations(plan);
-  if (plan.mode !== "modify" || !GENERATED_STRUCTURE_KINDS.has(plan.kind)) return primitives;
-  const phaseOrder = new Map(["foundation", "shell", "roof", "details"].map((phase, index) => [phase, index]));
-  return [...structureOperations(plan), ...primitives]
-    .sort((a, b) => phaseOrder.get(a.phase) - phaseOrder.get(b.phase));
+  let operations;
+  if (!primitives.length) operations = structureOperations(plan);
+  else if (plan.mode !== "modify" || !GENERATED_STRUCTURE_KINDS.has(plan.kind)) operations = primitives;
+  else {
+    const phaseOrder = new Map(["foundation", "shell", "roof", "details"].map((phase, index) => [phase, index]));
+    operations = [...structureOperations(plan), ...primitives]
+      .sort((a, b) => phaseOrder.get(a.phase) - phaseOrder.get(b.phase));
+  }
+  // An entity location is also a promise that the inhabitant can stand there.
+  // Provider geometry may otherwise put a hollow-box floor or room detail in
+  // the model's own spawn cell. Clear feet and headroom last, after every
+  // authored detail, while preserving the supported floor below.
+  const clearance = (plan.entities || []).map(({ location: [x, y, z] }) => (
+    structureBox("details", "minecraft:air", [x, y, z], [x, y + 1, z])
+  ));
+  return [...operations, ...clearance];
 }
 
 function worldStructureBox(origin, forward, right, operation) {
@@ -2190,7 +2567,7 @@ function phaseMessage(phase) {
   return "Finishing the doorway, windows, and useful details.";
 }
 
-function runStructurePostSteps(playerId, token, steps, complete, index = 0) {
+function runStructurePostSteps(playerId, token, steps, complete, fail, index = 0, retries = 0) {
   if (activeBuildToken !== token) return;
   if (index >= steps.length) {
     complete();
@@ -2203,13 +2580,19 @@ function runStructurePostSteps(playerId, token, steps, complete, index = 0) {
     console.warn(`[MC Wizard] structure inhabitant retry: ${error}`);
     result = false;
   }
+  if (result !== true && retries >= MAX_STRUCTURE_POST_RETRIES) {
+    fail("inhabitants could not be safely placed and verified");
+    return;
+  }
   system.runTimeout(
     () => runStructurePostSteps(
       playerId,
       token,
       steps,
       complete,
+      fail,
       result === true ? index + 1 : index,
+      result === true ? 0 : retries + 1,
     ),
     result === "placement-prepare" ? 3 : result === "placement-retry" ? 10 : result === false ? 5 : 2,
   );
@@ -2228,8 +2611,8 @@ function runBulkStructureSteps(
   if (activeBuildToken !== token) return;
   if (index >= operations.length) {
     const complete = () => {
+      if (!clearBuild(token)) return;
       endBuildAction(token, "completed", `verified all ${operations.length} structure operations`);
-      clearBuild(token);
       try {
         dimension.runCommand(`tickingarea remove ${WORKSHOP_TICKING_AREA}`);
       } catch {}
@@ -2237,7 +2620,16 @@ function runBulkStructureSteps(
       if (player) speak(player, `${title} is complete. I checked every section and inhabitant as they appeared.`);
       console.warn(`[MC Wizard] completed and verified bulk structure ${title}`);
     };
-    if (postSteps.length) runStructurePostSteps(playerId, token, postSteps, complete);
+    const fail = (detail) => {
+      if (!clearBuild(token)) return;
+      endBuildAction(token, "failed", detail);
+      try {
+        dimension.runCommand(`tickingarea remove ${WORKSHOP_TICKING_AREA}`);
+      } catch {}
+      const player = playerById(playerId);
+      if (player) speak(player, "That section won’t settle yet. I’m keeping the good work and replanning instead of leaving you waiting.");
+    };
+    if (postSteps.length) runStructurePostSteps(playerId, token, postSteps, complete, fail);
     else complete();
     return;
   }
@@ -2263,6 +2655,15 @@ function runBulkStructureSteps(
   } catch (error) {
     console.warn(`[MC Wizard] structure phase retry ${retries + 1}: ${error}`);
     if (player && retries === 0) speak(player, "One section snagged. I’m recasting that piece instead of abandoning it.");
+    if (retries >= MAX_BULK_STRUCTURE_RETRIES) {
+      if (!clearBuild(token)) return;
+      endBuildAction(token, "failed", `structure section failed after ${retries + 1} attempts`);
+      try {
+        dimension.runCommand(`tickingarea remove ${WORKSHOP_TICKING_AREA}`);
+      } catch {}
+      if (player) speak(player, "That section won’t settle yet. I’m keeping the good work and replanning instead of leaving you waiting.");
+      return;
+    }
     system.runTimeout(
       () => runBulkStructureSteps(playerId, token, dimension, operations, title, postSteps, index, retries + 1),
       Math.min(40, 5 + retries * 5),
@@ -2310,39 +2711,213 @@ function physicalStructurePlacements(operations) {
   return result;
 }
 
-function structureEntitySteps(plan, dimension, origin, forward, right) {
-  return (plan.entities || []).map(({ typeId, location }) => {
-    const target = customLocation(origin, forward, right, location);
-    const support = { x: target.x, y: target.y - 1, z: target.z };
-    const interaction = {
-      action: "use_item_on_block",
-      itemId: STRUCTURE_ENTITY_ITEMS[typeId],
-      block: location.map((coordinate, axis) => axis === 1 ? coordinate - 1 : coordinate),
-      faceTarget: location,
-      expectedEntity: typeId,
-    };
-    let used = false;
-    let attempts = 0;
-    const entityIsPresent = () => dimension.getEntities({ type: typeId }).some(({ location: current }) => (
-      current.x >= target.x && current.x < target.x + 1
-      && current.y >= target.y && current.y < target.y + 1
-      && current.z >= target.z && current.z < target.z + 1
-    ));
+function structureEntityBounds(plan, origin, forward, right) {
+  const { width, depth, height } = plan.dimensions;
+  const corners = [
+    [0, 0, 0],
+    [width - 1, 0, 0],
+    [0, 0, depth - 1],
+    [width - 1, 0, depth - 1],
+  ].map((location) => customLocation(origin, forward, right, location));
+  return {
+    minX: Math.min(...corners.map(({ x }) => x)),
+    maxX: Math.max(...corners.map(({ x }) => x)) + 1,
+    minY: origin.y,
+    maxY: origin.y + height + 1,
+    minZ: Math.min(...corners.map(({ z }) => z)),
+    maxZ: Math.max(...corners.map(({ z }) => z)) + 1,
+  };
+}
+
+function structureEntitiesInside(dimension, typeId, bounds) {
+  return dimension.getEntities({ type: typeId }).filter(({ location }) => (
+    location.x >= bounds.minX && location.x < bounds.maxX
+    && location.y >= bounds.minY && location.y < bounds.maxY
+    && location.z >= bounds.minZ && location.z < bounds.maxZ
+  ));
+}
+
+function entityHasTag(entity, tag) {
+  try {
+    return entity.hasTag(tag);
+  } catch {
+    return false;
+  }
+}
+
+function structureOverflowLocation(dimension, bounds, index = 0) {
+  const radius = 6 + index * 2;
+  const candidates = [
+    [bounds.maxX + radius, bounds.maxZ + radius],
+    [bounds.minX - radius, bounds.maxZ + radius],
+    [bounds.maxX + radius, bounds.minZ - radius],
+    [bounds.minX - radius, bounds.minZ - radius],
+  ];
+  for (const [x, z] of candidates) {
+    for (const yOffset of [0, 1, -1, 2, -2]) {
+      const feet = { x: Math.floor(x) + 0.5, y: bounds.minY + yOffset, z: Math.floor(z) + 0.5 };
+      const block = { x: Math.floor(feet.x), y: Math.floor(feet.y), z: Math.floor(feet.z) };
+      const ground = dimension.getBlock({ ...block, y: block.y - 1 });
+      const head = dimension.getBlock({ ...block, y: block.y + 1 });
+      if (ground && !SAFE_SPACE.has(ground.typeId)
+        && SAFE_SPACE.has(dimension.getBlock(block)?.typeId)
+        && SAFE_SPACE.has(head?.typeId)) return feet;
+    }
+  }
+  return undefined;
+}
+
+function structureEntityTargetIsSafe(dimension, origin, forward, right, localTarget) {
+  const target = customLocation(origin, forward, right, localTarget);
+  const support = { x: target.x, y: target.y - 1, z: target.z };
+  const head = { x: target.x, y: target.y + 1, z: target.z };
+  const feetBlock = dimension.getBlock(target);
+  const headBlock = dimension.getBlock(head);
+  const supportBlock = dimension.getBlock(support);
+  const supportIsSolid = typeof supportBlock?.isSolid === "boolean"
+    ? supportBlock.isSolid : Boolean(supportBlock && !SAFE_SPACE.has(supportBlock.typeId));
+  return Boolean(
+    feetBlock && SAFE_SPACE.has(feetBlock.typeId)
+    && headBlock && SAFE_SPACE.has(headBlock.typeId)
+    && supportIsSolid,
+  );
+}
+
+function structureEntitySteps(plan, player, origin, forward, right, inhabitantTag, previousEntities = []) {
+  const dimension = player.dimension;
+  const groups = new Map();
+  for (const entity of plan.entities || []) {
+    if (!groups.has(entity.typeId)) groups.set(entity.typeId, []);
+    groups.get(entity.typeId).push(entity.location);
+  }
+  for (const entity of previousEntities) {
+    if (!groups.has(entity.typeId)) groups.set(entity.typeId, []);
+  }
+  const bounds = structureEntityBounds(plan, origin, forward, right);
+  return [...groups].map(([typeId, locations]) => {
+    let stablePolls = 0;
+    let reachPolls = 0;
+    let warnedUnsafe = false;
     return () => {
-      if (entityIsPresent()) return true;
-      attempts += 1;
-      if (used || attempts >= 40) {
-        dimension.spawnEntity(typeId, { x: target.x + 0.5, y: target.y + 0.2, z: target.z + 0.5 });
-        console.warn(`[MC Wizard] restored missing ${typeId} at its planned room position`);
-        return true;
+      const present = structureEntitiesInside(dimension, typeId, bounds);
+      if (validStructureInhabitantTag(inhabitantTag)) {
+        for (const entity of present) {
+          if (!entityHasTag(entity, inhabitantTag)) {
+            try { entity.addTag(inhabitantTag); } catch {}
+          }
+        }
+        const allManaged = dimension.getEntities({ type: typeId })
+          .filter((entity) => entityHasTag(entity, inhabitantTag));
+        const presentIds = new Set(present.map(({ id }) => id));
+        const outsideManaged = allManaged.filter(({ id }) => !presentIds.has(id));
+        if (present.length < locations.length && outsideManaged.length) {
+          const local = locations[Math.min(present.length, locations.length - 1)];
+          if (structureEntityTargetIsSafe(dimension, origin, forward, right, local)) {
+            const target = customLocation(origin, forward, right, local);
+            try {
+              outsideManaged[0].teleport(
+                { x: target.x + 0.5, y: target.y, z: target.z + 0.5 },
+                { dimension },
+              );
+              stablePolls = 0;
+              return false;
+            } catch {}
+          }
+        }
+        const insideExcess = Math.max(0, present.length - locations.length);
+        const overflow = [
+          ...outsideManaged,
+          ...(insideExcess
+            ? present.filter((entity) => entityHasTag(entity, inhabitantTag)).slice(-insideExcess)
+            : []),
+        ];
+        if (overflow.length && present.length >= locations.length) {
+          for (let index = 0; index < overflow.length; index += 1) {
+            const destination = structureOverflowLocation(dimension, bounds, index);
+            if (!destination) return false;
+            try {
+              overflow[index].teleport(destination, { dimension });
+              overflow[index].removeTag(inhabitantTag);
+            } catch {
+              return false;
+            }
+          }
+          stablePolls = 0;
+          return false;
+        }
       }
-      const result = useItemAsWizard(dimension, interaction, origin, forward, right);
-      if (result === true) {
-        used = true;
+      if (present.length === locations.length) {
+        reachPolls = 0;
+        stablePolls += 1;
+        if (stablePolls >= STRUCTURE_ENTITY_STABLE_POLLS) {
+          console.warn(`[MC Wizard] verified ${present.length}/${locations.length} ${typeId} inhabitants remained inside the completed structure`);
+          return true;
+        }
         return false;
       }
-      if (result === false && !wizardCanReach(dimension, target, support)) return false;
-      return result;
+
+      stablePolls = 0;
+      // The plan describes the desired total, not "spawn this many more". Pick
+      // one remaining room and re-count the whole structure before another use;
+      // this keeps delayed spawn-egg results and repeated modifications from
+      // multiplying inhabitants.
+      const preferred = Math.min(present.length, locations.length - 1);
+      const candidates = [...locations.slice(preferred), ...locations.slice(0, preferred)]
+        .filter((location) => structureEntityTargetIsSafe(
+          dimension,
+          origin,
+          forward,
+          right,
+          location,
+        ));
+      const occupantsAt = (local) => {
+        const cell = customLocation(origin, forward, right, local);
+        return present.filter(({ location }) => (
+          location.x >= cell.x && location.x < cell.x + 1
+          && location.y >= cell.y && location.y < cell.y + 1
+          && location.z >= cell.z && location.z < cell.z + 1
+        )).length;
+      };
+      const localTarget = candidates.find((location) => occupantsAt(location) === 0)
+        || candidates[0];
+      if (!localTarget) {
+        if (!warnedUnsafe) {
+          warnedUnsafe = true;
+          console.warn(`[MC Wizard] waiting for a safe floor and two-block opening for ${typeId} inside the structure`);
+        }
+        return false;
+      }
+      warnedUnsafe = false;
+      const target = customLocation(origin, forward, right, localTarget);
+      const interaction = {
+        action: "use_item_on_block",
+        itemId: STRUCTURE_ENTITY_ITEMS[typeId],
+        block: localTarget.map((coordinate, axis) => axis === 1 ? coordinate - 1 : coordinate),
+        faceTarget: localTarget,
+        expectedEntity: typeId,
+        expectedEntityCount: occupantsAt(localTarget) + 1,
+      };
+      const result = useItemAsWizard(dimension, interaction, origin, forward, right);
+      if (result === false) {
+        reachPolls += 1;
+        if (reachPolls >= STRUCTURE_ENTITY_REACH_POLLS) {
+          const spawned = dimension.spawnEntity(typeId, {
+            x: target.x + 0.5,
+            y: target.y + 0.5,
+            z: target.z + 0.5,
+          });
+          if (validStructureInhabitantTag(inhabitantTag)) {
+            try { spawned.addTag(inhabitantTag); } catch {}
+          }
+          console.warn(`[MC Wizard] completed ${typeId} inhabitant placement directly after the Wizard could not reach the safe pen`);
+          reachPolls = 0;
+        }
+        return false;
+      }
+      reachPolls = 0;
+      // Even a successful API use is provisional until the entity is observable
+      // inside the structure on a later tick.
+      return result === true ? false : result;
     };
   });
 }
@@ -2353,28 +2928,9 @@ async function buildStructure(player, value) {
     plan = validateBuildStructurePlan(value);
   } catch (error) {
     console.warn(`[MC Wizard] rejected malformed structure plan: ${error}`);
-    const safeDimension = (candidate, fallback, limit) => (
-      Math.min(limit, Math.max(1, Math.floor(Number(candidate) || fallback)))
-    );
-    const kind = String(value?.kind || "structure").replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, 48)
-      || "structure";
-    plan = validateBuildStructurePlan({
-      title: `Sturdy ${kind}`,
-      kind,
-      dimensions: {
-        width: safeDimension(value?.dimensions?.width, 9, STRUCTURE_LIMITS.width),
-        depth: safeDimension(value?.dimensions?.depth, 9, STRUCTURE_LIMITS.depth),
-        height: safeDimension(value?.dimensions?.height, 5, STRUCTURE_LIMITS.height),
-      },
-      materials: {
-        primary: "minecraft:oak_planks",
-        accent: "minecraft:oak_log",
-        roof: "minecraft:spruce_planks",
-      },
-      features: ["floor", "walls", "door", "windows", "roof", "lighting"],
-      phases: ["foundation", "shell", "roof", "details"],
-    });
-    speak(player, "That blueprint arrived smudged, so I switched to a sturdy local version and kept building instead of sending you back to ask again.");
+    speak(player, "That drawing had a broken piece. I’m revising this same project now instead of pretending a wooden box is what you asked for.");
+    failPendingAction(player, `structure plan validation failed: ${String(error).slice(0, 160)}`);
+    return;
   }
   if (buildInProgress || buildPreparing) {
     queueBuild(player, (current) => buildStructure(current, value));
@@ -2416,6 +2972,8 @@ async function buildStructure(player, value) {
     forward,
     right,
     plan,
+    inhabitantTag: modifying && validStructureInhabitantTag(modificationSite.previous.inhabitantTag)
+      ? modificationSite.previous.inhabitantTag : newStructureInhabitantTag(token),
   };
   bindBuildAction(player, token, structureRecord);
   try {
@@ -2438,7 +2996,15 @@ async function buildStructure(player, value) {
   const bot = bringWizardTo(player);
   if (!bot) console.warn("[MC Wizard] structure continuing while simulated player respawns");
   lastBuildTick.set(player.id, system.currentTick);
-  const postSteps = structureEntitySteps(plan, player.dimension, site.origin, forward, right);
+  const postSteps = structureEntitySteps(
+    plan,
+    player,
+    site.origin,
+    forward,
+    right,
+    structureRecord.inhabitantTag,
+    modifying ? modificationSite.previous.plan.entities || [] : [],
+  );
   const physical = cleanupOperations.length
     || (modifying && operations.some(({ blockId }) => blockId === "minecraft:air"))
     ? undefined : physicalStructurePlacements(operations);
@@ -2527,10 +3093,46 @@ function applyExpectedBlockState(dimension, location, expectedState) {
   return block.permutation.getState(stateName) === expectedState.value;
 }
 
+function expectedBlockStateMatches(dimension, location, expectedState) {
+  if (!expectedState) return false;
+  const states = dimension.getBlock(location)?.permutation.getAllStates() || {};
+  const stateName = Object.keys(states).find((name) => (
+    name === expectedState.state || name.endsWith(`:${expectedState.state}`)
+  ));
+  return Boolean(stateName && states[stateName] === expectedState.value);
+}
+
+function interactionIsSatisfied(dimension, interaction, origin, forward, right) {
+  const block = customLocation(origin, forward, right, interaction.block);
+  const faceTarget = customLocation(origin, forward, right, interaction.faceTarget);
+  if (interaction.expectedFaceBlocks?.length) {
+    return interaction.expectedFaceBlocks.every((location) => (
+      dimension.getBlock(customLocation(origin, forward, right, location))?.typeId
+        === interaction.expectedFaceType
+    ));
+  }
+  if (interaction.expectedFaceType) {
+    return dimension.getBlock(faceTarget)?.typeId === interaction.expectedFaceType;
+  }
+  if (interaction.expectedEntity) {
+    const spawnTarget = interaction.expectedEntity === "minecraft:hopper_minecart" ? block : faceTarget;
+    const count = dimension.getEntities({ type: interaction.expectedEntity }).filter(({ location }) => (
+      location.x >= spawnTarget.x && location.x < spawnTarget.x + 1
+      && location.y >= spawnTarget.y && location.y < spawnTarget.y + 1
+      && location.z >= spawnTarget.z && location.z < spawnTarget.z + 1
+    )).length;
+    return count >= (interaction.expectedEntityCount || 1);
+  }
+  if (interaction.expectedState) {
+    return expectedBlockStateMatches(dimension, block, interaction.expectedState);
+  }
+  return false;
+}
+
 function useItemAsWizard(dimension, interaction, origin, forward, right) {
   const block = customLocation(origin, forward, right, interaction.block);
   const faceTarget = customLocation(origin, forward, right, interaction.faceTarget);
-  if (interaction.expectedFaceType && dimension.getBlock(faceTarget)?.typeId === interaction.expectedFaceType) return true;
+  if (interactionIsSatisfied(dimension, interaction, origin, forward, right)) return true;
   const retryKey = `interact:${block.x},${block.y},${block.z}:${interaction.itemId}`;
   if (!positionWizardForBuild(dimension, faceTarget, block, placementRetries.has(retryKey))) return false;
   const item = new ItemStack(interaction.itemId, 1);
@@ -2544,21 +3146,33 @@ function useItemAsWizard(dimension, interaction, origin, forward, right) {
   preparedPlacements.delete(retryKey);
   const direction = directionFromSupport(block, faceTarget);
   wizard.lookAtBlock(block, LookDuration.Instant);
-  if (!wizard.useItemOnBlock(item, block, direction, faceLocation(direction))) {
+  const used = wizard.useItemOnBlock(item, block, direction, faceLocation(direction));
+  const hasExpectedOutcome = Boolean(
+    interaction.expectedFaceType || interaction.expectedEntity || interaction.expectedState,
+  );
+  if (!used || (hasExpectedOutcome
+    && !interactionIsSatisfied(dimension, interaction, origin, forward, right))) {
     const retries = (placementRetries.get(retryKey) || 0) + 1;
     if (retries <= 3) {
       placementRetries.set(retryKey, retries);
       return "placement-retry";
     }
     placementRetries.delete(retryKey);
-    if (interaction.expectedEntity) {
+    if (interaction.itemId === "minecraft:flint_and_steel"
+      || interaction.expectedFaceType === "minecraft:portal") {
+      console.warn(`[MC Wizard] flint interaction failed to create the complete portal interior after ${retries} player attempts`);
+      return "interaction-failed";
+    }
+    if (interaction.expectedEntity
+      && !interactionIsSatisfied(dimension, interaction, origin, forward, right)) {
       const spawnTarget = interaction.expectedEntity === "minecraft:hopper_minecart" ? block : faceTarget;
       dimension.spawnEntity(interaction.expectedEntity, {
         x: spawnTarget.x + 0.5,
         y: spawnTarget.y + (interaction.expectedEntity === "minecraft:hopper_minecart" ? 0.2 : 0.5),
         z: spawnTarget.z + 0.5,
       });
-    } else if (interaction.expectedFaceType) {
+    } else if (interaction.expectedFaceType
+      && !interactionIsSatisfied(dimension, interaction, origin, forward, right)) {
       dimension.setBlockType(faceTarget, interaction.expectedFaceType);
     } else if (interaction.expectedState) {
       applyExpectedBlockState(dimension, block, interaction.expectedState);
@@ -2573,8 +3187,12 @@ function useItemAsWizard(dimension, interaction, origin, forward, right) {
     return true;
   }
   placementRetries.delete(retryKey);
-  if (interaction.expectedState) applyExpectedBlockState(dimension, block, interaction.expectedState);
-  return !interaction.expectedFaceType || dimension.getBlock(faceTarget)?.typeId === interaction.expectedFaceType;
+  if (interaction.expectedState
+    && !interactionIsSatisfied(dimension, interaction, origin, forward, right)) {
+    applyExpectedBlockState(dimension, block, interaction.expectedState);
+  }
+  return hasExpectedOutcome
+    ? interactionIsSatisfied(dimension, interaction, origin, forward, right) : true;
 }
 
 function expectedHopperFacing(from, to) {
@@ -2646,9 +3264,10 @@ function containerHasSlots(dimension, location, slots) {
 
 function loadContainerSlotAsWizard(dimension, interaction, slot, origin, forward, right) {
   const location = customLocation(origin, forward, right, interaction.block);
-  if (!positionWizardForBuild(dimension, location)) return false;
   const container = containerAt(dimension, location);
   if (!container) throw new Error(`could not open container at ${location.x},${location.y},${location.z}`);
+  if (containerHasSlots(dimension, location, [slot])) return true;
+  if (!positionWizardForBuild(dimension, location)) return false;
   const item = new ItemStack(slot.itemId, slot.amount);
   if (slot.nameTag) item.nameTag = slot.nameTag;
   if (!wizard.setItem(item, 0, true)) throw new Error(`could not equip ${slot.itemId}`);
@@ -2832,7 +3451,10 @@ function verifyBlueprint(dimension, blueprint, origin, forward, right) {
 function repairBlueprintVerification(dimension, blueprint, origin, forward, right, repairAttempt = 1) {
   for (const check of blueprint.verification || []) {
     if (check.kind === "block_type") {
-      dimension.setBlockType(customLocation(origin, forward, right, check.block), check.typeId);
+      // Portal blocks must only come from a real flint-and-steel interaction.
+      if (check.typeId !== "minecraft:portal") {
+        dimension.setBlockType(customLocation(origin, forward, right, check.block), check.typeId);
+      }
     } else if (check.kind === "block_facing") {
       correctBlockFacing(
         dimension,
@@ -3012,9 +3634,11 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     return;
   }
   let dimension = player.dimension;
-  let forward = cardinalDirection(player);
-  let right = { x: -forward.z, z: forward.x };
-  let origin = findBlueprintSite(player, blueprint, forward, right);
+  const previousProject = blueprint.mode === "modify" ? lastProjectFor(player) : undefined;
+  const reuseProject = previousProject?.dimensionId === dimension.id ? previousProject : undefined;
+  let forward = reuseProject ? { ...reuseProject.forward } : cardinalDirection(player);
+  let right = reuseProject ? { ...reuseProject.right } : { x: -forward.z, z: forward.x };
+  let origin = reuseProject ? { ...reuseProject.origin } : findBlueprintSite(player, blueprint, forward, right);
   let actionClaim;
   if (!origin && !waitingForBody) {
     actionClaim = captureBuildActionClaim(player);
@@ -3033,6 +3657,16 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     y: standingBlockY(player.location),
     z: Math.floor(player.location.z) + forward.z * 6,
   };
+  const projectSummary = projectBlueprintSummary(blueprint);
+  const obsoletePlacements = reuseProject
+    ? obsoleteProjectPlacements(reuseProject, projectSummary).filter((placement) => (
+      projectPlacementStillOwned(
+        dimension,
+        customLocation(origin, forward, right, placement.target),
+        placement,
+      )
+    ))
+    : [];
   if (!bringWizardTo(player)) {
     queueBuild(
       player,
@@ -3049,30 +3683,49 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     clearBuild(token);
     return;
   }
+  bindBuildProject(player, token, {
+    ...projectSummary,
+    dimensionId: dimension.id,
+    origin: { ...origin },
+    forward: { ...forward },
+    right: { ...right },
+  });
   lastBuildTick.set(player.id, system.currentTick);
   speak(player, `I’ve got the complete ${blueprint.title} plan. Watch my inventory—I’ll place every part, use its controls, and test what the design can prove in this world.`);
 
+  const expectedEntityCounts = new Map();
+  const deficitInteraction = (interaction) => {
+    if (!interaction.expectedEntity) return interaction;
+    const key = `${interaction.expectedEntity}:${interaction.block.join(",")}:${interaction.faceTarget.join(",")}`;
+    const expectedEntityCount = (expectedEntityCounts.get(key) || 0) + 1;
+    expectedEntityCounts.set(key, expectedEntityCount);
+    return { ...interaction, expectedEntityCount };
+  };
   const preInteractionSteps = (blueprint.preInteractions || [])
+    .map(deficitInteraction)
     .map((interaction) => () => useItemAsWizard(dimension, interaction, origin, forward, right));
+  const breakStep = (localTarget) => {
+    const target = customLocation(origin, forward, right, localTarget);
+    let breakStarted = false;
+    let polls = 0;
+    return () => {
+      if (dimension.getBlock(target)?.typeId === "minecraft:air") return true;
+      if (!breakStarted) {
+        if (!breakAsWizard(dimension, target)) return false;
+        breakStarted = true;
+      }
+      polls += 1;
+      if (polls > 40) {
+        breakStarted = false;
+        polls = 0;
+      }
+      return false;
+    };
+  };
+  const cleanupSteps = obsoletePlacements.map(({ target }) => breakStep(target));
   const placementSteps = blueprint.placements.map((placement) => {
     const target = customLocation(origin, forward, right, placement.target);
-    if (placement.action === "break") {
-      let breakStarted = false;
-      let polls = 0;
-      return () => {
-        if (dimension.getBlock(target)?.typeId === "minecraft:air") return true;
-        if (!breakStarted) {
-          if (!breakAsWizard(dimension, target)) return false;
-          breakStarted = true;
-        }
-        polls += 1;
-        if (polls > 40) {
-          breakStarted = false;
-          polls = 0;
-        }
-        return false;
-      };
-    }
+    if (placement.action === "break") return breakStep(placement.target);
     const supportLocal = placement.facingTarget || placement.support;
     const support = customLocation(origin, forward, right, supportLocal);
     const orientationTarget = placement.orientationTarget
@@ -3105,11 +3758,12 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     ),
   );
   const steps = [
+    ...cleanupSteps,
     ...placementSteps.slice(0, preInteractionBefore),
     ...preInteractionSteps,
     ...placementSteps.slice(preInteractionBefore),
   ];
-  for (const interaction of blueprint.interactions || []) {
+  for (const interaction of (blueprint.interactions || []).map(deficitInteraction)) {
     if (interaction.action === "load_container") {
       for (const slot of interaction.slots) {
         steps.push(() => loadContainerSlotAsWizard(dimension, interaction, slot, origin, forward, right));
@@ -3126,9 +3780,13 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
   }
   if (blueprint.verification?.length) {
     let checks = 0;
+    const verifiesPortal = blueprint.verification.some((check) => (
+      check.kind === "block_type" && check.typeId === "minecraft:portal"
+    ));
     steps.push(() => {
       if (verifyBlueprint(dimension, blueprint, origin, forward, right)) return true;
       checks += 1;
+      if (verifiesPortal && checks >= 80) return "interaction-failed";
       if (checks % 80 === 0) {
         repairBlueprintVerification(dimension, blueprint, origin, forward, right, checks / 80);
       }
@@ -3140,6 +3798,10 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     });
   }
   const expected = new Map();
+  for (const placement of obsoletePlacements) {
+    const location = customLocation(origin, forward, right, placement.target);
+    expected.set(`${location.x},${location.y},${location.z}`, { location, typeId: "minecraft:air" });
+  }
   for (const placement of blueprint.placements) {
     const location = customLocation(origin, forward, right, placement.target);
     const key = `${location.x},${location.y},${location.z}`;
@@ -3166,8 +3828,8 @@ function buildMachinePlan(player, value) {
     void buildInteractiveBlueprint(player, machineBlueprint(value));
   } catch (error) {
     console.warn(`[MC Wizard] rejected unsafe machine plan: ${error}`);
-    speak(player, "That machine plan had one unsafe part. I’m starting a working redstone memory core nearby instead of leaving you with nothing while I redraw the larger mechanism.");
-    void buildCopperBulbTFlipFlop(player);
+    speak(player, "That machine drawing had one broken part. I’m revising this same machine now instead of swapping in an unrelated redstone trick.");
+    failPendingAction(player, `machine plan validation failed: ${String(error).slice(0, 160)}`);
   }
 }
 
@@ -3197,7 +3859,7 @@ async function buildValidatedPlan(player, value) {
   try {
     plan = validateBuildPlan(value);
   } catch (error) {
-    speak(player, `I rejected that plan before touching the world: ${error.message}.`);
+    speak(player, "One piece of that drawing would not work in Bedrock. I’m revising the same idea before I touch the world.");
     failPendingAction(player, `build plan was rejected: ${error.message}`);
     return;
   }
@@ -3548,6 +4210,335 @@ async function buildRedstoneCalculator(player) {
   system.runTimeout(beginCalculator, 20);
 }
 
+function travelDimension(action) {
+  const requested = String(action.destination || action.dimension || "").replace(/^minecraft:/, "");
+  return TRAVEL_DIMENSIONS[requested === "end" ? "the_end" : requested];
+}
+
+function activeE2ETravelFault() {
+  if (variable("mc_wizard_e2e", false) !== true
+    || variable("mc_wizard_e2e_scope", "") !== "travel-rollback") return undefined;
+  try {
+    const fault = JSON.parse(String(world.getDynamicProperty(E2E_TRAVEL_FAULT_PROPERTY) || ""));
+    const run = String(variable("mc_wizard_e2e_run", "")).trim();
+    return fault.run === run && fault.mode === "hold-last-traveler" ? fault : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function updateE2ETravelFault(fault, changes) {
+  if (!fault) return;
+  Object.assign(fault, changes);
+  world.setDynamicProperty(E2E_TRAVEL_FAULT_PROPERTY, JSON.stringify(fault));
+}
+
+function nearbyTravelParty(player) {
+  return [player, ...humanPlayers().filter((candidate) => (
+    candidate.id !== player.id
+    && candidate.dimension.id === player.dimension.id
+    && distanceSquared(candidate.location, player.location) <= TRAVEL_PARTY_DISTANCE_SQUARED
+  ))];
+}
+
+function travelPartyOffsets(count) {
+  const side = Math.ceil(Math.sqrt(count));
+  const start = -Math.floor((side - 1) * 2 / 2);
+  return Array.from({ length: count }, (_, index) => ({
+    x: start + (index % side) * 2,
+    z: start + Math.floor(index / side) * 2,
+  }));
+}
+
+function travelAnchor(player, destination) {
+  if (destination.name === "overworld") {
+    const spawn = world.getDefaultSpawnLocation();
+    return { x: Math.floor(spawn.x), y: Math.floor(spawn.y), z: Math.floor(spawn.z) };
+  }
+  if (destination.name === "the_end") return { x: 100, y: 50, z: 0 };
+  const scale = player.dimension.id === "minecraft:overworld" ? 1 / 8 : 1;
+  return {
+    x: Math.floor(player.location.x * scale),
+    y: Math.min(100, Math.max(32, Math.floor(player.location.y))),
+    z: Math.floor(player.location.z * scale),
+  };
+}
+
+function travelCellIsSafe(dimension, location) {
+  const ground = dimension.getBlock({ ...location, y: location.y - 1 });
+  const feet = dimension.getBlock(location);
+  const head = dimension.getBlock({ ...location, y: location.y + 1 });
+  const solidGround = typeof ground?.isSolid === "boolean"
+    ? ground.isSolid : Boolean(ground && !SAFE_SPACE.has(ground.typeId));
+  return solidGround
+    && !TRAVEL_GROUND_HAZARDS.has(ground.typeId)
+    && SAFE_SPACE.has(feet?.typeId)
+    && SAFE_SPACE.has(head?.typeId);
+}
+
+function travelSiteIsSafe(dimension, origin, offsets) {
+  return offsets.every(({ x, z }) => travelCellIsSafe(dimension, {
+    x: origin.x + x,
+    y: origin.y,
+    z: origin.z + z,
+  }));
+}
+
+function findTravelSite(dimension, anchor, offsets) {
+  const candidates = [
+    [0, 0, 0], [0, 1, 0], [0, -1, 0], [0, 2, 0], [0, -2, 0],
+    [4, 0, 0], [-4, 0, 0], [0, 0, 4], [0, 0, -4],
+  ];
+  for (const [x, y, z] of candidates) {
+    const origin = { x: anchor.x + x, y: anchor.y + y, z: anchor.z + z };
+    try {
+      if (travelSiteIsSafe(dimension, origin, offsets)) return origin;
+    } catch {
+      // The fallback pad below handles unloaded or obstructed arrival blocks.
+    }
+  }
+  return undefined;
+}
+
+function prepareTravelPad(dimension, anchor, offsets) {
+  const xs = offsets.map(({ x }) => x);
+  const zs = offsets.map(({ z }) => z);
+  const minX = anchor.x + Math.min(...xs) - 1;
+  const maxX = anchor.x + Math.max(...xs) + 1;
+  const minZ = anchor.z + Math.min(...zs) - 1;
+  const maxZ = anchor.z + Math.max(...zs) + 1;
+  for (let x = minX; x <= maxX; x += 1) {
+    for (let z = minZ; z <= maxZ; z += 1) {
+      dimension.setBlockType({ x, y: anchor.y - 1, z }, "minecraft:obsidian");
+      for (let y = anchor.y; y <= anchor.y + 2; y += 1) {
+        dimension.setBlockType({ x, y, z }, "minecraft:air");
+      }
+    }
+  }
+  return anchor;
+}
+
+async function waitForTravelChunk(dimension, anchor) {
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    try {
+      if (dimension.getBlock(anchor) && dimension.getBlock({ ...anchor, y: anchor.y - 1 })) return true;
+    } catch {
+      // A preloaded ticking area still needs time to generate a fresh realm.
+    }
+    await system.waitTicks(2);
+  }
+  return false;
+}
+
+function entityReachedDimension(entity, dimensionId) {
+  try {
+    return entity.isValid && entity.dimension.id === dimensionId;
+  } catch {
+    return false;
+  }
+}
+
+async function applyDimensionTravel(player, action, capturedPartyIds = nearbyTravelParty(player).map(({ id }) => id)) {
+  const destination = travelDimension(action);
+  if (!destination) {
+    const report = beginImmediateAction(player);
+    speak(player, "That realm name slipped past my map. Try Overworld, Nether, or End.");
+    endImmediateAction(report, "failed", "requested dimension was not supported");
+    return;
+  }
+  if (buildInProgress || buildPreparing) {
+    queueBuild(
+      player,
+      (current) => applyDimensionTravel(current, action, capturedPartyIds),
+      20,
+      "I’ve kept this exact travel party together. We’ll realm-hop as soon as my current build is stable.",
+    );
+    return;
+  }
+  const bot = bringWizardTo(player);
+  if (!bot) {
+    queueBuild(
+      player,
+      (current) => applyDimensionTravel(current, action, capturedPartyIds),
+      40,
+      "My player body is re-forming. I’ve kept this exact travel party queued until I can come too.",
+    );
+    return;
+  }
+  const report = beginImmediateAction(player);
+  const playersById = new Map(humanPlayers().map((member) => [member.id, member]));
+  const party = capturedPartyIds.map((id) => playersById.get(id)).filter(Boolean);
+  if (party.length !== capturedPartyIds.length) {
+    speak(player, "One traveler left before the spell began, so I kept everyone else together here instead of splitting the party.");
+    endImmediateAction(report, "failed", "a captured party member left before dimension travel began");
+    return;
+  }
+  const targetDimension = world.getDimension(destination.name);
+  if (party.every((member) => member.dimension.id === destination.id)
+    && bot.dimension.id === destination.id) {
+    speak(player, `We’re already in the ${destination.label}.`);
+    endImmediateAction(report, "completed", `observed the captured party and Wizard already in ${destination.id}`);
+    return;
+  }
+  const reservation = beginBuildPreparation();
+  const travelers = [...party, bot];
+  const sources = travelers.map((entity) => ({
+    entity,
+    dimensionId: entity.dimension.id,
+    location: { ...entity.location },
+  }));
+  const e2eFault = activeE2ETravelFault();
+  const travelerDimensions = () => travelers.map((member) => {
+    try {
+      return member.dimension.id;
+    } catch {
+      return "invalid";
+    }
+  });
+  updateE2ETravelFault(e2eFault, {
+    phase: "traveling",
+    travelerCount: travelers.length,
+    travelerNames: travelers.map((member) => member.name),
+    sourceDimensions: sources.map(({ dimensionId }) => dimensionId),
+  });
+  const restoreAll = async () => {
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      for (const source of sources) {
+        if (entityReachedDimension(source.entity, source.dimensionId)) continue;
+        try {
+          source.entity.teleport(source.location, {
+            dimension: world.getDimension(source.dimensionId.replace(/^minecraft:/, "")),
+          });
+        } catch (error) {
+          console.warn(`[MC Wizard] could not roll ${source.entity.name} back after partial travel: ${error}`);
+        }
+      }
+      await system.waitTicks(2);
+      if (sources.every(({ entity, dimensionId }) => entityReachedDimension(entity, dimensionId))) return true;
+    }
+    return false;
+  };
+  const offsets = travelPartyOffsets(travelers.length);
+  const anchor = travelAnchor(player, destination);
+  try {
+    try {
+      targetDimension.runCommand(`tickingarea remove ${TRAVEL_TICKING_AREA}`);
+    } catch {}
+    targetDimension.runCommand(`tickingarea add circle ${anchor.x} ${anchor.y} ${anchor.z} 2 ${TRAVEL_TICKING_AREA} true`);
+    if (!await waitForTravelChunk(targetDimension, anchor)) {
+      throw new Error(`arrival chunk at ${anchor.x},${anchor.z} did not become loaded and ticking`);
+    }
+    const site = findTravelSite(targetDimension, anchor, offsets)
+      || prepareTravelPad(targetDimension, anchor, offsets);
+    const teleportTraveler = (member, index) => {
+      if (e2eFault && index === travelers.length - 1) {
+        updateE2ETravelFault(e2eFault, {
+          injections: (Number(e2eFault.injections) || 0) + 1,
+          heldTraveler: member.name,
+        });
+        return;
+      }
+      try {
+        member.teleport({
+          x: site.x + offsets[index].x + 0.5,
+          y: site.y,
+          z: site.z + offsets[index].z + 0.5,
+        }, { dimension: targetDimension });
+      } catch (error) {
+        console.warn(`[MC Wizard] could not move ${member.name} to ${destination.id}: ${error}`);
+      }
+    };
+    const allReached = (dimensionId) => travelers.every((member) => (
+      entityReachedDimension(member, dimensionId)
+    ));
+    const sendAll = async () => {
+      travelers.forEach(teleportTraveler);
+      await system.waitTicks(2);
+      if (e2eFault && !allReached(destination.id)) {
+        const dimensions = travelerDimensions();
+        updateE2ETravelFault(e2eFault, {
+          phase: "partial",
+          partialObserved: e2eFault.partialObserved || new Set(dimensions).size > 1,
+          dimensions,
+        });
+      }
+      if (!allReached(destination.id)) {
+        travelers.forEach((member, index) => {
+          if (!entityReachedDimension(member, destination.id)) teleportTraveler(member, index);
+        });
+        await system.waitTicks(2);
+      }
+      return allReached(destination.id);
+    };
+    for (let journey = 0; journey < 2; journey += 1) {
+      if (await sendAll()) {
+        updateE2ETravelFault(e2eFault, {
+          phase: "finished",
+          outcome: "destination",
+          dimensions: travelerDimensions(),
+        });
+        speak(player, `Realm hop complete—${party.length === 1 ? "you’re" : `all ${party.length} of you are`} safely in the ${destination.label}, and I came with you.`);
+        endImmediateAction(report, "completed", `observed ${party.length}/${party.length} captured players and Wizard in ${destination.id}`);
+        return;
+      }
+      if (await restoreAll()) {
+        updateE2ETravelFault(e2eFault, {
+          phase: "rolled-back",
+          rollbackObserved: true,
+          dimensions: travelerDimensions(),
+        });
+        continue;
+      }
+      // A rollback can itself be interrupted. Converge on the requested realm
+      // rather than leave half the party on each side.
+      for (let rescue = 0; rescue < 3; rescue += 1) {
+        if (await sendAll()) {
+          updateE2ETravelFault(e2eFault, {
+            phase: "finished",
+            outcome: "destination",
+            dimensions: travelerDimensions(),
+          });
+          speak(player, `The first hop wobbled, but I gathered the whole party and landed everyone in the ${destination.label}.`);
+          endImmediateAction(report, "completed", `recovered the captured party and Wizard together in ${destination.id}`);
+          return;
+        }
+      }
+      break;
+    }
+    const restored = await restoreAll();
+    updateE2ETravelFault(e2eFault, {
+      phase: "finished",
+      outcome: restored ? "rolled_back" : "unresolved",
+      rollbackObserved: e2eFault?.rollbackObserved || restored,
+      dimensions: travelerDimensions(),
+    });
+    speak(player, restored
+      ? `The path to the ${destination.label} would not hold everyone, so I rolled the whole captured party back together instead of leaving anyone behind.`
+      : `The path to the ${destination.label} would not hold everyone. I marked the spell unfinished so the recovery can continue.`);
+    endImmediateAction(report, "failed", `captured party did not reach ${destination.id} atomically; rollback=${restored}`);
+  } catch (error) {
+    console.warn(`[MC Wizard] dimension travel failed: ${error}`);
+    const restored = await restoreAll();
+    updateE2ETravelFault(e2eFault, {
+      phase: "finished",
+      outcome: restored ? "rolled_back" : "unresolved",
+      rollbackObserved: e2eFault?.rollbackObserved || restored,
+      dimensions: travelerDimensions(),
+    });
+    speak(player, restored
+      ? `The path to the ${destination.label} buckled, so I rolled the whole party and myself back together.`
+      : `The path to the ${destination.label} buckled. I’m keeping the failed spell marked for another recovery attempt.`);
+    endImmediateAction(report, "failed", `dimension travel failed; rollback=${restored}: ${String(error).slice(0, 100)}`);
+  } finally {
+    endBuildPreparation(reservation);
+    system.runTimeout(() => {
+      try {
+        targetDimension.runCommand(`tickingarea remove ${TRAVEL_TICKING_AREA}`);
+      } catch {}
+    }, 200);
+  }
+}
+
 function castPotionRain(player, action, report = beginImmediateAction(player)) {
   const radius = Math.min(12, Math.max(3, Math.floor(Number(action.radius) || 8)));
   const durationSeconds = Math.min(15, Math.max(3, Math.floor(Number(action.durationSeconds) || 8)));
@@ -3782,6 +4773,8 @@ function applyResponse(playerId, payload, question) {
     }
   } else if (action?.type === "world_control" && action.version === 1) {
     applyWorldControl(player, action);
+  } else if (action?.type === "dimension_travel" && action.version === 1) {
+    void applyDimensionTravel(player, action);
   } else if (action?.type === "potion_rain" && action.version === 1) {
     castPotionRain(player, action);
   } else if (action?.type === "give_items" && action.version === 1) {
@@ -3794,10 +4787,11 @@ function applyResponse(playerId, payload, question) {
   }
 }
 
-async function askBackend(playerId, question, mode = "wizard") {
+async function askBackend(playerId, question, mode = "wizard", planningAttempt = 0, expectedToken, goalRetryId) {
   const player = playerById(playerId);
   if (!player) return;
   const key = `${playerId}:${mode}`;
+  if (expectedToken !== undefined && pendingQuestions.get(key) !== expectedToken) return;
   const token = ++nextQuestionToken;
   const requestId = `${system.currentTick.toString(36)}-${token.toString(36)}`;
   pendingQuestions.set(key, token);
@@ -3812,6 +4806,8 @@ async function askBackend(playerId, question, mode = "wizard") {
     for (const [ticks, message] of [
       [80, acknowledgements[token % acknowledgements.length]],
       [240, "Still working—I’m staying with it."],
+      [500, "I’m drawing the tricky parts now. I haven’t forgotten your build."],
+      [780, "This is a bigger spell, but I’m still working on the same request."],
     ]) {
       system.runTimeout(() => {
         if (pendingQuestions.get(key) !== token) return;
@@ -3827,6 +4823,7 @@ async function askBackend(playerId, question, mode = "wizard") {
       question,
       mode,
       requestId,
+      ...(goalRetryId ? { goalId: goalRetryId } : {}),
       ...(mode === "wizard" ? { context: liveWorldSnapshot(player) } : {}),
     };
     let response;
@@ -3847,6 +4844,11 @@ async function askBackend(playerId, question, mode = "wizard") {
       throw new Error(`brain returned HTTP ${response.status}`);
     }
     const payload = JSON.parse(response.body);
+    const retryPlanning = mode === "wizard"
+      && payload?.mode === "planning-deferred"
+      && !payload?.action
+      && payload?.goal?.status === "active"
+      && planningAttempt < 2;
     const responseReport = payload?.action
       && typeof payload.requestId === "string"
       && /^[a-zA-Z0-9_-]{1,64}$/.test(payload.requestId)
@@ -3860,14 +4862,23 @@ async function askBackend(playerId, question, mode = "wizard") {
         }
         return;
       }
-      pendingQuestions.delete(key);
+      if (!retryPlanning) pendingQuestions.delete(key);
       if (!playerById(playerId)) {
         if (responseReport) {
           void postActionResult(responseReport, "failed", "player left before execution");
         }
         return;
       }
-      applyResponse(playerId, payload, question);
+      if (retryPlanning) {
+        const current = playerById(playerId);
+        if (current) speak(current, "That design didn’t fit your goal. I’m trying another one now without making you repeat it.");
+        system.runTimeout(
+          () => void askBackend(playerId, question, mode, planningAttempt + 1, token, goalRetryId),
+          60,
+        );
+      } else {
+        applyResponse(playerId, payload, question);
+      }
     });
   } catch (error) {
     console.warn(`[MC Wizard] ${error}`);
@@ -3959,6 +4970,7 @@ function handleLocalCommand(player, question) {
     return true;
   }
   if (/^(?:undo|undo (?:my |the )?last build)(?: please)?[.!]?$/i.test(question)) {
+    cancelPendingQuestion(player);
     undoLastBuild(player);
     return true;
   }
@@ -4134,6 +5146,7 @@ world.afterEvents.worldLoad.subscribe(() => {
       engineAddressedMessageCount: (playerId) => engineAddressedMessageCounts.get(playerId) || 0,
       undoLastBuild,
       hasCommittedBuild: (playerId) => lastUndo.has(playerId),
+      buildCommitToken: (playerId) => lastCompletedBuildTokens.get(playerId),
       buildValidatedPlan,
       prepareBuildWorkshop,
       deliverTestBook: (player) => deliverModelAnswer(player, {

@@ -19,8 +19,8 @@ if [ ! -f "$ROOT/package.json" ]; then
   echo "Run from the MC Wizard repository root." >&2
   exit 1
 fi
-if [ "$E2E_SCOPE" != "full" ] && [ "$E2E_SCOPE" != "machines" ] && [ "$E2E_SCOPE" != "arbitrary" ] && [ "$E2E_SCOPE" != "child" ] && [ "$E2E_SCOPE" != "refinement" ] && [ "$E2E_SCOPE" != "farms" ] && [ "$E2E_SCOPE" != "kelp" ]; then
-  echo "MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, child, refinement, farms, or kelp." >&2
+if [ "$E2E_SCOPE" != "full" ] && [ "$E2E_SCOPE" != "machines" ] && [ "$E2E_SCOPE" != "arbitrary" ] && [ "$E2E_SCOPE" != "portal" ] && [ "$E2E_SCOPE" != "travel-rollback" ] && [ "$E2E_SCOPE" != "city" ] && [ "$E2E_SCOPE" != "child" ] && [ "$E2E_SCOPE" != "refinement" ] && [ "$E2E_SCOPE" != "farms" ] && [ "$E2E_SCOPE" != "kelp" ]; then
+  echo "MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, portal, travel-rollback, city, child, refinement, farms, or kelp." >&2
   exit 1
 fi
 if ! command -v container >/dev/null 2>&1; then
@@ -136,7 +136,7 @@ mkfifo "$FIFO"
 ) >"$FIFO" &
 LOG_PID=$!
 result=0
-if [ "$E2E_SCOPE" = "arbitrary" ] || [ "$E2E_SCOPE" = "refinement" ]; then E2E_TIMEOUT_MS=300000
+if [ "$E2E_SCOPE" = "arbitrary" ] || [ "$E2E_SCOPE" = "refinement" ] || [ "$E2E_SCOPE" = "travel-rollback" ] || [ "$E2E_SCOPE" = "city" ]; then E2E_TIMEOUT_MS=300000
 elif [ "$E2E_SCOPE" = "farms" ]; then E2E_TIMEOUT_MS=600000
 else E2E_TIMEOUT_MS=1800000
 fi

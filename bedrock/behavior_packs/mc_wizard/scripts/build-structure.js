@@ -19,7 +19,7 @@ const MATERIALS = new Set([
   "minecraft:oak_log",
   "minecraft:spruce_log",
   "minecraft:birch_log",
-  "minecraft:bricks",
+  "minecraft:brick_block",
   "minecraft:quartz_block",
   "minecraft:white_concrete",
   "minecraft:glass",
@@ -72,6 +72,10 @@ const MATERIALS = new Set([
   "minecraft:emerald_block",
 ]);
 
+export function isAllowedStructureMaterial(blockId) {
+  return MATERIALS.has(blockId);
+}
+
 const FEATURES = new Set([
   "floor",
   "walls",
@@ -104,16 +108,24 @@ function dimension(value, name) {
   return number;
 }
 
-function vector(value, name, dimensions) {
+function vector(value, name, dimensions, horizontalMargin = 0) {
   if (!Array.isArray(value) || value.length !== 3) throw new Error(`${name} must be an x,y,z vector`);
   const limits = [dimensions.width, dimensions.height, dimensions.depth];
   return value.map((coordinate, axis) => {
     const number = Number(coordinate);
-    if (!Number.isInteger(number) || number < 0 || number >= limits[axis]) {
+    const margin = axis === 1 ? 0 : horizontalMargin;
+    if (!Number.isInteger(number) || number < -margin || number >= limits[axis] + margin) {
       throw new Error(`${name} is outside the requested dimensions`);
     }
     return number;
   });
+}
+
+function primitiveVolume(shape, from, to) {
+  const size = from.map((coordinate, axis) => to[axis] - coordinate + 1);
+  if (shape !== "hollow_box") return size.reduce((total, length) => total * length, 1);
+  return size.reduce((total, length) => total * length, 1)
+    - size.map((length) => length - 2).reduce((total, length) => total * length, 1);
 }
 
 function validatePrimitives(value, dimensions, { partial = false } = {}) {
@@ -131,8 +143,8 @@ function validatePrimitives(value, dimensions, { partial = false } = {}) {
     if (!primitive || typeof primitive !== "object" || Array.isArray(primitive)) {
       throw new Error(`primitives[${index}] must be an object`);
     }
-    const shape = primitive.shape === "box" || primitive.shape === "line" ? primitive.shape : undefined;
-    if (!shape) throw new Error(`primitives[${index}].shape must be box or line`);
+    const shape = ["box", "line", "hollow_box"].includes(primitive.shape) ? primitive.shape : undefined;
+    if (!shape) throw new Error(`primitives[${index}].shape must be box, line, or hollow_box`);
     const phaseIndex = STRUCTURE_PHASES.indexOf(primitive.phase);
     if (phaseIndex < 0) throw new Error(`primitives[${index}].phase is unsupported`);
     if (phaseIndex < lastPhase) throw new Error("primitives must stay in phase order");
@@ -142,14 +154,18 @@ function validatePrimitives(value, dimensions, { partial = false } = {}) {
     if (blockId !== "minecraft:air" && !MATERIALS.has(blockId)) {
       throw new Error(`primitives[${index}].blockId is not allowed`);
     }
-    const first = vector(primitive.from, `primitives[${index}].from`, dimensions);
-    const second = vector(primitive.to, `primitives[${index}].to`, dimensions);
+    const extension = partial ? 4 : 0;
+    const first = vector(primitive.from, `primitives[${index}].from`, dimensions, extension);
+    const second = vector(primitive.to, `primitives[${index}].to`, dimensions, extension);
     const from = first.map((coordinate, axis) => Math.min(coordinate, second[axis]));
     const to = first.map((coordinate, axis) => Math.max(coordinate, second[axis]));
     if (shape === "line" && from.filter((coordinate, axis) => coordinate === to[axis]).length < 2) {
       throw new Error(`primitives[${index}] line must be axis-aligned`);
     }
-    totalVolume += (to[0] - from[0] + 1) * (to[1] - from[1] + 1) * (to[2] - from[2] + 1);
+    if (shape === "hollow_box" && from.some((coordinate, axis) => to[axis] - coordinate < 2)) {
+      throw new Error(`primitives[${index}] hollow_box must be at least 3x3x3`);
+    }
+    totalVolume += primitiveVolume(shape, from, to);
     if (blockId !== "minecraft:air") {
       solidPhases.add(primitive.phase);
       for (let axis = 0; axis < 3; axis += 1) {
@@ -191,6 +207,79 @@ function validateEntities(value, dimensions) {
   });
 }
 
+function validateCityGeometry(plan) {
+  if (plan.mode === "modify" || /^First pass\b/i.test(plan.title)
+    || !["city", "village", "settlement"].includes(plan.kind)) return;
+  if (!plan.primitives) throw new Error("a city needs authored primitives");
+  const buildings = plan.primitives.filter(({ shape, blockId, from, to }) => (
+    shape === "hollow_box"
+    && blockId !== "minecraft:air"
+    && from[1] >= 0
+    && to[0] - from[0] >= 3
+    && to[1] - from[1] >= 3
+    && to[2] - from[2] >= 3
+  ));
+  if (buildings.length < 4) {
+    throw new Error("a city needs at least four distinct habitable hollow_box buildings");
+  }
+  for (let first = 0; first < buildings.length; first += 1) {
+    for (let second = first + 1; second < buildings.length; second += 1) {
+      const a = buildings[first];
+      const b = buildings[second];
+      const separated = a.to[0] + 1 < b.from[0] || b.to[0] + 1 < a.from[0]
+        || a.to[2] + 1 < b.from[2] || b.to[2] + 1 < a.from[2];
+      if (!separated) throw new Error("city buildings must be distinct and separated, not duplicate or nested shells");
+    }
+  }
+  const centersX = buildings.map(({ from, to }) => (from[0] + to[0]) / 2);
+  const centersZ = buildings.map(({ from, to }) => (from[2] + to[2]) / 2);
+  if (Math.max(...centersX) - Math.min(...centersX) < (plan.dimensions.width - 1) * 0.5
+    || Math.max(...centersZ) - Math.min(...centersZ) < (plan.dimensions.depth - 1) * 0.5) {
+    throw new Error("city buildings must be distributed across both sides of the site");
+  }
+  const heights = buildings.map(({ from, to }) => to[1] - from[1] + 1);
+  if (plan.kind === "city" && Math.max(...heights) - Math.min(...heights) < 2) {
+    throw new Error("a city needs a varied skyline, not four identical-height rooms");
+  }
+
+  const routes = plan.primitives.filter(({ phase, blockId, from, to }) => (
+    phase === "foundation" && blockId !== "minecraft:air" && from[1] === 0 && to[1] === 0
+  ));
+  const longX = routes.filter(({ from, to }) => (
+    to[0] - from[0] + 1 >= Math.ceil(plan.dimensions.width * 0.7) && to[2] - from[2] + 1 <= 3
+  ));
+  const longZ = routes.filter(({ from, to }) => (
+    to[2] - from[2] + 1 >= Math.ceil(plan.dimensions.depth * 0.7) && to[0] - from[0] + 1 <= 3
+  ));
+  const crossing = longX.some((xRoute) => longZ.some((zRoute) => (
+    xRoute !== zRoute
+    && xRoute.from[0] <= zRoute.to[0] && xRoute.to[0] >= zRoute.from[0]
+    && xRoute.from[2] <= zRoute.to[2] && xRoute.to[2] >= zRoute.from[2]
+  )));
+  if (!crossing) throw new Error("a city needs two distinct thin connected paths crossing in both directions");
+  const routeTouches = (building) => routes.some((route) => {
+    const dx = Math.max(route.from[0] - building.to[0], building.from[0] - route.to[0], 0);
+    const dz = Math.max(route.from[2] - building.to[2], building.from[2] - route.to[2], 0);
+    return dx + dz <= 1;
+  });
+  if (!buildings.every(routeTouches)) throw new Error("every city building must connect to the path network");
+
+  const openings = plan.primitives.filter(({ phase, blockId }) => (
+    phase === "details" && blockId === "minecraft:air"
+  ));
+  const hasDoor = (building) => openings.some(({ from, to }) => {
+    if (from[1] > building.from[1] + 1 || to[1] < building.from[1] + 2) return false;
+    const onXWall = (from[0] <= building.from[0] && to[0] >= building.from[0]
+        || from[0] <= building.to[0] && to[0] >= building.to[0])
+      && to[2] >= building.from[2] + 1 && from[2] <= building.to[2] - 1;
+    const onZWall = (from[2] <= building.from[2] && to[2] >= building.from[2]
+        || from[2] <= building.to[2] && to[2] >= building.to[2])
+      && to[0] >= building.from[0] + 1 && from[0] <= building.to[0] - 1;
+    return onXWall || onZWall;
+  });
+  if (!buildings.every(hasDoor)) throw new Error("every city building needs a two-block-tall exterior doorway");
+}
+
 export function validateBuildStructurePlan(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("structure plan must be an object");
   const mode = value.mode === undefined ? undefined : String(value.mode);
@@ -225,11 +314,25 @@ export function validateBuildStructurePlan(value) {
     plan.primitives = validatePrimitives(value.primitives, dimensions, { partial: mode === "modify" });
   }
   if (value.entities !== undefined) plan.entities = validateEntities(value.entities, dimensions);
+  validateCityGeometry(plan);
   return plan;
 }
 
 export function primitiveStructureOperations(plan) {
-  return (plan.primitives || []).map(({ phase, blockId, from, to }) => ({ phase, blockId, from, to }));
+  return (plan.primitives || []).flatMap(({ shape, phase, blockId, from, to }) => {
+    if (shape !== "hollow_box") return [{ phase, blockId, from, to }];
+    const [x0, y0, z0] = from;
+    const [x1, y1, z1] = to;
+    const operation = (start, end) => ({ phase, blockId, from: start, to: end });
+    return [
+      operation([x0, y0, z0], [x1, y0, z1]),
+      operation([x0, y0 + 1, z0], [x0, y1 - 1, z1]),
+      operation([x1, y0 + 1, z0], [x1, y1 - 1, z1]),
+      operation([x0 + 1, y0 + 1, z0], [x1 - 1, y1 - 1, z0]),
+      operation([x0 + 1, y0 + 1, z1], [x1 - 1, y1 - 1, z1]),
+      operation([x0, y1, z0], [x1, y1, z1]),
+    ];
+  });
 }
 
 export function expansionClearOperations(previousPlan, nextPlan) {
@@ -270,13 +373,14 @@ const boxesIntersect = (a, b) => a.from.every((from, axis) => (
 export function obsoleteExpansionOperations(previousPlan, nextPlan, previousOperations) {
   const before = previousPlan.dimensions;
   const after = nextPlan.dimensions;
-  if (!["width", "depth", "height"].some((axis) => after[axis] !== before[axis])) return [];
+  const firstPass = /^First pass\b/i.test(previousPlan.title || "");
+  if (!firstPass && !["width", "depth", "height"].some((axis) => after[axis] !== before[axis])) return [];
   const shrinking = ["width", "depth", "height"].some((axis) => after[axis] < before[axis]);
   const edgeX = before.width - 1;
   const edgeZ = before.depth - 1;
   const envelope = previousOperations.filter((operation) => (
     operation.blockId !== "minecraft:air"
-    && (shrinking || operation.phase === "roof" || (operation.phase === "shell"
+    && (firstPass || shrinking || operation.phase === "roof" || (operation.phase === "shell"
       && (operation.from[0] === 0 || operation.to[0] === edgeX
         || operation.from[2] === 0 || operation.to[2] === edgeZ)))
   ));
@@ -299,8 +403,9 @@ export function buildStructureSchemaPrompt() {
     + `This compact plan means the adapter must finish every phase, using player placement for details and sliced fill operations when the structure is large. Preserve every explicitly requested dimension exactly. `
     + `Limits: width 1-${STRUCTURE_LIMITS.width}, depth 1-${STRUCTURE_LIMITS.depth}, height 1-${STRUCTURE_LIMITS.height}. `
     + `For a known ordinary building, omit primitives and the adapter will generate it. For a follow-up edit, set "mode":"modify"; omit primitives to regenerate the ordinary structure in place, or include only the changed primitives. `
-    + `For every new unusual or representational shape (for example a dragon, statue, creature, treehouse, vehicle, or pixel-art object), include 4-${STRUCTURE_PRIMITIVE_LIMIT} primitives so the model's shape is built instead of a generic building. `
-    + `A primitive is {"shape":"box|line","phase":"foundation|shell|roof|details","blockId":"minecraft:...","from":[x,y,z],"to":[x,y,z]}; coordinates are inclusive, zero-based, and must stay inside dimensions. minecraft:air is allowed only as a primitive blockId, never counts toward a new structure's phases or bounds, and may be the only material only in mode modify. New structures need solid geometry in every phase spanning all requested bounds; modify primitives may be partial. Lines must be axis-aligned and stay in phase order. `
+    + `For every new unusual, multi-building, or representational shape (for example a city, village, settlement, dragon, statue, creature, treehouse, vehicle, or pixel-art object), include 4-${STRUCTURE_PRIMITIVE_LIMIT} primitives so the model's complete shape is built instead of a generic building. `
+    + `A primitive is {"shape":"box|line|hollow_box","phase":"foundation|shell|roof|details","blockId":"minecraft:...","from":[x,y,z],"to":[x,y,z]}; coordinates are inclusive and zero-based. New structures must stay inside dimensions. A mode-modify primitive may extend x or z up to four blocks outside the existing footprint for an attached balcony, eave, bridge, moat, or exterior detail; y must always stay inside height. A hollow_box must be at least 3x3x3 and builds a one-block-thick floor, four walls, and ceiling around an empty interior. minecraft:air is allowed only as a primitive blockId, never counts toward a new structure's phases or bounds, and may be the only material only in mode modify. New structures need solid geometry in every phase spanning all requested bounds; modify primitives may be partial. Lines must be axis-aligned and stay in phase order. `
+    + `Use hollow_box for every habitable building or room; never represent one as a solid box. Carve door and window openings with later minecraft:air box primitives, and add interior floors, dividing walls, lighting, or furnishings as details. A city must contain at least four separated habitable hollow_box buildings distributed across both axes with varied heights; give every building a two-block-tall exterior air doorway connected to a thin foundation path. Use two distinct paths no more than three blocks wide that cross and span at least 70% of x and z. Never use one giant slab, duplicate shells, one box, or one floating room as a city. `
     + `Example unusual plan addition for 7x7x5 dimensions: "primitives":[{"shape":"line","phase":"foundation","blockId":"minecraft:stone","from":[0,0,3],"to":[6,0,3]},{"shape":"box","phase":"shell","blockId":"minecraft:green_concrete","from":[2,1,0],"to":[4,2,6]},{"shape":"line","phase":"roof","blockId":"minecraft:green_concrete","from":[3,3,3],"to":[3,4,3]},{"shape":"box","phase":"details","blockId":"minecraft:white_concrete","from":[3,3,2],"to":[3,3,2]}]. `
     + `Optional entities contains 0-${STRUCTURE_ENTITY_LIMIT} {"typeId":"minecraft:villager_v2","location":[x,y,z]} entries inside the dimensions. `
     + `Allowed materials: ${[...MATERIALS].join(", ")}. Allowed features: ${[...FEATURES].join(", ")}.`;

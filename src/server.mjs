@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { createServer as createNodeServer } from "node:http";
 import { fileURLToPath } from "node:url";
 import {
@@ -7,11 +7,12 @@ import {
   STRUCTURE_PRIMITIVE_LIMIT,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/build-structure.js";
 import { loadCorpus } from "./rag.mjs";
+import { createInteractionLog } from "./interaction-log.mjs";
 import { createFileSessionStore } from "./sessions.mjs";
 import { createWizard } from "./wizard.mjs";
 import { readRuntimeSettings } from "./runtime-settings.mjs";
 
-const MAX_BODY_BYTES = 32 * 1024;
+const MAX_BODY_BYTES = 128 * 1024;
 const CONTEXT_BLOCK_ID = /^minecraft:[a-z0-9_]{1,48}$/;
 
 const finiteInt = (value, min, max) => Number.isInteger(value) && value >= min && value <= max
@@ -42,7 +43,7 @@ function structurePrimitives(value, dimensions) {
   let totalVolume = 0;
   for (const entry of value) {
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
-    const shape = entry.shape === "box" || entry.shape === "line" ? entry.shape : undefined;
+    const shape = ["box", "line", "hollow_box"].includes(entry.shape) ? entry.shape : undefined;
     const phaseIndex = STRUCTURE_PHASES.indexOf(entry.phase);
     const blockId = typeof entry.blockId === "string" && CONTEXT_BLOCK_ID.test(entry.blockId)
       ? entry.blockId : undefined;
@@ -55,11 +56,81 @@ function structurePrimitives(value, dimensions) {
     if (shape === "line" && from.filter((coordinate, axis) => coordinate === to[axis]).length < 2) {
       return undefined;
     }
+    if (shape === "hollow_box" && from.some((coordinate, axis) => to[axis] - coordinate + 1 < 3)) {
+      return undefined;
+    }
     totalVolume += (to[0] - from[0] + 1) * (to[1] - from[1] + 1) * (to[2] - from[2] + 1);
     if (totalVolume > 2_000_000) return undefined;
     primitives.push({ shape, phase: entry.phase, blockId, from, to });
   }
   return primitives;
+}
+
+function structureEntities(value, dimensions) {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || value.length > 8) return undefined;
+  const entities = value.map((entry) => {
+    const typeId = typeof entry?.typeId === "string" && CONTEXT_BLOCK_ID.test(entry.typeId)
+      ? entry.typeId : undefined;
+    const location = structurePoint(entry?.location, dimensions);
+    return typeId && location ? { typeId, location } : undefined;
+  });
+  return entities.every(Boolean) ? entities : undefined;
+}
+
+function verifiedInhabitantCounts(value) {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const entries = Object.entries(value);
+  if (entries.length > 8) return undefined;
+  const counts = entries.map(([typeId, count]) => (
+    CONTEXT_BLOCK_ID.test(typeId) && Number.isInteger(finiteInt(count, 0, 8))
+      ? [typeId, count] : undefined
+  ));
+  return counts.every(Boolean) ? Object.fromEntries(counts) : undefined;
+}
+
+function projectPoint(value) {
+  if (!Array.isArray(value) || value.length !== 3) return undefined;
+  const point = value.map((coordinate) => finiteInt(coordinate, -64, 64));
+  return point.every(Number.isInteger) ? point : undefined;
+}
+
+function projectText(value, max) {
+  return typeof value === "string"
+    ? value.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, max)
+    : "";
+}
+
+function projectSummary(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const title = projectText(value.title, 64);
+  const kind = projectText(value.kind, 64).toLowerCase();
+  const relativeOrigin = worldVector(value.relativeOrigin);
+  const min = projectPoint(value.bounds?.min);
+  const max = projectPoint(value.bounds?.max);
+  if (!title || !kind || !relativeOrigin || !min || !max
+    || min.some((coordinate, axis) => coordinate > max[axis])) return undefined;
+  const placements = Array.isArray(value.placements) ? value.placements.slice(0, 128)
+    .map((entry) => {
+      const itemId = typeof entry?.itemId === "string" && CONTEXT_BLOCK_ID.test(entry.itemId)
+        ? entry.itemId : undefined;
+      const target = projectPoint(entry?.target);
+      const support = projectPoint(entry?.support);
+      const orientationTarget = entry?.orientationTarget === null ? null : projectPoint(entry?.orientationTarget);
+      return itemId && target && support && orientationTarget !== undefined
+        ? { itemId, target, support, orientationTarget } : undefined;
+    }).filter(Boolean) : [];
+  const interactions = Array.isArray(value.interactions) ? value.interactions.slice(0, 24)
+    .map((entry) => {
+      const action = entry?.action === "use_item_on_block" ? entry.action : undefined;
+      const itemId = typeof entry?.itemId === "string" && CONTEXT_BLOCK_ID.test(entry.itemId)
+        ? entry.itemId : undefined;
+      const block = projectPoint(entry?.block);
+      const faceTarget = projectPoint(entry?.faceTarget);
+      return action && itemId && block && faceTarget ? { action, itemId, block, faceTarget } : undefined;
+    }).filter(Boolean) : [];
+  return { title, kind, relativeOrigin, bounds: { min, max }, placements, interactions };
 }
 
 export function validateWorldContext(value) {
@@ -106,6 +177,9 @@ export function validateWorldContext(value) {
     : [];
   const primitives = validDimensions
     ? structurePrimitives(value.lastStructure?.primitives, validDimensions) : undefined;
+  const entities = validDimensions
+    ? structureEntities(value.lastStructure?.entities, validDimensions) : undefined;
+  const verifiedInhabitants = verifiedInhabitantCounts(value.lastStructure?.verifiedInhabitants);
   const lastStructure = typeof value.lastStructure?.kind === "string" ? {
     kind: value.lastStructure.kind.replace(/[^a-zA-Z0-9 _-]/g, "").slice(0, 48),
     title: String(value.lastStructure.title || "").replace(/[^a-zA-Z0-9 _-]/g, "").slice(0, 64),
@@ -113,8 +187,11 @@ export function validateWorldContext(value) {
     ...(Object.values(materials).every(Boolean) ? { materials } : {}),
     ...(features.length ? { features } : {}),
     ...(primitives?.length ? { primitives } : {}),
+    ...(entities?.length ? { entities } : {}),
+    ...(verifiedInhabitants && Object.keys(verifiedInhabitants).length ? { verifiedInhabitants } : {}),
     relativeOrigin: worldVector(value.lastStructure.relativeOrigin),
   } : undefined;
+  const lastProject = projectSummary(value.lastProject);
   const buildState = ["idle", "queued", "building"].includes(value.buildState)
     ? value.buildState : "idle";
   return {
@@ -122,6 +199,7 @@ export function validateWorldContext(value) {
     nearbyBlocks,
     nearbyEntities,
     ...(lastStructure?.kind && lastStructure.dimensions ? { lastStructure } : {}),
+    ...(lastProject ? { lastProject } : {}),
   };
 }
 
@@ -135,6 +213,14 @@ function sendJson(response, status, value) {
   response.end(body);
 }
 
+async function recordInteraction(interactionLog, method, value, logger) {
+  try {
+    await interactionLog?.[method]?.(value);
+  } catch (error) {
+    logger.error?.(`[interaction-log] ${error.stack || error}`);
+  }
+}
+
 function authorized(request, expectedToken) {
   const supplied = request.headers.authorization?.replace(/^Bearer\s+/i, "") || "";
   const expected = Buffer.from(expectedToken);
@@ -142,7 +228,7 @@ function authorized(request, expectedToken) {
   return expected.length === actual.length && timingSafeEqual(expected, actual);
 }
 
-async function readJson(request) {
+export async function readJson(request) {
   const declaredLength = Number(request.headers["content-length"] || 0);
   if (declaredLength > MAX_BODY_BYTES) {
     const error = new Error("request body is too large");
@@ -187,10 +273,18 @@ export function validateAskBody(body) {
   const mode = body.mode === "general" ? "general" : "wizard";
   const requestId = typeof body.requestId === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(body.requestId)
     ? body.requestId : undefined;
+  const goalId = typeof body.goalId === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(body.goalId)
+    ? body.goalId : undefined;
+  if (body.goalId !== undefined && !goalId) {
+    const error = new Error("goalId must be 1–64 letters, numbers, underscores, or dashes");
+    error.status = 400;
+    throw error;
+  }
   const context = validateWorldContext(body.context);
   return {
     question, player, mode,
     ...(requestId && { requestId }),
+    ...(goalId && { goalId }),
     ...(context && { context }),
   };
 }
@@ -227,10 +321,33 @@ export function validateActionResultBody(body) {
     throw error;
   }
   const detail = body.detail?.replace(/[\u0000-\u001f\u007f]+/g, " ").trim();
-  return { player, requestId, status: body.status, ...(detail && { detail }) };
+  const context = validateWorldContext(body.context);
+  if (body.context !== undefined && !context) {
+    const error = new Error("context must be a valid live-world snapshot");
+    error.status = 400;
+    throw error;
+  }
+  if (body.status === "completed" && !context) {
+    const error = new Error("completed actions require a fresh live-world context");
+    error.status = 400;
+    throw error;
+  }
+  return {
+    player, requestId, status: body.status,
+    ...(detail && { detail }),
+    ...(context && { context }),
+  };
 }
 
-export function createHttpServer({ wizard, corpus, token, maxConcurrent = 4, cooldownMs = 1_500, logger = console }) {
+export function createHttpServer({
+  wizard,
+  corpus,
+  token,
+  interactionLog,
+  maxConcurrent = 4,
+  cooldownMs = 1_500,
+  logger = console,
+}) {
   let inFlight = 0;
   const lastRequestAt = new Map();
   return createNodeServer(async (request, response) => {
@@ -264,7 +381,9 @@ export function createHttpServer({ wizard, corpus, token, maxConcurrent = 4, coo
         return;
       }
       try {
-        const result = await wizard.recordActionResult(validateActionResultBody(await readJson(request)));
+        const actionResult = validateActionResultBody(await readJson(request));
+        const result = await wizard.recordActionResult(actionResult);
+        await recordInteraction(interactionLog, "recordActionResult", { ...actionResult, result }, logger);
         if (!result.matched) {
           sendJson(response, 404, { error: "matching action was not found" });
           return;
@@ -292,7 +411,7 @@ export function createHttpServer({ wizard, corpus, token, maxConcurrent = 4, coo
 
     inFlight += 1;
     try {
-      const { question, player, mode, requestId, context } = validateAskBody(await readJson(request));
+      const { question, player, mode, requestId, goalId, context } = validateAskBody(await readJson(request));
       const now = Date.now();
       if (now - (lastRequestAt.get(player) || 0) < cooldownMs) {
         sendJson(response, 429, { error: "please wait a moment before asking again" });
@@ -300,9 +419,16 @@ export function createHttpServer({ wizard, corpus, token, maxConcurrent = 4, coo
       }
       lastRequestAt.set(player, now);
       logger.log("[mc-wizard] ask request received");
-      const result = await wizard.ask({ question, player, mode, requestId, context });
+      const result = await wizard.ask({
+        question, player, mode, requestId, context,
+        ...(goalId && { goalRetry: { goalId } }),
+      });
+      await recordInteraction(interactionLog, "recordAsk", {
+        question, player, mode, requestId, result,
+      }, logger);
       sendJson(response, 200, result);
-      logger.log("[mc-wizard] ask response sent; action=" + (result.action?.id || "none"));
+      logger.log("[mc-wizard] ask response sent; action="
+        + (result.action?.id || result.action?.plan?.title || result.action?.type || "none"));
     } catch (error) {
       if (!error.status || error.status >= 500) logger.error(`[server] ${error.stack || error}`);
       sendJson(response, error.status || 500, {
@@ -322,9 +448,21 @@ export async function startServer({ env = process.env, logger = console } = {}) 
     throw new Error("Refusing a default or short bridge token on a non-loopback address; use at least 24 characters");
   }
   const corpus = await loadCorpus();
+  const configuredWizardSalt = String(env.WIZARD_SALT || "").trim();
+  const privateWizardSalt = configuredWizardSalt.length >= 24
+    && configuredWizardSalt !== "change-me-before-sharing";
+  if (configuredWizardSalt && !privateWizardSalt) {
+    logger.warn("[mc-wizard] ignoring default or short WIZARD_SALT");
+  }
+  const privateBridgeToken = token !== "dev-only-change-me" && token.length >= 24;
+  const wizardSalt = privateWizardSalt
+    ? configuredWizardSalt
+    : privateBridgeToken
+      ? createHmac("sha256", token).update("mc-wizard:server-private-state:v1").digest("hex")
+      : randomBytes(32).toString("hex");
   const sessions = await createFileSessionStore({
     filePath: env.SESSION_FILE || "runtime/brain/sessions.json",
-    salt: env.WIZARD_SALT || token,
+    salt: wizardSalt,
     maxTurns: Math.min(Math.max(Number(env.SESSION_MAX_TURNS) || 12, 1), 50),
     ttlMs: Math.min(Math.max(Number(env.SESSION_TTL_MS) || 86_400_000, 60_000), 30 * 86_400_000),
   });
@@ -332,13 +470,18 @@ export async function startServer({ env = process.env, logger = console } = {}) 
   const wizard = createWizard({
     corpus,
     env,
+    safetySalt: wizardSalt,
     logger,
     sessions,
     settings: () => readRuntimeSettings(settingsFile, logger),
   });
+  const interactionLog = createInteractionLog({
+    filePath: env.INTERACTION_LOG_FILE || "runtime/brain/interactions.jsonl",
+    salt: wizardSalt,
+  });
   const port = Number(env.PORT) || 3000;
   const cooldownMs = Math.min(Math.max(Number(env.REQUEST_COOLDOWN_MS) || 1_500, 0), 60_000);
-  const server = createHttpServer({ wizard, corpus, token, cooldownMs, logger });
+  const server = createHttpServer({ wizard, corpus, token, interactionLog, cooldownMs, logger });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);

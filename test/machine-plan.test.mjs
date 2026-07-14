@@ -5,6 +5,7 @@ import test from "node:test";
 import { allowedWizardAction, wizardSkillPrompt } from "../src/skills.mjs";
 import { classifyAction, createWizard } from "../src/wizard.mjs";
 import {
+  foldPlacementSteps,
   machineBlueprint,
   validateMachinePlan,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/machine-plan.js";
@@ -51,6 +52,33 @@ const flyingMachinePlan = {
   interactions: [],
 };
 
+const netherPortalPlan = {
+  title: "Nether Portal",
+  kind: "nether portal",
+  placements: [
+    place("minecraft:obsidian", [0, 0, 2], [0, -1, 2]),
+    place("minecraft:obsidian", [1, 0, 2], [0, 0, 2]),
+    place("minecraft:obsidian", [2, 0, 2], [1, 0, 2]),
+    place("minecraft:obsidian", [3, 0, 2], [2, 0, 2]),
+    place("minecraft:obsidian", [0, 1, 2], [0, 0, 2]),
+    place("minecraft:obsidian", [0, 2, 2], [0, 1, 2]),
+    place("minecraft:obsidian", [0, 3, 2], [0, 2, 2]),
+    place("minecraft:obsidian", [0, 4, 2], [0, 3, 2]),
+    place("minecraft:obsidian", [3, 1, 2], [3, 0, 2]),
+    place("minecraft:obsidian", [3, 2, 2], [3, 1, 2]),
+    place("minecraft:obsidian", [3, 3, 2], [3, 2, 2]),
+    place("minecraft:obsidian", [3, 4, 2], [3, 3, 2]),
+    place("minecraft:obsidian", [1, 4, 2], [0, 4, 2]),
+    place("minecraft:obsidian", [2, 4, 2], [1, 4, 2]),
+  ],
+  interactions: [{
+    action: "use_item_on_block",
+    itemId: "minecraft:flint_and_steel",
+    block: [1, 0, 2],
+    faceTarget: [1, 1, 2],
+  }],
+};
+
 test("validates bounded player-action plans for long-tail farms and machines", () => {
   const farm = machineBlueprint(sugarCanePlan);
   const flying = machineBlueprint(flyingMachinePlan);
@@ -86,6 +114,43 @@ test("rejects unsafe machine items, arbitrary breaking, and unbounded directions
     ...sugarCanePlan,
     interactions: [{ action: "use_item_on_block", itemId: "minecraft:lava_bucket", block: [0, -1, 2], faceTarget: [0, 0, 2] }],
   }), /itemId is not allowed/);
+});
+
+test("builds and lights a complete model-authored Nether portal before verifying its interior", () => {
+  const portal = machineBlueprint(netherPortalPlan);
+  assert.equal(portal.placements[0].expectedType, "minecraft:obsidian");
+  assert.equal(portal.preInteractions.length, 0);
+  assert.equal(portal.interactions[0].itemId, "minecraft:flint_and_steel");
+  assert.equal(portal.interactions[0].expectedFaceType, "minecraft:portal");
+  assert.equal(portal.interactions[0].expectedFaceBlocks.length, 6);
+  assert.equal(portal.verification.filter(({ kind, typeId }) => (
+    kind === "block_type" && typeId === "minecraft:portal"
+  )).length, 6);
+  assert.equal(allowedWizardAction({ type: "build_machine", version: 1, plan: netherPortalPlan }).plan.kind, "nether portal");
+});
+
+test("folds ordered placement and break operations into final project state", () => {
+  assert.deepEqual(foldPlacementSteps([
+    place("minecraft:smooth_stone", [0, 0, 1], [0, -1, 1]),
+    { action: "break", target: [0, 0, 1] },
+    place("minecraft:chest", [0, 0, 1], [0, -1, 1]),
+    place("minecraft:glass", [1, 0, 1], [1, -1, 1]),
+    { action: "break", target: [1, 0, 1] },
+  ]), [place("minecraft:chest", [0, 0, 1], [0, -1, 1])]);
+});
+
+test("rejects ignition without a complete bounded obsidian portal frame", () => {
+  assert.throws(() => validateMachinePlan({
+    ...netherPortalPlan,
+    placements: netherPortalPlan.placements.slice(0, -1),
+  }), /complete vertical obsidian portal frame/);
+  assert.throws(() => validateMachinePlan({
+    ...netherPortalPlan,
+    placements: [
+      ...netherPortalPlan.placements,
+      place("minecraft:smooth_stone", [2, 1, 2], [2, 0, 2]),
+    ],
+  }), /complete vertical obsidian portal frame/);
 });
 
 test("uses the local sugar-cane fallback and accepts model-authored long-tail machines", async () => {
@@ -138,10 +203,16 @@ test("wires the machine-plan schema through the model skill and Bedrock executor
   const action = schema.properties.action.anyOf.find((candidate) => candidate.properties?.type?.const === "build_machine");
   assert.ok(action.properties.plan.properties.placements);
   assert.match(wizardSkillPrompt(), /build_bounded_machine/);
-  assert.match(pack, /import \{ machineBlueprint \} from "\.\/machine-plan\.js"/);
+  assert.match(pack, /import \{ foldPlacementSteps, machineBlueprint \} from "\.\/machine-plan\.js"/);
   assert.match(pack, /action\?\.type === "build_machine"/);
   assert.match(pack, /buildInteractiveBlueprint\(player, machineBlueprint\(value\)\)/);
   assert.match(pack, /interaction\.expectedFaceType/);
   assert.match(pack, /blueprint\.preInteractions/);
   assert.match(pack, /check\.kind === "block_facing"/);
+  const useItem = pack.slice(pack.indexOf("function useItemAsWizard"), pack.indexOf("function expectedHopperFacing"));
+  assert.match(useItem, /flint_and_steel[\s\S]*return "interaction-failed"/);
+  assert.match(useItem, /interactionIsSatisfied/);
+  assert.doesNotMatch(useItem, /setBlockType\(faceTarget, "minecraft:portal"\)/);
+  const repair = pack.slice(pack.indexOf("function repairBlueprintVerification"), pack.indexOf("async function buildInteractiveBlueprint"));
+  assert.match(repair, /check\.typeId !== "minecraft:portal"/);
 });

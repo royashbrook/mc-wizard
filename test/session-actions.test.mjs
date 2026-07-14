@@ -21,6 +21,7 @@ test("file sessions round-trip JSON-safe actions", async () => {
         question: "Build a wool farm",
         answer: "I’ll build it now.",
         requestId: "farm-1",
+        goalId: "goal-farm-1",
         status: "pending",
         action: {
           type: "build_machine",
@@ -39,6 +40,7 @@ test("file sessions round-trip JSON-safe actions", async () => {
         answer: "I’ll build it now.",
         action: { type: "build_machine", version: 1, plan: { kind: "wool farm" } },
         requestId: "farm-1",
+        goalId: "goal-farm-1",
         status: "pending",
         requestSequence: 1,
       },
@@ -59,6 +61,8 @@ test("reserved request order survives out-of-order file appends", async () => {
     const store = await createFileSessionStore({ filePath, salt });
     const first = store.reserve("OrderKid", "wizard");
     const second = store.reserve("OrderKid", "wizard");
+    assert.equal(store.isCurrent("OrderKid", "wizard", first), false);
+    assert.equal(store.isCurrent("OrderKid", "wizard", second), true);
     await store.append("OrderKid", "wizard", {
       question: "second", answer: "fast", action: null, requestSequence: second,
     });
@@ -70,6 +74,23 @@ test("reserved request order survives out-of-order file appends", async () => {
     const reloaded = await createFileSessionStore({ filePath, salt });
     assert.deepEqual(reloaded.get("OrderKid", "wizard").map(({ question }) => question), ["first", "second"]);
     assert.equal(reloaded.reserve("OrderKid", "wizard"), 3);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a file append cannot publish a reply superseded while persistence is pending", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-session-current-"));
+  const filePath = join(directory, "sessions.json");
+  try {
+    const store = await createFileSessionStore({ filePath, salt });
+    const first = store.reserve("OrderKid", "wizard");
+    const pending = store.appendIfCurrent("OrderKid", "wizard", {
+      question: "old request", answer: "old reply", action: null, requestSequence: first,
+    });
+    store.reserve("OrderKid", "wizard");
+    assert.equal(await pending, false);
+    assert.deepEqual(store.get("OrderKid", "wizard"), []);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -162,6 +183,7 @@ test("legacy version 1 action turns migrate to an unknown outcome", async () => 
   try {
     await writeFile(filePath, JSON.stringify({
       version: 1,
+      behaviorRevision: 3,
       sessions: {
         [`wizard:${playerHash}`]: {
           updatedAt: 1_000,
@@ -192,6 +214,33 @@ test("legacy version 1 action turns migrate to an unknown outcome", async () => 
         requestSequence: 2,
       },
     ]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("discards dialogue from an incompatible agent behavior revision", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-stale-session-"));
+  const filePath = join(directory, "sessions.json");
+  const player = "StaleKid";
+  const playerHash = createHmac("sha256", salt).update(player).digest("hex");
+  try {
+    await writeFile(filePath, JSON.stringify({
+      version: 1,
+      behaviorRevision: 2,
+      sessions: {
+        [`wizard:${playerHash}`]: {
+          updatedAt: 1_000,
+          turns: [{
+            question: "Build a portal",
+            answer: "I built a portal.",
+            action: { type: "build_structure", version: 1, plan: { kind: "nether portal" } },
+          }],
+        },
+      },
+    }));
+    const store = await createFileSessionStore({ filePath, salt, now: () => 1_000 });
+    assert.deepEqual(store.get(player, "wizard"), []);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

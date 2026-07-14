@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -52,8 +52,8 @@ const e2eScope = (process.env.MC_WIZARD_E2E_SCOPE || "full").trim();
 if (e2eEnabled && !e2eRun) {
   throw new Error("MC_WIZARD_E2E_RUN is required when MC_WIZARD_E2E=1");
 }
-if (!new Set(["full", "machines", "arbitrary", "child", "refinement", "farms", "kelp"]).has(e2eScope)) {
-  throw new Error("MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, child, refinement, farms, or kelp");
+if (!new Set(["full", "machines", "arbitrary", "portal", "travel-rollback", "city", "child", "refinement", "farms", "kelp"]).has(e2eScope)) {
+  throw new Error("MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, portal, travel-rollback, city, child, refinement, farms, or kelp");
 }
 const loopbackBrain = parsedUrl.hostname === "localhost"
   || parsedUrl.hostname === "[::1]"
@@ -122,9 +122,11 @@ await writeFile(path.join(configTarget, "variables.json"), `${JSON.stringify({
   mc_wizard_e2e_run: e2eRun,
   mc_wizard_e2e_scope: e2eScope,
 }, null, 2)}\n`);
-await writeFile(path.join(configTarget, "secrets.json"), `${JSON.stringify({
+const secretsFile = path.join(configTarget, "secrets.json");
+await writeFile(secretsFile, `${JSON.stringify({
   mc_wizard_authorization: `Bearer ${token}`,
-}, null, 2)}\n`);
+}, null, 2)}\n`, { mode: 0o600 });
+await chmod(secretsFile, 0o600);
 
 console.log(`Installed MC Wizard in ${serverRoot}`);
 console.log(`Activated behavior and wand resource packs for world: ${worldName}`);

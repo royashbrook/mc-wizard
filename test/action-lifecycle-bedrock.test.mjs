@@ -46,6 +46,81 @@ test("immediate world actions also report their observed result", () => {
   assert.match(packScript, /dropped > 0 \? "completed" : "failed"/);
 });
 
+test("an explicit no-action continuation stays visible and retries through the guarded brain path", () => {
+  const start = packScript.indexOf("function actionResultRetry");
+  const end = packScript.indexOf("function registerActionRequest", start);
+  const lifecycle = packScript.slice(start, end);
+  assert.match(lifecycle, /question\.length > 500/);
+  assert.match(lifecycle, /typeof value\.goalId === "string"/);
+  assert.match(lifecycle, /\^\[a-zA-Z0-9_\-\]\{1,64\}\$/);
+  assert.match(lifecycle, /\|\| !goalId/);
+  assert.match(lifecycle, /return \{ question, reason: value\.reason, goalId \}/);
+  assert.match(lifecycle, /value\.reason !== "failed-action" && value\.reason !== "staged-progress"/);
+  assert.match(lifecycle, /pendingQuestions\.set\(questionKey, retryToken\)/);
+  assert.match(lifecycle, /retry\.reason === "failed-action"/);
+  assert.match(lifecycle, /That first pass is in place and our goal is still active/);
+  assert.match(lifecycle, /our goal is still active/);
+  assert.match(lifecycle, /askBackend\(player\.id, retry\.question, "wizard", 0, retryToken, retry\.goalId\)/);
+  assert.match(packScript, /\.\.\.\(goalRetryId \? \{ goalId: goalRetryId \} : \{\}\)/);
+  assert.match(packScript, /askBackend\(playerId, question, mode, planningAttempt \+ 1, token, goalRetryId\)/);
+  assert.match(lifecycle, /system\.runTimeout/);
+  assert.match(lifecycle, /const executableReplan = result\.replan\?\.action/);
+  assert.ok(lifecycle.indexOf("if (executableReplan)") < lifecycle.indexOf("actionResultRetry(result.retry)"));
+});
+
+test("automatic continuations yield to newer child work and stop visibly at brain limits", () => {
+  const start = packScript.indexOf("function hasNewerAction");
+  const end = packScript.indexOf("function registerActionRequest", start);
+  const lifecycle = packScript.slice(start, end);
+  assert.match(lifecycle, /pendingQuestions\.has\(questionKey\) \|\| hasNewerAction/);
+  assert.match(lifecycle, /pendingQuestions\.get\(questionKey\) !== retryToken/);
+  const schedule = lifecycle.slice(
+    lifecycle.indexOf("function scheduleActionResultRetry"),
+    lifecycle.indexOf("async function postActionResult"),
+  );
+  assert.ok(schedule.indexOf("hasNewerAction(player.id, report.requestId)")
+    < schedule.indexOf("askBackend(player.id, retry.question"));
+  assert.match(lifecycle, /result\.superseded \|\| result\.replan\?\.superseded/);
+  assert.match(lifecycle, /result\.updated === false/);
+  assert.match(lifecycle, /result\.reviewLimitReached \|\| result\.retryLimitReached/);
+  assert.match(lifecycle, /reached my automatic retry limit/);
+  assert.ok(lifecycle.indexOf("result.reviewLimitReached") < lifecycle.indexOf("actionResultRetry(result.retry)"));
+  assert.match(lifecycle, /const abandoned = \/\\b\(\?:superseded\|player left\|all players left\|server stopp\)/);
+});
+
+test("intermediate planner retries stay conversational without speaking a false terminal answer", () => {
+  const start = packScript.indexOf("async function askBackend");
+  const end = packScript.indexOf("function cancelPendingQuestion", start);
+  const backend = packScript.slice(start, end);
+  const branch = backend.slice(backend.indexOf("if (retryPlanning)"), backend.indexOf("} catch (error)"));
+  assert.match(branch, /That design didn’t fit your goal\. I’m trying another one now/);
+  assert.match(branch, /\} else \{\n\s+applyResponse\(playerId, payload, question\)/);
+  assert.ok(branch.indexOf("if (retryPlanning)") < branch.indexOf("applyResponse(playerId, payload, question)"));
+});
+
+test("undo cancels an already scheduled goal continuation before restoring the build", () => {
+  const start = packScript.indexOf("function handleLocalCommand");
+  const end = packScript.indexOf("function shouldAddressWizard", start);
+  const commands = packScript.slice(start, end);
+  const undo = commands.slice(
+    commands.indexOf("if (/^(?:undo|undo"),
+    commands.indexOf("const wantsMovement"),
+  );
+  assert.match(undo, /cancelPendingQuestion\(player\)/);
+  assert.ok(undo.indexOf("cancelPendingQuestion(player)") < undo.indexOf("undoLastBuild(player)"));
+});
+
+test("failed immediate typed actions use the same no-action recovery boundary", () => {
+  const start = packScript.indexOf("function beginImmediateAction");
+  const end = packScript.indexOf("function bindBuildAction", start);
+  const immediate = packScript.slice(start, end);
+  assert.match(immediate, /function endImmediateAction\(report, status, detail\)/);
+  assert.match(immediate, /postActionResult\(report, status, detail\)/);
+  assert.match(packScript, /endImmediateAction\(report, "failed", `dimension travel failed/);
+  assert.match(packScript, /endImmediateAction\(report, "failed", "player left before world control completed"\)/);
+  assert.match(packScript, /endImmediateAction\(activeReport, "failed", "item delivery was interrupted before completion"\)/);
+});
+
 test("superseded and abandoned actions cannot remain pending forever", () => {
   assert.match(packScript, /postActionResult\(responseReport, "failed", "superseded before execution"\)/);
   assert.match(packScript, /endImmediateAction\(report, "failed", "player left before queued build started"\)/);

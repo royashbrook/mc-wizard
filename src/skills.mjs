@@ -53,6 +53,11 @@ export const WIZARD_SKILLS = [
     action: { type: "world_control", version: 1, time: "day", weather: "clear" },
   },
   {
+    name: "travel_to_dimension",
+    description: "Safely move the requesting player and nearby players together to the requested Bedrock dimension. Use this for requests to take, teleport, or travel to the Nether, Overworld, or End; do not build a portal-shaped structure as a substitute.",
+    action: { type: "dimension_travel", version: 1, destination: "nether" },
+  },
+  {
     name: "cast_splash_potion_rain",
     description: "Create a bounded shower of falling splash-potion projectiles around the player. Use this for imaginative requests to make splash potions rain from the sky; do not substitute ordinary weather rain.",
     action: { type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 },
@@ -101,6 +106,10 @@ export function allowedWizardAction(value) {
     const weather = ["clear", "rain", "thunder"].includes(value.weather) ? value.weather : undefined;
     return time || weather ? { type: "world_control", version: 1, ...(time && { time }), ...(weather && { weather }) } : null;
   }
+  if (value?.type === "dimension_travel") {
+    return value.version === 1 && ["overworld", "nether", "the_end"].includes(value.destination)
+      ? { type: "dimension_travel", version: 1, destination: value.destination } : null;
+  }
   if (value?.type === "potion_rain" && value.version === 1) {
     const radius = Math.min(12, Math.max(3, Math.floor(Number(value.radius) || 8)));
     const durationSeconds = Math.min(15, Math.max(3, Math.floor(Number(value.durationSeconds) || 8)));
@@ -144,6 +153,36 @@ export function allowedWizardAction(value) {
   ))?.action || null;
 }
 
+export function wizardActionRejection(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return "no action object";
+  if (value.version !== 1) return "action version must be 1";
+  try {
+    if (value.type === "build_structure") validateBuildStructurePlan(value.plan);
+    else if (value.type === "build_machine") validateMachinePlan(value.plan);
+    else if (value.type === "build_plan") validateBuildPlan(value.plan);
+    else return allowedWizardAction(value) ? null : "action is not registered or its arguments are invalid";
+    return null;
+  } catch (error) {
+    return String(error?.message || error).slice(0, 240);
+  }
+}
+
+export function allowedWizardGoal(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  if (Object.keys(value).some((key) => !["objective", "successCriteria", "status"].includes(key))) return null;
+  const clean = (text) => typeof text === "string"
+    ? text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim() : "";
+  const objective = clean(value.objective);
+  const successCriteria = clean(value.successCriteria);
+  if (!objective || objective.length > 500 || !successCriteria || successCriteria.length > 500
+    || !["active", "complete"].includes(value.status)) return null;
+  return { objective, successCriteria, status: value.status };
+}
+
+export function wizardGoalPrompt() {
+  return `For an in-world request, include goal={"objective":"the player's intended result","successCriteria":"observable facts that prove the result works","status":"active"}. Keep the same goal for follow-up corrections and revise its objective or success criteria from the player's feedback; return a concrete corrective action at the existing project instead of action=null or a replacement build. Use status="complete" only after the live-world observation proves every success criterion.`;
+}
+
 export function wizardSkillPrompt() {
   return [...WIZARD_SKILLS, {
     name: "show_crafting_recipe",
@@ -151,5 +190,6 @@ export function wizardSkillPrompt() {
     action: { type: "show_recipe", version: 1, itemId: "minecraft:crafting_table" },
   }]
     .map(({ name, description, action }) => `- ${name}: ${description}\n  action=${JSON.stringify(action)}`)
-    .join("\n");
+    .join("\n")
+    + `\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
 }

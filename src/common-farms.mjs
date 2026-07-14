@@ -85,6 +85,14 @@ function pistonFarm(title, kind, crop, needsWater = false) {
       ...[-1, 1].flatMap((x) => [4, 5].map((y) => (
         place("minecraft:glass", [x, y, 1], [x, y - 1, 1])
       ))),
+      // Close the harvest chamber. Broken cane can bounce upward in Bedrock;
+      // this roof sends it back down over the hopper minecart.
+      place("minecraft:glass", [-1, 6, 0], [-1, 5, 0]),
+      place("minecraft:glass", [0, 6, 0], [-1, 6, 0]),
+      place("minecraft:glass", [1, 6, 0], [1, 5, 0]),
+      place("minecraft:glass", [-1, 6, 1], [-1, 5, 1]),
+      place("minecraft:glass", [0, 6, 1], [-1, 6, 1]),
+      place("minecraft:glass", [1, 6, 1], [1, 5, 1]),
       place("minecraft:glass", [0, 3, 2], [1, 3, 2]),
 
       // Swap the temporary soil support for a rail. The hopper minecart sits

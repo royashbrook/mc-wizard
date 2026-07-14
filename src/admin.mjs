@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
+import { readRecentInteractions } from "./interaction-log.mjs";
 import { readRuntimeSettings, writeRuntimeSettings } from "./runtime-settings.mjs";
 
 const MAX_BODY_BYTES = 20 * 1024;
@@ -18,6 +19,22 @@ function send(response, status, body, type = "application/json; charset=utf-8") 
 }
 
 async function readJson(request) {
+  const contentType = String(request.headers?.["content-type"] || "")
+    .split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/json") {
+    throw Object.assign(new Error("content-type must be application/json"), { status: 415 });
+  }
+  if (request.headers?.["sec-fetch-site"] === "cross-site") {
+    throw Object.assign(new Error("cross-site requests are not allowed"), { status: 403 });
+  }
+  const origin = request.headers?.origin;
+  if (origin) {
+    let originHost;
+    try { originHost = new URL(origin).host; } catch {}
+    if (!originHost || originHost !== request.headers?.host) {
+      throw Object.assign(new Error("cross-origin requests are not allowed"), { status: 403 });
+    }
+  }
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
@@ -104,6 +121,7 @@ const PAGE = `<!doctype html>
     </div>
     <div class="stack">
       <section class="panel"><h2>AI tuning</h2><p class="help">Saved changes apply to the next AI request. Bedrock does not restart. Core safety and action contracts remain active.</p><label class="check"><input type="checkbox" id="aiEnabled">Use the configured AI provider</label><label>MC Wizard prompt addendum<textarea id="wizardPrompt" placeholder="Example: Keep replies under four sentences unless the player asks for a lesson."></textarea></label><label>General AI prompt addendum<textarea id="generalPrompt" placeholder="Example: Use short section headings for long guides."></textarea></label><div class="row"><label>Wizard max output tokens<input id="wizardTokens" type="number" min="64" max="3000" placeholder="Use environment default"></label><label>General max output tokens<input id="generalTokens" type="number" min="64" max="3000" placeholder="Use environment default"></label></div><div class="actions" style="margin-top:16px"><button class="button primary" id="save">Save live tuning</button><button class="button" id="reload">Discard edits</button></div><div class="saved" id="saveStatus"></div></section>
+      <section class="panel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><h2>Recent kid interactions</h2><p class="help">Persistent Wizard and general-AI requests, replies, and action outcomes. Player names are replaced with stable private hashes.</p></div><button class="button" id="refreshInteractions">Refresh</button></div><pre id="interactions">Loading...</pre></section>
       <section class="panel"><div style="display:flex;justify-content:space-between;gap:12px;align-items:center"><div><h2>Recent server log</h2><p class="help">Console replies and player activity appear here. Routine Bedrock database compaction is hidden; it is not AI activity and uses no tokens.</p></div><button class="button" id="refreshLogs">Refresh</button></div><pre id="logs">Loading...</pre></section>
     </div>
   </div>
@@ -117,13 +135,16 @@ async function saveSettings(){try{await api("/api/settings",{method:"PUT",body:J
 async function sendCommand(command,confirmFirst=true){if(confirmFirst&&!window.confirm('Run "'+command+'" on the Bedrock server?'))return;$("consoleStatus").textContent="Sending...";try{await api("/api/console",{method:"POST",body:JSON.stringify({command})});$("consoleStatus").textContent='Sent: '+command;setTimeout(loadLogs,600)}catch(error){$("consoleStatus").textContent=error.message}}
 async function ask(){$("answer").textContent="Thinking...";try{const value=await api("/api/ask",{method:"POST",body:JSON.stringify({question:$("question").value,mode:$("mode").value})});$("answer").textContent=value.answer+(value.action?'\\n\\nAction: '+JSON.stringify(value.action):'')+(value.title?'\\n\\nBook title: '+value.title:'')}catch(error){$("answer").textContent=error.message}}
 let logsLoading=false;async function loadLogs(){if(logsLoading)return;logsLoading=true;try{const panel=$("logs");panel.textContent=(await api("/api/logs")).logs||"No log output yet.";requestAnimationFrame(()=>{panel.scrollTop=panel.scrollHeight})}catch(error){$("logs").textContent=error.message}finally{logsLoading=false}}
-document.querySelectorAll(".quick").forEach(button=>button.onclick=()=>sendCommand(button.dataset.command,false));$("send").onclick=()=>sendCommand($("command").value);$("command").onkeydown=event=>{if(event.key==="Enter")sendCommand($("command").value)};$("save").onclick=saveSettings;$("reload").onclick=loadSettings;$("ask").onclick=ask;$("clearSession").onclick=async()=>{await api("/api/session",{method:"DELETE",body:JSON.stringify({mode:$("mode").value})});$("answer").textContent="Test session cleared."};$("refreshLogs").onclick=loadLogs;
-Promise.all([status(),loadSettings(),loadLogs()]);setInterval(status,5000);setInterval(loadLogs,4000);
+function formatInteraction(entry){const time=new Date(entry.timestamp).toLocaleTimeString();const who=(entry.playerHash||"unknown").slice(0,10);if(entry.event==="ask")return '['+time+'] '+entry.mode+'/'+who+' > '+(entry.input||'')+'\\n['+time+'] '+(entry.mode==='general'?'AI':'MC Wizard')+' < '+(entry.answer||'')+(entry.actionLabel?'\\n  action: '+entry.actionLabel:'')+(entry.requestId?' · request '+entry.requestId:'');return '['+time+'] action/'+who+' '+(entry.outcome?.status||'unknown')+' '+entry.requestId+(entry.detail?' — '+entry.detail:'')+(entry.actionLabel?'\\n  next action: '+entry.actionLabel:'')+(entry.answer?'\\n  MC Wizard < '+entry.answer:'')}
+let interactionsLoading=false;async function loadInteractions(){if(interactionsLoading)return;interactionsLoading=true;try{const panel=$("interactions");const entries=(await api("/api/interactions")).interactions||[];panel.textContent=entries.length?entries.map(formatInteraction).join('\\n\\n'):"No interactions recorded yet.";requestAnimationFrame(()=>{panel.scrollTop=panel.scrollHeight})}catch(error){$("interactions").textContent=error.message}finally{interactionsLoading=false}}
+document.querySelectorAll(".quick").forEach(button=>button.onclick=()=>sendCommand(button.dataset.command,false));$("send").onclick=()=>sendCommand($("command").value);$("command").onkeydown=event=>{if(event.key==="Enter")sendCommand($("command").value)};$("save").onclick=saveSettings;$("reload").onclick=loadSettings;$("ask").onclick=ask;$("clearSession").onclick=async()=>{await api("/api/session",{method:"DELETE",body:JSON.stringify({mode:$("mode").value})});$("answer").textContent="Test session cleared."};$("refreshLogs").onclick=loadLogs;$("refreshInteractions").onclick=loadInteractions;
+Promise.all([status(),loadSettings(),loadLogs(),loadInteractions()]);setInterval(status,5000);setInterval(loadLogs,4000);setInterval(loadInteractions,4000);
 </script>
 </body></html>`;
 
 export function createAdminServer({
   settingsFile = "runtime/admin/settings.json",
+  interactionsFile = "runtime/brain/interactions.jsonl",
   brainUrl = "http://127.0.0.1:3000",
   bridgeToken = "dev-only-change-me",
   fetchImpl = fetch,
@@ -143,6 +164,9 @@ export function createAdminServer({
           execute("container", ["exec", "mc-wizard-bedrock", "true"]),
         ]);
         return send(response, 200, { bedrock: bedrock.code === 0, brain: Boolean(brain.ok), provider: Boolean(brain.provider && brain.provider !== "offline"), providerName: brain.provider || "Offline" });
+      }
+      if (request.method === "GET" && url.pathname === "/api/interactions") {
+        return send(response, 200, { interactions: await readRecentInteractions(interactionsFile) });
       }
       if (request.method === "GET" && url.pathname === "/api/logs") {
         const result = await execute("container", ["logs", "-n", "120", "mc-wizard-bedrock"]);
@@ -188,6 +212,7 @@ export async function startAdminServer({ env = process.env, logger = console } =
   const brainHost = env.HOST || "127.0.0.1";
   const server = createAdminServer({
     settingsFile: env.RUNTIME_SETTINGS_FILE || "runtime/admin/settings.json",
+    interactionsFile: env.INTERACTION_LOG_FILE || "runtime/brain/interactions.jsonl",
     brainUrl: `http://${brainHost}:${env.PORT || 3000}`,
     bridgeToken: env.BRIDGE_TOKEN || "dev-only-change-me",
     logger,

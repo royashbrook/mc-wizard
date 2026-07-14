@@ -6,8 +6,18 @@ import { itemSorterFillerItem, itemSorterFillerName } from "./item-sorter.js";
 
 const TEST_TAG = "mcwizard:e2e";
 const TICKING_AREA = "mc_wizard_e2e";
+const E2E_TRAVEL_FAULT_PROPERTY = "mcwizard:e2e_travel_fault";
 const POLL_TICKS = 10;
 const TIMEOUT_TICKS = 1_200;
+const NON_STRUCTURAL_BLOCKS = new Set([
+  "minecraft:air",
+  "minecraft:cave_air",
+  "minecraft:void_air",
+  "minecraft:water",
+  "minecraft:flowing_water",
+  "minecraft:lava",
+  "minecraft:flowing_lava",
+]);
 let runId = "";
 let testName = "";
 let chatCallbacks;
@@ -329,17 +339,49 @@ function countBlocks(dimension, min, max, typeId) {
   return count;
 }
 
+function blockIsStructural(dimension, location) {
+  const block = dimension.getBlock(location);
+  if (!block) return false;
+  if (/(?:_fence|_fence_gate|_wall|_slab|_stairs)$/.test(block.typeId)) return true;
+  if (typeof block.isSolid === "boolean") return block.isSolid;
+  return !NON_STRUCTURAL_BLOCKS.has(block.typeId);
+}
+
+function rectangleIsStructural(dimension, x, y, z, width, depth) {
+  for (let dx = 0; dx < width; dx += 1) {
+    for (let dz = 0; dz < depth; dz += 1) {
+      if (!blockIsStructural(dimension, { x: x + dx, y, z: z + dz })) return false;
+    }
+  }
+  return true;
+}
+
+function countStructuralBlocks(dimension, min, max) {
+  let count = 0;
+  for (let x = min.x; x <= max.x; x += 1) {
+    for (let y = min.y; y <= max.y; y += 1) {
+      for (let z = min.z; z <= max.z; z += 1) {
+        if (blockIsStructural(dimension, { x, y, z })) count += 1;
+      }
+    }
+  }
+  return count;
+}
+
 function prepareArbitraryStructureStation(kid, station) {
   const dimension = kid.dimension;
   dimension.runCommand(
-    `fill ${station.x - 20} ${station.y - 1} ${station.z - 20} ${station.x + 20} ${station.y - 1} ${station.z + 20} grass_block replace`,
+    `fill ${station.x - 20} ${station.y - 1} ${station.z - 20} ${station.x + 20} ${station.y - 1} ${station.z + 42} grass_block replace`,
   );
   // Split the clear so each fill remains below Bedrock's command volume limit.
   dimension.runCommand(
-    `fill ${station.x - 20} ${station.y} ${station.z - 20} ${station.x + 20} ${station.y + 7} ${station.z + 20} air replace`,
+    `fill ${station.x - 20} ${station.y} ${station.z - 20} ${station.x + 20} ${station.y + 7} ${station.z + 42} air replace`,
   );
   dimension.runCommand(
-    `fill ${station.x - 20} ${station.y + 8} ${station.z - 20} ${station.x + 20} ${station.y + 15} ${station.z + 20} air replace`,
+    `fill ${station.x - 20} ${station.y + 8} ${station.z - 20} ${station.x + 20} ${station.y + 15} ${station.z + 42} air replace`,
+  );
+  dimension.runCommand(
+    `fill ${station.x - 20} ${station.y + 16} ${station.z - 20} ${station.x + 20} ${station.y + 23} ${station.z + 42} air replace`,
   );
 }
 
@@ -480,24 +522,489 @@ async function runArbitraryStructureAcceptance(kid) {
   }
 }
 
+function findLitNetherPortal(kid, station) {
+  const dimension = kid.dimension;
+  const frameAt = (x, y, z, axis) => {
+    const point = (horizontal, vertical) => axis === "x"
+      ? { x: x + horizontal, y: y + vertical, z }
+      : { x, y: y + vertical, z: z + horizontal };
+    for (let horizontal = 0; horizontal < 4; horizontal += 1) {
+      if (dimension.getBlock(point(horizontal, 0))?.typeId !== "minecraft:obsidian") return false;
+      if (dimension.getBlock(point(horizontal, 4))?.typeId !== "minecraft:obsidian") return false;
+    }
+    for (let vertical = 1; vertical < 4; vertical += 1) {
+      if (dimension.getBlock(point(0, vertical))?.typeId !== "minecraft:obsidian") return false;
+      if (dimension.getBlock(point(3, vertical))?.typeId !== "minecraft:obsidian") return false;
+      for (let horizontal = 1; horizontal < 3; horizontal += 1) {
+        if (dimension.getBlock(point(horizontal, vertical))?.typeId !== "minecraft:portal") return false;
+      }
+    }
+    return true;
+  };
+  for (let x = station.x - 18; x <= station.x + 18; x += 1) {
+    for (let y = station.y; y <= station.y + 8; y += 1) {
+      for (let z = station.z - 18; z <= station.z + 18; z += 1) {
+        if (frameAt(x, y, z, "x") || frameAt(x, y, z, "z")) return { x, y, z };
+      }
+    }
+  }
+  return undefined;
+}
+
+async function runPortalTravelAcceptance(kid) {
+  const check = "portal-travel-pipeline";
+  const station = {
+    x: Math.floor(kid.location.x),
+    y: Math.round(kid.location.y),
+    z: Math.floor(kid.location.z),
+  };
+  let currentRequest = "fixture preparation";
+  try {
+    kid.dimension.runCommand(`tickingarea remove ${TICKING_AREA}`);
+    kid.dimension.runCommand(`tickingarea add circle ${station.x} ${station.y} ${station.z} 4 ${TICKING_AREA} true`);
+    await prepareAcceptanceStation(kid, station);
+    await teleportToStation(kid, station);
+    await system.waitTicks(20);
+
+    currentRequest = "build and light a Nether portal here";
+    const portalTransport = await routeWizardRequest(
+      kid,
+      "wizard, build and light a Nether portal here",
+      "lit-nether-portal",
+    );
+    await waitFor(
+      () => chatCallbacks.hasCommittedBuild(kid.id) && Boolean(findLitNetherPortal(kid, station)),
+      TIMEOUT_TICKS * 2,
+      "a complete obsidian frame containing all six live portal blocks",
+    );
+    report("CHECK", "portal-build", `request via ${portalTransport}; complete lit 4x5 frame verified`);
+
+    currentRequest = "teleport us to the Nether";
+    const travelTransport = await routeWizardRequest(
+      kid,
+      "wizard, teleport us to the Nether",
+      "nether-party-travel",
+    );
+    await waitFor(() => {
+      const wizardPlayer = world.getAllPlayers().find((player) => player.name === "MC Wizard");
+      return kid.dimension.id === "minecraft:nether"
+        && wizardPlayer?.dimension.id === "minecraft:nether";
+    }, 600, "Test Kid and MC Wizard to arrive together in the Nether");
+    report("CHECK", "dimension-travel", `request via ${travelTransport}; child and visible Wizard arrived together`);
+    report(
+      "PASS",
+      check,
+      "the Wizard built and physically lit a complete Nether portal, then moved the child and his visible player body safely into the Nether",
+    );
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    report("FAIL", check, `${currentRequest}: ${String(error)}`);
+    try { kid.disconnect(); } catch {}
+  }
+}
+
+function readE2ETravelFault() {
+  try {
+    return JSON.parse(String(world.getDynamicProperty(E2E_TRAVEL_FAULT_PROPERTY) || ""));
+  } catch {
+    return undefined;
+  }
+}
+
+async function runDimensionTravelRollbackAcceptance(kid) {
+  const check = "dimension-travel-rollback";
+  const companionName = `WizPal-${runId.slice(0, 8)}`;
+  let companion;
+  let state;
+  try {
+    const sourceDimension = kid.dimension.id;
+    companion = spawnSimulatedPlayer({
+      dimension: kid.dimension,
+      x: kid.location.x + 2,
+      y: kid.location.y,
+      z: kid.location.z,
+    }, companionName, GameMode.Creative);
+    companion.addTag(TEST_TAG);
+    await system.waitTicks(2);
+    world.setDynamicProperty(E2E_TRAVEL_FAULT_PROPERTY, JSON.stringify({
+      run: runId,
+      mode: "hold-last-traveler",
+      phase: "armed",
+      injections: 0,
+      partialObserved: false,
+      rollbackObserved: false,
+    }));
+
+    const transport = await routeWizardRequest(
+      kid,
+      "wizard, teleport all of us to the Nether",
+      "faulted-nether-party-travel",
+    );
+    await waitFor(() => {
+      state = readE2ETravelFault();
+      return state?.run === runId && state.phase === "finished";
+    }, TIMEOUT_TICKS, "the real dimension-travel path to finish its injected partial failure");
+
+    const wizardPlayer = world.getAllPlayers().find((player) => player.name === "MC Wizard");
+    if (!wizardPlayer?.isValid || !companion?.isValid) {
+      throw new Error("the captured child party and visible Wizard did not remain observable");
+    }
+    const travelers = [kid, companion, wizardPlayer];
+    const finalDimensions = travelers.map((member) => member.dimension.id);
+    const converged = new Set(finalDimensions).size === 1;
+    const destination = finalDimensions.every((dimensionId) => dimensionId === "minecraft:nether");
+    const rolledBack = finalDimensions.every((dimensionId) => dimensionId === sourceDimension);
+    if (state.travelerCount !== travelers.length
+      || !state.travelerNames?.includes(companionName)
+      || !state.travelerNames?.includes("MC Wizard")) {
+      throw new Error(`the production travel path did not capture the full party: ${JSON.stringify(state)}`);
+    }
+    if (!state.partialObserved || !state.rollbackObserved || Number(state.injections) < 1) {
+      throw new Error(`the deterministic partial failure did not exercise rollback: ${JSON.stringify(state)}`);
+    }
+    if (!converged || (!destination && !rolledBack)) {
+      throw new Error(`split party after recovery: ${finalDimensions.join(",")}`);
+    }
+    report(
+      "CHECK",
+      check,
+      `request via ${transport}; injected=${state.injections}; partial=true; rollback=true; outcome=${destination ? "destination" : "source"}; dimensions=${finalDimensions.join(",")}`,
+    );
+    report(
+      "PASS",
+      check,
+      "a two-child party and the visible Wizard exercised a real partial realm hop and finished together with nobody stranded across dimensions",
+    );
+  } catch (error) {
+    report("FAIL", check, String(error));
+  } finally {
+    world.setDynamicProperty(E2E_TRAVEL_FAULT_PROPERTY, undefined);
+    try { companion?.disconnect(); } catch {}
+    try { kid.disconnect(); } catch {}
+  }
+}
+
+function analyzeCityGeometry(kid, station, expectedHeight) {
+  const blocks = [];
+  for (let x = station.x - 20; x <= station.x + 20; x += 1) {
+    for (let y = station.y; y <= station.y + 23; y += 1) {
+      // The test player faces +Z. New structures begin seven blocks ahead, so
+      // a 31-deep city reaches station.z + 37 rather than straddling the player.
+      for (let z = station.z - 2; z <= station.z + 42; z += 1) {
+        const typeId = kid.dimension.getBlock({ x, y, z })?.typeId;
+        if (typeId && !NON_STRUCTURAL_BLOCKS.has(typeId)) blocks.push({ x, y, z, typeId });
+      }
+    }
+  }
+  if (!blocks.length) return { complete: false, detail: "no city blocks yet" };
+  const bounds = {
+    min: {
+      x: Math.min(...blocks.map(({ x }) => x)),
+      y: Math.min(...blocks.map(({ y }) => y)),
+      z: Math.min(...blocks.map(({ z }) => z)),
+    },
+    max: {
+      x: Math.max(...blocks.map(({ x }) => x)),
+      y: Math.max(...blocks.map(({ y }) => y)),
+      z: Math.max(...blocks.map(({ z }) => z)),
+    },
+  };
+  const spans = {
+    x: bounds.max.x - bounds.min.x + 1,
+    y: bounds.max.y - bounds.min.y + 1,
+    z: bounds.max.z - bounds.min.z + 1,
+  };
+
+  const upperBlocks = blocks.filter(({ y, typeId }) => y > bounds.min.y && !isHouseLight(typeId));
+  const byLocation = new Map(upperBlocks.map((block) => [`${block.x},${block.y},${block.z}`, block]));
+  const remaining = new Set(byLocation.keys());
+  const buildingHeights = [];
+  let accessibleBuildings = 0;
+  while (remaining.size) {
+    const first = remaining.values().next().value;
+    remaining.delete(first);
+    const queue = [first];
+    const component = [];
+    for (let index = 0; index < queue.length; index += 1) {
+      const key = queue[index];
+      const block = byLocation.get(key);
+      component.push(block);
+      for (const [dx, dy, dz] of [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1], [0, 0, -1]]) {
+        const neighbor = `${block.x + dx},${block.y + dy},${block.z + dz}`;
+        if (!remaining.delete(neighbor)) continue;
+        queue.push(neighbor);
+      }
+    }
+    const xs = component.map(({ x }) => x);
+    const ys = component.map(({ y }) => y);
+    const zs = component.map(({ z }) => z);
+    const width = Math.max(...xs) - Math.min(...xs) + 1;
+    const height = Math.max(...ys) - Math.min(...ys) + 1;
+    const depth = Math.max(...zs) - Math.min(...zs) + 1;
+    const footprint = new Set(component.map(({ x, z }) => `${x},${z}`)).size;
+    if (width >= 4 && depth >= 4 && height >= 4 && footprint >= 12 && component.length >= 40) {
+      buildingHeights.push(height);
+      const minX = Math.min(...xs);
+      const maxX = Math.max(...xs);
+      const minY = Math.min(...ys);
+      const maxY = Math.max(...ys);
+      const minZ = Math.min(...zs);
+      const maxZ = Math.max(...zs);
+      const roofCoverage = component.filter(({ y }) => y === maxY).length / (width * depth);
+      let interiorHeadroom = 0;
+      for (let x = minX + 1; x < maxX; x += 1) {
+        for (let z = minZ + 1; z < maxZ; z += 1) {
+          const feet = kid.dimension.getBlock({ x, y: minY + 1, z })?.typeId;
+          const head = kid.dimension.getBlock({ x, y: minY + 2, z })?.typeId;
+          if (NON_STRUCTURAL_BLOCKS.has(feet) && NON_STRUCTURAL_BLOCKS.has(head)
+            && blockIsStructural(kid.dimension, { x, y: minY, z })) interiorHeadroom += 1;
+        }
+      }
+      const openings = [];
+      for (let x = minX + 1; x < maxX; x += 1) {
+        openings.push([{ x, y: minY + 1, z: minZ }, { x, y: minY + 2, z: minZ }]);
+        openings.push([{ x, y: minY + 1, z: maxZ }, { x, y: minY + 2, z: maxZ }]);
+      }
+      for (let z = minZ + 1; z < maxZ; z += 1) {
+        openings.push([{ x: minX, y: minY + 1, z }, { x: minX, y: minY + 2, z }]);
+        openings.push([{ x: maxX, y: minY + 1, z }, { x: maxX, y: minY + 2, z }]);
+      }
+      const doorway = openings.some(([feet, head]) => (
+        NON_STRUCTURAL_BLOCKS.has(kid.dimension.getBlock(feet)?.typeId)
+        && NON_STRUCTURAL_BLOCKS.has(kid.dimension.getBlock(head)?.typeId)
+      ));
+      if (roofCoverage >= 0.6 && interiorHeadroom >= 4 && doorway) accessibleBuildings += 1;
+    }
+  }
+
+  let roadX = 0;
+  let roadZ = 0;
+  const groundBlocks = blocks.filter(({ y }) => y === bounds.min.y);
+  for (let z = bounds.min.z; z <= bounds.max.z; z += 1) {
+    const byType = new Map();
+    for (const { x, typeId } of groundBlocks.filter((block) => block.z === z)) {
+      if (!byType.has(typeId)) byType.set(typeId, []);
+      byType.get(typeId).push(x);
+    }
+    for (const xs of byType.values()) roadX = Math.max(roadX, longestConsecutiveRun(xs));
+  }
+  for (let x = bounds.min.x; x <= bounds.max.x; x += 1) {
+    const byType = new Map();
+    for (const { z, typeId } of groundBlocks.filter((block) => block.x === x)) {
+      if (!byType.has(typeId)) byType.set(typeId, []);
+      byType.get(typeId).push(z);
+    }
+    for (const zs of byType.values()) roadZ = Math.max(roadZ, longestConsecutiveRun(zs));
+  }
+
+  const lights = blocks.filter(({ typeId }) => isHouseLight(typeId)).length;
+  const center = {
+    x: (bounds.min.x + bounds.max.x) / 2,
+    y: bounds.min.y + 1,
+    z: (bounds.min.z + bounds.max.z) / 2,
+  };
+  const villagers = kid.dimension.getEntities({
+    type: "minecraft:villager_v2",
+    location: center,
+    maxDistance: 32,
+  }).filter(({ location }) => (
+    location.x >= bounds.min.x && location.x <= bounds.max.x + 1
+    && location.z >= bounds.min.z && location.z <= bounds.max.z + 1
+  )).length;
+  const heightRange = buildingHeights.length
+    ? Math.max(...buildingHeights) - Math.min(...buildingHeights) : 0;
+  const complete = spans.x === 31 && spans.z === 31
+    && (!expectedHeight || spans.y === expectedHeight)
+    && buildingHeights.length >= 4
+    && accessibleBuildings >= 4
+    && heightRange >= 2
+    && roadX >= 22 && roadZ >= 22
+    && lights >= 4 && villagers === 4;
+  return {
+    complete,
+    bounds,
+    spans,
+    buildingHeights,
+    accessibleBuildings,
+    lights,
+    villagers,
+    detail: `bounds=${spans.x}x${spans.z}x${spans.y}; buildings=${buildingHeights.length}/${accessibleBuildings} accessible; heights=${buildingHeights.sort((a, b) => a - b).join(",")}; roads=${roadX}x/${roadZ}z; lights=${lights}; villagers=${villagers}`,
+  };
+}
+
+function cityGroundSnapshot(kid, profile) {
+  const snapshot = new Set();
+  for (let x = profile.bounds.min.x; x <= profile.bounds.max.x; x += 1) {
+    for (let z = profile.bounds.min.z; z <= profile.bounds.max.z; z += 1) {
+      if (blockIsStructural(kid.dimension, { x, y: profile.bounds.min.y, z })) snapshot.add(`${x},${z}`);
+    }
+  }
+  return snapshot;
+}
+
+function cityGroundRetention(kid, profile, snapshot) {
+  if (!snapshot.size) return 1;
+  let retained = 0;
+  for (const key of snapshot) {
+    const [x, z] = key.split(",").map(Number);
+    if (blockIsStructural(kid.dimension, { x, y: profile.bounds.min.y, z })) retained += 1;
+  }
+  return retained / snapshot.size;
+}
+
+async function runCityAcceptance(kid) {
+  const check = "city-goal-pipeline";
+  const station = {
+    x: Math.floor(kid.location.x),
+    y: Math.round(kid.location.y),
+    z: Math.floor(kid.location.z),
+  };
+  let currentRequest = "fixture preparation";
+  let observed = { detail: "not scanned yet" };
+  try {
+    kid.dimension.runCommand(`tickingarea remove ${TICKING_AREA}`);
+    kid.dimension.runCommand(`tickingarea add circle ${station.x} ${station.y} ${station.z} 4 ${TICKING_AREA} true`);
+    prepareArbitraryStructureStation(kid, station);
+    await teleportToStation(kid, station);
+    await system.waitTicks(20);
+
+    currentRequest = "build a complete 31x31x18 city";
+    const beforeCityCommit = chatCallbacks.buildCommitToken(kid.id);
+    const cityTransport = await routeWizardRequest(
+      kid,
+      "wizard, build a complete 31x31x18 city with two crossed streets, at least four separate habitable buildings of different heights, streetlights, and exactly four villagers",
+      "complete-city",
+    );
+    await waitFor(() => {
+      if (chatCallbacks.buildCommitToken(kid.id) === beforeCityCommit) return false;
+      observed = analyzeCityGeometry(kid, station, 18);
+      return observed.complete;
+    }, TIMEOUT_TICKS * 4, "a complete multi-building city instead of one room");
+    await system.waitTicks(20);
+    observed = analyzeCityGeometry(kid, station, 18);
+    if (!observed.complete) throw new Error(`the city was not stable after completion: ${observed.detail}`);
+    report("CHECK", "city-build", `request via ${cityTransport}; ${observed.detail}`);
+
+    const ground = cityGroundSnapshot(kid, observed);
+    const tallest = Math.max(...observed.buildingHeights);
+    const priorLights = observed.lights;
+    const initialCityCommit = chatCallbacks.buildCommitToken(kid.id);
+    currentRequest = "make this same city more like New York";
+    const revisionTransport = await routeWizardRequest(
+      kid,
+      "wizard, make this same city more like New York by adding two taller skyscrapers and at least four more streetlights",
+      "in-place-city-revision",
+    );
+    await waitFor(() => {
+      if (chatCallbacks.buildCommitToken(kid.id) === initialCityCommit) return false;
+      const revised = analyzeCityGeometry(kid, station);
+      const tallerBuildings = revised.buildingHeights?.filter((height) => height > tallest).length || 0;
+      if (revised.complete && revised.lights >= priorLights + 4 && tallerBuildings >= 2
+        && cityGroundRetention(kid, observed, ground) >= 0.8) observed = revised;
+      return revised.complete && revised.lights >= priorLights + 4 && tallerBuildings >= 2
+        && cityGroundRetention(kid, observed, ground) >= 0.8;
+    }, TIMEOUT_TICKS * 4, "two taller towers and more lights at the same city site");
+    await system.waitTicks(20);
+    const stableRevision = analyzeCityGeometry(kid, station);
+    const stableTaller = stableRevision.buildingHeights?.filter((height) => height > tallest).length || 0;
+    if (!stableRevision.complete || stableRevision.lights < priorLights + 4 || stableTaller < 2
+      || cityGroundRetention(kid, stableRevision, ground) < 0.8) {
+      throw new Error(`the city revision was not stable after completion: ${stableRevision.detail}`);
+    }
+    observed = stableRevision;
+    report("CHECK", "city-revision", `request via ${revisionTransport}; ${observed.detail}; original-ground-retained=${cityGroundRetention(kid, observed, ground).toFixed(2)}`);
+    report(
+      "PASS",
+      check,
+      "the Wizard built a real four-building city with roads, varied skyline, lights, and residents, then revised that same city with two taller skyscrapers and more lights",
+    );
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    report("FAIL", check, `${currentRequest}: ${String(error)}; ${observed.detail}`);
+    try { kid.disconnect(); } catch {}
+  }
+}
+
+function isHouseWindow(typeId) {
+  return /(?:_stained)?_glass(?:_pane)?$/.test(typeId) || typeId === "minecraft:glass";
+}
+
+function isHouseLight(typeId) {
+  return /(?:lantern|glowstone|torch|shroomlight|froglight|light_block)$/.test(typeId);
+}
+
+function housePerimeterLocations(x, y, z, size) {
+  const locations = [];
+  for (let offset = 0; offset < size; offset += 1) {
+    locations.push({ x: x + offset, y, z });
+    locations.push({ x: x + offset, y, z: z + size - 1 });
+    if (offset > 0 && offset < size - 1) {
+      locations.push({ x, y, z: z + offset });
+      locations.push({ x: x + size - 1, y, z: z + offset });
+    }
+  }
+  return locations;
+}
+
+function completedHouseProfile(dimension, x, y, z, size) {
+  if (!rectangleIsStructural(dimension, x, y, z, size, size)) return undefined;
+
+  for (let roofOffset = 3; roofOffset <= 10; roofOffset += 1) {
+    const roofBlocks = countStructuralBlocks(
+      dimension,
+      { x, y: y + roofOffset, z },
+      { x: x + size - 1, y: y + roofOffset, z: z + size - 1 },
+    );
+    if (roofBlocks < size * size - 10) continue;
+
+    let wallLayers = 0;
+    let windows = 0;
+    let lights = 0;
+    let doorway = false;
+    for (let offset = 1; offset <= roofOffset; offset += 1) {
+      const perimeter = housePerimeterLocations(x, y + offset, z, size);
+      const boundaryBlocks = perimeter.filter((location) => {
+        const typeId = dimension.getBlock(location)?.typeId ?? "minecraft:air";
+        return blockIsStructural(dimension, location) || isHouseWindow(typeId) || /_door$/.test(typeId);
+      }).length;
+      if (offset < roofOffset && boundaryBlocks >= perimeter.length - 10) wallLayers += 1;
+      windows += perimeter.filter((location) => isHouseWindow(
+        dimension.getBlock(location)?.typeId ?? "minecraft:air",
+      )).length;
+      for (let dx = 0; dx < size; dx += 1) {
+        for (let dz = 0; dz < size; dz += 1) {
+          const typeId = dimension.getBlock({ x: x + dx, y: y + offset, z: z + dz })?.typeId ?? "";
+          if (isHouseLight(typeId)) lights += 1;
+        }
+      }
+    }
+
+    const lowerPerimeter = housePerimeterLocations(x, y + 1, z, size);
+    for (const location of lowerPerimeter) {
+      const above = { ...location, y: location.y + 1 };
+      const lowerType = dimension.getBlock(location)?.typeId ?? "minecraft:air";
+      const upperType = dimension.getBlock(above)?.typeId ?? "minecraft:air";
+      const lowerOpen = !blockIsStructural(dimension, location) || /_door$/.test(lowerType);
+      const upperOpen = !blockIsStructural(dimension, above) || /_door$/.test(upperType);
+      if (lowerOpen && upperOpen && !isHouseWindow(lowerType) && !isHouseWindow(upperType)) {
+        doorway = true;
+        break;
+      }
+    }
+
+    if (wallLayers >= 2 && windows >= 4 && lights >= 2 && doorway) {
+      return { x, y, z, roofOffset, wallLayers, windows, lights };
+    }
+  }
+  return undefined;
+}
+
 function findCompletedTenByTenHouse(kid, station) {
   const dimension = kid.dimension;
   for (let x = station.x - 18; x <= station.x + 18; x += 1) {
     for (let z = station.z - 18; z <= station.z + 18; z += 1) {
-      if (!rectangleIs(dimension, x, station.y, z, 10, 10, "minecraft:oak_planks")) continue;
-      const min = { x, y: station.y + 3, z };
-      const max = { x: x + 9, y: station.y + 3, z: z + 9 };
-      const lowerRoof = countBlocks(dimension, min, max, "minecraft:spruce_planks");
-      const lanterns = countBlocks(dimension, min, max, "minecraft:sea_lantern");
-      const upperRoof = rectangleIs(dimension, x + 1, station.y + 4, z, 8, 10, "minecraft:spruce_planks")
-        || rectangleIs(dimension, x, station.y + 4, z + 1, 10, 8, "minecraft:spruce_planks");
-      const glass = countBlocks(
-        dimension,
-        { x, y: station.y + 2, z },
-        { x: x + 9, y: station.y + 2, z: z + 9 },
-        "minecraft:glass",
-      );
-      if (lowerRoof >= 98 && lanterns === 2 && upperRoof && glass >= 8) return { x, y: station.y, z };
+      const profile = completedHouseProfile(dimension, x, station.y, z, 10);
+      if (profile) return profile;
     }
   }
   return undefined;
@@ -677,11 +1184,11 @@ async function runKelpFarmAcceptance(kid) {
   }
 }
 
-function findCompletedStoneBrickCastle(kid, station, size) {
+function findCompletedCastle(kid, station, size) {
   const dimension = kid.dimension;
   for (let x = station.x - 24; x <= station.x + 24; x += 1) {
     for (let z = station.z - 24; z <= station.z + 24; z += 1) {
-      if (rectangleIs(dimension, x, station.y, z, size, size, "minecraft:stone_bricks")) {
+      if (rectangleIsStructural(dimension, x, station.y, z, size, size)) {
         return { x, y: station.y, z };
       }
     }
@@ -691,57 +1198,115 @@ function findCompletedStoneBrickCastle(kid, station, size) {
 
 function castleUpgradeMetrics(kid, origin) {
   if (!origin) {
-    return { upperFloor: 0, roomWalls: 0, towerTrim: 0, decorations: 0, villagers: 0 };
+    return {
+      upperFloor: 0,
+      roomWalls: 0,
+      towerCorners: 0,
+      towerBlocks: 0,
+      decorations: 0,
+      villagers: 0,
+      villagerLocations: [],
+    };
   }
   const dimension = kid.dimension;
-  const interiorMin = { x: origin.x + 1, y: origin.y + 4, z: origin.z + 1 };
-  const interiorMax = { x: origin.x + 10, y: origin.y + 4, z: origin.z + 10 };
-  const upperFloor = countBlocks(dimension, interiorMin, interiorMax, "minecraft:stone_bricks");
+  let upperFloor = 0;
   let roomWalls = 0;
-  for (const centerX of [origin.x + 5, origin.x + 6]) {
-    for (const centerZ of [origin.z + 5, origin.z + 6]) {
-      let candidate = 0;
-      for (let offset = 1; offset <= 10; offset += 1) {
-        if (dimension.getBlock({ x: centerX, y: origin.y + 2, z: origin.z + offset })?.typeId === "minecraft:stone_bricks") candidate += 1;
-        if (dimension.getBlock({ x: origin.x + offset, y: origin.y + 2, z: centerZ })?.typeId === "minecraft:stone_bricks") candidate += 1;
+  // The planner chooses height, so a usable second floor is not tied to y=3/4.
+  // A roof is also a broad horizontal plane; distinguish a real storey by
+  // requiring the requested room partitions in the headroom immediately above.
+  for (let yOffset = 3; yOffset <= 8; yOffset += 1) {
+    const floorBlocks = countStructuralBlocks(
+      dimension,
+      { x: origin.x + 1, y: origin.y + yOffset, z: origin.z + 1 },
+      { x: origin.x + 10, y: origin.y + yOffset, z: origin.z + 10 },
+    );
+    let partitionsAbove = 0;
+    for (const centerX of [origin.x + 5, origin.x + 6]) {
+      for (const centerZ of [origin.z + 5, origin.z + 6]) {
+        let candidate = 0;
+        for (let offset = 1; offset <= 10; offset += 1) {
+          if (blockIsStructural(dimension, { x: centerX, y: origin.y + yOffset + 1, z: origin.z + offset })) candidate += 1;
+          if (blockIsStructural(dimension, { x: origin.x + offset, y: origin.y + yOffset + 1, z: centerZ })) candidate += 1;
+        }
+        partitionsAbove = Math.max(partitionsAbove, candidate);
       }
-      roomWalls = Math.max(roomWalls, candidate);
+    }
+    if (partitionsAbove >= 12 && floorBlocks > upperFloor) {
+      upperFloor = floorBlocks;
+      roomWalls = partitionsAbove;
     }
   }
-  const towerTrim = countBlocks(
-    dimension,
-    origin,
-    { x: origin.x + 11, y: origin.y + 7, z: origin.z + 11 },
-    "minecraft:cobblestone",
-  );
-  const decorations = countBlocks(
-    dimension,
-    { x: origin.x + 5, y: origin.y + 1, z: origin.z + 5 },
-    { x: origin.x + 6, y: origin.y + 7, z: origin.z + 6 },
-    "minecraft:sea_lantern",
-  );
-  const villagers = dimension.getEntities({ type: "minecraft:villager_v2" }).filter(({ location }) => (
-    location.x >= origin.x && location.x <= origin.x + 12
-    && location.y >= origin.y && location.y <= origin.y + 9
-    && location.z >= origin.z && location.z <= origin.z + 12
-  )).length;
-  return { upperFloor, roomWalls, towerTrim, decorations, villagers };
+
+  const cornerInwardRims = [
+    [[2, 2], [2, 1], [1, 2]],
+    [[9, 2], [9, 1], [10, 2]],
+    [[2, 9], [2, 10], [1, 9]],
+    [[9, 9], [9, 10], [10, 9]],
+  ];
+  const towerBlockCounts = cornerInwardRims.map((rim) => {
+    let count = 0;
+    for (let yOffset = 4; yOffset <= 7; yOffset += 1) {
+      for (const [xOffset, zOffset] of rim) {
+        if (blockIsStructural(dimension, {
+          x: origin.x + xOffset,
+          y: origin.y + yOffset,
+          z: origin.z + zOffset,
+        })) count += 1;
+      }
+    }
+    return count;
+  });
+  const towerCorners = towerBlockCounts.filter((count) => count >= 6).length;
+  const towerBlocks = towerBlockCounts.reduce((sum, count) => sum + count, 0);
+
+  let decorations = 0;
+  for (let x = origin.x + 1; x <= origin.x + 10; x += 1) {
+    for (let y = origin.y + 1; y <= origin.y + 7; y += 1) {
+      for (let z = origin.z + 1; z <= origin.z + 10; z += 1) {
+        const typeId = dimension.getBlock({ x, y, z })?.typeId || "";
+        if (/(?:lantern|glowstone|torch|end_rod|banner|carpet|flower_pot|bookshelf)/.test(typeId)) {
+          decorations += 1;
+        }
+      }
+    }
+  }
+  const villagersInside = dimension.getEntities({ type: "minecraft:villager_v2" }).filter(({ location }) => (
+    location.x >= origin.x && location.x < origin.x + 12
+    && location.y >= origin.y && location.y < origin.y + 9
+    && location.z >= origin.z && location.z < origin.z + 12
+  ));
+  const villagerLocations = villagersInside.map(({ location }) => [
+    Number(location.x.toFixed(1)),
+    Number(location.y.toFixed(1)),
+    Number(location.z.toFixed(1)),
+  ]);
+  return {
+    upperFloor,
+    roomWalls,
+    towerCorners,
+    towerBlocks,
+    decorations,
+    villagers: villagersInside.length,
+    villagerLocations,
+  };
 }
 
 function castleUpgradeIsComplete(kid, origin) {
-  const { upperFloor, roomWalls, towerTrim, decorations, villagers } = castleUpgradeMetrics(kid, origin);
-  return upperFloor >= 90 && roomWalls >= 12 && towerTrim >= 24 && decorations >= 1 && villagers >= 4;
+  const { upperFloor, roomWalls, towerCorners, decorations, villagers } = castleUpgradeMetrics(kid, origin);
+  return upperFloor >= 90
+    && roomWalls >= 12
+    && towerCorners === 4
+    && decorations >= 1
+    && villagers === 4;
 }
 
 function castleUpgradeSnapshot(kid, origin) {
-  return `origin=${origin ? `${origin.x},${origin.y},${origin.z}` : "not-found"}; metrics=${JSON.stringify(castleUpgradeMetrics(kid, origin))}; required={"upperFloor":90,"roomWalls":12,"towerTrim":24,"decorations":1,"villagers":4}`;
+  return `origin=${origin ? `${origin.x},${origin.y},${origin.z}` : "not-found"}; metrics=${JSON.stringify(castleUpgradeMetrics(kid, origin))}; required={"upperFloor":90,"roomWalls":12,"towerCorners":4,"decorations":1,"villagers":"exactly 4"}`;
 }
 
 function castleShellIsComplete(kid, origin, size, height) {
   if (!origin) return false;
   const dimension = kid.dimension;
-  const shell = new Set(["minecraft:stone_bricks", "minecraft:cobblestone"]);
-  const roof = new Set(["minecraft:deepslate_bricks", "minecraft:cobblestone"]);
   let wallBlocks = 0;
   for (let offset = 0; offset < size; offset += 1) {
     const edge = [
@@ -752,19 +1317,127 @@ function castleShellIsComplete(kid, origin, size, height) {
       { x: origin.x, y: origin.y + 2, z: origin.z + offset },
       { x: origin.x + size - 1, y: origin.y + 2, z: origin.z + offset },
     );
-    wallBlocks += edge.filter((location) => shell.has(dimension.getBlock(location)?.typeId)).length;
+    wallBlocks += edge.filter((location) => blockIsStructural(dimension, location)).length;
   }
   let roofBlocks = 0;
-  for (let x = 0; x < size; x += 1) {
-    for (let z = 0; z < size; z += 1) {
-      if (roof.has(dimension.getBlock({
-        x: origin.x + x,
-        y: origin.y + height - 1,
-        z: origin.z + z,
-      })?.typeId)) roofBlocks += 1;
+  for (let yOffset = Math.max(3, height - 4); yOffset < height; yOffset += 1) {
+    let candidate = 0;
+    for (let x = 0; x < size; x += 1) {
+      for (let z = 0; z < size; z += 1) {
+        if (blockIsStructural(dimension, {
+          x: origin.x + x,
+          y: origin.y + yOffset,
+          z: origin.z + z,
+        })) candidate += 1;
+      }
     }
+    roofBlocks = Math.max(roofBlocks, candidate);
   }
   return wallBlocks >= 4 * size - 8 && roofBlocks >= size * size - 4;
+}
+
+function castleShellIsCompleteAtAnyHeight(kid, origin, size) {
+  for (let height = 6; height <= 14; height += 1) {
+    if (castleShellIsComplete(kid, origin, size, height)) return true;
+  }
+  return false;
+}
+
+function castleStructuralSnapshot(kid, origin, size) {
+  const snapshot = new Set();
+  for (let x = origin.x - 4; x <= origin.x + size + 3; x += 1) {
+    for (let y = origin.y + 1; y <= origin.y + 8; y += 1) {
+      for (let z = origin.z - 4; z <= origin.z + size + 3; z += 1) {
+        if (blockIsStructural(kid.dimension, { x, y, z })) snapshot.add(`${x},${y},${z}`);
+      }
+    }
+  }
+  return snapshot;
+}
+
+function castleSnapshotRetention(kid, before) {
+  if (!before.size) return 1;
+  let retained = 0;
+  for (const key of before) {
+    const [x, y, z] = key.split(",").map(Number);
+    if (blockIsStructural(kid.dimension, { x, y, z })) retained += 1;
+  }
+  return retained / before.size;
+}
+
+function longestConsecutiveRun(values) {
+  const sorted = [...new Set(values)].sort((a, b) => a - b);
+  let longest = 0;
+  let current = 0;
+  let previous;
+  for (const value of sorted) {
+    current = previous === undefined || value === previous + 1 ? current + 1 : 1;
+    longest = Math.max(longest, current);
+    previous = value;
+  }
+  return longest;
+}
+
+function castleBalconyProfile(kid, origin, size, before) {
+  const point = (side, tangent, distance, y) => {
+    if (side === "north") return { x: origin.x + tangent, y, z: origin.z - distance };
+    if (side === "south") return { x: origin.x + tangent, y, z: origin.z + size - 1 + distance };
+    if (side === "west") return { x: origin.x - distance, y, z: origin.z + tangent };
+    return { x: origin.x + size - 1 + distance, y, z: origin.z + tangent };
+  };
+  const isNewStructure = (location) => (
+    blockIsStructural(kid.dimension, location)
+    && !before.has(`${location.x},${location.y},${location.z}`)
+  );
+  let best = { complete: false, side: "none", y: 0, area: 0, depth: 0, rail: 0, headroom: 0 };
+  for (const side of ["north", "south", "west", "east"]) {
+    for (let yOffset = 2; yOffset <= 6; yOffset += 1) {
+      const floorY = origin.y + yOffset;
+      const rows = [];
+      const floorCells = [];
+      for (let distance = 1; distance <= 4; distance += 1) {
+        const tangents = [];
+        for (let tangent = 0; tangent < size; tangent += 1) {
+          const location = point(side, tangent, distance, floorY);
+          if (!isNewStructure(location)) continue;
+          tangents.push(tangent);
+          floorCells.push({ ...location, tangent, distance });
+        }
+        rows.push({ distance, tangents, run: longestConsecutiveRun(tangents) });
+      }
+      const attachedRun = rows[0].run;
+      let depth = 0;
+      let previousTangents;
+      for (const row of rows) {
+        if (row.run < 3) break;
+        if (previousTangents
+          && row.tangents.filter((tangent) => previousTangents.has(tangent)).length < 2) break;
+        depth = row.distance;
+        previousTangents = new Set(row.tangents);
+      }
+      const platformCells = floorCells.filter(({ distance }) => distance <= depth);
+      const area = platformCells.length;
+      const rail = platformCells.filter(({ x, y, z }) => isNewStructure({ x, y: y + 1, z })).length;
+      const headroom = platformCells.filter(({ x, y, z }) => !blockIsStructural(
+        kid.dimension,
+        { x, y: y + 1, z },
+      )).length;
+      const candidate = {
+        complete: attachedRun >= 3 && area >= 6 && depth >= 1 && rail >= 3 && headroom >= 3,
+        side,
+        y: yOffset,
+        area,
+        depth,
+        rail,
+        headroom,
+      };
+      if (Number(candidate.complete) > Number(best.complete)
+        || (candidate.complete === best.complete && candidate.area + candidate.rail > best.area + best.rail)) {
+        best = candidate;
+      }
+    }
+  }
+  return best;
 }
 
 function removeAcceptanceEntities(kid, station) {
@@ -1126,7 +1799,7 @@ async function runChildRequestAcceptance(kid) {
     const castleTransport = await routeWizardRequest(kid, "wizard, build a 12x12 castle right here", "12x12-castle");
     await waitFor(
       () => {
-        castleOrigin = findCompletedStoneBrickCastle(kid, castleStation, 12);
+        castleOrigin = findCompletedCastle(kid, castleStation, 12);
         return Boolean(castleOrigin);
       },
       TIMEOUT_TICKS * 2,
@@ -1141,7 +1814,7 @@ async function runChildRequestAcceptance(kid) {
     );
     await waitFor(
       () => castleUpgradeIsComplete(kid, castleOrigin)
-        && castleShellIsComplete(kid, castleOrigin, 12, 9),
+        && rectangleIsStructural(kid.dimension, castleOrigin.x, castleOrigin.y, castleOrigin.z, 12, 12),
       TIMEOUT_TICKS * 2,
       "the rooms, upper floor, corner towers, and villagers at the original castle site",
     );
@@ -1223,7 +1896,7 @@ async function runCastleRefinementAcceptance(kid) {
     );
     await waitFor(
       () => {
-        castleOrigin = findCompletedStoneBrickCastle(kid, castleStation, 12);
+        castleOrigin = findCompletedCastle(kid, castleStation, 12);
         return Boolean(castleOrigin);
       },
       TIMEOUT_TICKS * 2,
@@ -1239,7 +1912,7 @@ async function runCastleRefinementAcceptance(kid) {
     );
     await waitFor(
       () => castleUpgradeIsComplete(kid, castleOrigin)
-        && castleShellIsComplete(kid, castleOrigin, 12, 9),
+        && rectangleIsStructural(kid.dimension, castleOrigin.x, castleOrigin.y, castleOrigin.z, 12, 12),
       TIMEOUT_TICKS * 2,
       "the rooms, upper floor, corner towers, and villagers at the original castle site",
     );
@@ -1249,27 +1922,32 @@ async function runCastleRefinementAcceptance(kid) {
       `requests via ${castleTransport}/${upgradeTransport}; ${castleUpgradeSnapshot(kid, castleOrigin)}`,
     );
 
-    const trimBeforeBalcony = castleUpgradeMetrics(kid, castleOrigin).towerTrim;
+    const beforeBalcony = castleStructuralSnapshot(kid, castleOrigin, 12);
     currentRequest = "add a balcony";
     const balconyTransport = await routeWizardRequest(kid, "wizard, add a balcony", "refinement-castle-balcony");
     await waitFor(
-      () => rectangleIs(kid.dimension, castleOrigin.x, castleOrigin.y, castleOrigin.z, 12, 12, "minecraft:stone_bricks")
-        && castleShellIsComplete(kid, castleOrigin, 12, 9)
-        && castleUpgradeMetrics(kid, castleOrigin).towerTrim >= trimBeforeBalcony + 15,
+      () => rectangleIsStructural(kid.dimension, castleOrigin.x, castleOrigin.y, castleOrigin.z, 12, 12)
+        && castleUpgradeIsComplete(kid, castleOrigin)
+        && castleSnapshotRetention(kid, beforeBalcony) >= 0.6
+        && castleBalconyProfile(kid, castleOrigin, 12, beforeBalcony).complete,
       TIMEOUT_TICKS * 2,
       "the balcony to appear without replacing the castle base",
     );
-    report("CHECK", "castle-refinement-balcony", `request via ${balconyTransport}; full castle base and new balcony verified together`);
+    report(
+      "CHECK",
+      "castle-refinement-balcony",
+      `request via ${balconyTransport}; retained=${castleSnapshotRetention(kid, beforeBalcony).toFixed(2)}; projecting balcony=${JSON.stringify(castleBalconyProfile(kid, castleOrigin, 12, beforeBalcony))}`,
+    );
 
     currentRequest = "make it bigger";
     const biggerTransport = await routeWizardRequest(kid, "wizard, make it bigger", "refinement-bigger-castle");
     let expandedOrigin;
     await waitFor(
       () => {
-        expandedOrigin = findCompletedStoneBrickCastle(kid, castleStation, 16);
+        expandedOrigin = findCompletedCastle(kid, castleStation, 16);
         return expandedOrigin?.x === castleOrigin.x - 2
           && expandedOrigin?.z === castleOrigin.z - 2
-          && castleShellIsComplete(kid, expandedOrigin, 16, 11);
+          && castleShellIsCompleteAtAnyHeight(kid, expandedOrigin, 16);
       },
       TIMEOUT_TICKS * 2,
       "the complete 16x16 castle to replace the old shell around the same center",
@@ -1285,12 +1963,9 @@ async function runCastleRefinementAcceptance(kid) {
         moatOrigin,
         { x: moatOrigin.x + 19, y: moatOrigin.y, z: moatOrigin.z + 19 },
         "minecraft:blue_concrete",
-      ) >= 76 && countBlocks(
-        kid.dimension,
-        moatOrigin,
-        { x: moatOrigin.x + 19, y: moatOrigin.y, z: moatOrigin.z + 19 },
-        "minecraft:stone_bricks",
-      ) >= 300 && castleShellIsComplete(kid, moatOrigin, 20, 11),
+      ) >= 76
+        && rectangleIsStructural(kid.dimension, moatOrigin.x, moatOrigin.y, moatOrigin.z, 20, 20)
+        && castleShellIsCompleteAtAnyHeight(kid, moatOrigin, 20),
       TIMEOUT_TICKS * 2,
       "the moat and complete expanded castle foundation at the same center",
     );
@@ -1966,7 +2641,7 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "mc_wizard_e2e_run is required");
     return;
   }
-  if (scope !== "full" && scope !== "machines" && scope !== "arbitrary" && scope !== "child" && scope !== "refinement" && scope !== "farms" && scope !== "kelp") {
+  if (scope !== "full" && scope !== "machines" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "farms" && scope !== "kelp") {
     report("FAIL", "configuration", `unsupported mc_wizard_e2e_scope: ${scope}`);
     return;
   }
@@ -1983,6 +2658,9 @@ export async function startE2E(callbacks) {
   }
   const startCheck = scope === "machines" ? "machine-action-pipeline"
     : scope === "arbitrary" ? "arbitrary-exact-structure"
+      : scope === "portal" ? "portal-travel-pipeline"
+        : scope === "travel-rollback" ? "dimension-travel-rollback"
+        : scope === "city" ? "city-goal-pipeline"
       : scope === "child" ? "child-action-pipeline"
         : scope === "refinement" ? "castle-refinement"
           : scope === "farms" ? "common-farm-pipeline"
@@ -2019,6 +2697,18 @@ export async function startE2E(callbacks) {
     }
     if (scope === "arbitrary") {
       system.runTimeout(() => void runArbitraryStructureAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "portal") {
+      system.runTimeout(() => void runPortalTravelAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "travel-rollback") {
+      system.runTimeout(() => void runDimensionTravelRollbackAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "city") {
+      system.runTimeout(() => void runCityAcceptance(kid), 80);
       return;
     }
     if (scope === "child") {

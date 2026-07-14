@@ -7,6 +7,7 @@ const PLACE_ITEMS = Object.freeze({
   "minecraft:glass": "minecraft:glass",
   "minecraft:dirt": "minecraft:dirt",
   "minecraft:sand": "minecraft:sand",
+  "minecraft:obsidian": "minecraft:obsidian",
   "minecraft:slime_block": "minecraft:slime_block",
   "minecraft:honey_block": "minecraft:honey_block",
   "minecraft:piston": "minecraft:piston",
@@ -31,6 +32,7 @@ const PLACE_ITEMS = Object.freeze({
 
 const INTERACTION_ITEMS = Object.freeze({
   "minecraft:water_bucket": { expectedFaceType: "minecraft:water" },
+  "minecraft:flint_and_steel": { expectedFaceType: "minecraft:portal" },
   "minecraft:hopper_minecart": { expectedEntity: "minecraft:hopper_minecart" },
   "minecraft:stick": { control: true },
   "minecraft:chicken_spawn_egg": { expectedEntity: "minecraft:chicken" },
@@ -51,6 +53,16 @@ const BELOW_ONLY = new Set([
 const FARM_CROPS = new Set(["minecraft:sugar_cane", "minecraft:bamboo", "minecraft:cactus"]);
 
 const key = ([x, y, z]) => `${x},${y},${z}`;
+
+export function foldPlacementSteps(placements) {
+  const final = new Map();
+  for (const placement of placements || []) {
+    if (!Array.isArray(placement?.target)) continue;
+    if (placement.action === "break") final.delete(key(placement.target));
+    else final.set(key(placement.target), placement);
+  }
+  return [...final.values()];
+}
 const clean = (value, fallback, max) => String(value || fallback)
   .replace(/[^a-zA-Z0-9 _-]/g, "")
   .trim()
@@ -75,6 +87,60 @@ function vector(value, name, { ground = false } = {}) {
 
 const touches = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]) === 1;
 const distance = (a, b) => Math.abs(a[0] - b[0]) + Math.abs(a[1] - b[1]) + Math.abs(a[2] - b[2]);
+
+function portalInterior(placed, interaction) {
+  const obsidian = new Set([...placed.entries()]
+    .filter(([, placement]) => placement.itemId === "minecraft:obsidian")
+    .map(([location]) => location));
+  const [faceX, faceY, faceZ] = interaction.faceTarget;
+  if (placed.has(key(interaction.faceTarget))) return undefined;
+
+  // Search both vertical portal orientations for a complete, full-corner frame
+  // around the requested ignition cell. Bounds keep this search tiny.
+  for (const horizontalAxis of [0, 2]) {
+    const planeAxis = horizontalAxis === 0 ? 2 : 0;
+    const faceHorizontal = interaction.faceTarget[horizontalAxis];
+    const facePlane = interaction.faceTarget[planeAxis];
+    const points = [...obsidian].map((location) => location.split(",").map(Number))
+      .filter((location) => location[planeAxis] === facePlane);
+    const lefts = [...new Set(points.map((location) => location[horizontalAxis]))]
+      .filter((position) => position < faceHorizontal);
+    const rights = [...new Set(points.map((location) => location[horizontalAxis]))]
+      .filter((position) => position > faceHorizontal);
+    const bottoms = [...new Set(points.map((location) => location[1]))]
+      .filter((position) => position < faceY);
+    const tops = [...new Set(points.map((location) => location[1]))]
+      .filter((position) => position > faceY);
+
+    for (const left of lefts) for (const right of rights) {
+      if (right - left < 3) continue;
+      for (const bottom of bottoms) for (const top of tops) {
+        if (top - bottom < 4) continue;
+        const point = (horizontal, y) => {
+          const location = [faceX, y, faceZ];
+          location[horizontalAxis] = horizontal;
+          location[planeAxis] = facePlane;
+          return location;
+        };
+        const perimeter = [];
+        for (let horizontal = left; horizontal <= right; horizontal += 1) {
+          perimeter.push(point(horizontal, bottom), point(horizontal, top));
+        }
+        for (let y = bottom + 1; y < top; y += 1) {
+          perimeter.push(point(left, y), point(right, y));
+        }
+        const interior = [];
+        for (let horizontal = left + 1; horizontal < right; horizontal += 1) {
+          for (let y = bottom + 1; y < top; y += 1) interior.push(point(horizontal, y));
+        }
+        if (perimeter.every((location) => obsidian.has(key(location)))
+          && interior.every((location) => !placed.has(key(location)))
+          && perimeter.some((location) => key(location) === key(interaction.block))) return interior;
+      }
+    }
+  }
+  return undefined;
+}
 
 function cropFarmPipeline(plan) {
   const plant = plan.placements.find(({ itemId }) => FARM_CROPS.has(itemId));
@@ -126,7 +192,10 @@ function cropFarmPipeline(plan) {
 }
 
 export function validateMachinePlan(value) {
-  exactKeys(value, ["title", "kind", "placements", "interactions"], "machine plan");
+  exactKeys(value, ["title", "kind", "mode", "placements", "interactions"], "machine plan");
+  if (value.mode !== undefined && value.mode !== "modify") {
+    throw new Error("machine plan mode must be modify when supplied");
+  }
   if (!Array.isArray(value.placements) || value.placements.length < 1
     || value.placements.length > MACHINE_PLAN_LIMITS.placements) {
     throw new Error(`placements must contain 1-${MACHINE_PLAN_LIMITS.placements} entries`);
@@ -196,12 +265,16 @@ export function validateMachinePlan(value) {
     if (itemId === "minecraft:hopper_minecart" && placed.get(key(block))?.itemId !== "minecraft:rail") {
       throw new Error(`interactions[${index}].block must be a planned rail`);
     }
+    if (itemId === "minecraft:flint_and_steel" && !portalInterior(placed, { block, faceTarget })) {
+      throw new Error(`interactions[${index}] requires a complete vertical obsidian portal frame around an empty interior`);
+    }
     return { action: "use_item_on_block", itemId, block, faceTarget };
   });
 
   return {
     title: clean(value.title, "Working Machine", 32),
     kind: clean(value.kind, "machine", 48).toLowerCase(),
+    ...(value.mode === "modify" ? { mode: "modify" } : {}),
     placements,
     interactions,
   };
@@ -215,6 +288,8 @@ export function machineBlueprint(value) {
     expectedType: PLACE_ITEMS[placement.itemId],
     ...placement.orientationTarget && { orientationTarget: placement.orientationTarget },
   });
+  const finalPlaced = new Map(foldPlacementSteps(plan.placements)
+    .map((placement) => [key(placement.target), placement]));
   const toggles = new Map();
   const preparedInteractions = plan.interactions.map((interaction) => {
     const behavior = INTERACTION_ITEMS[interaction.itemId];
@@ -223,10 +298,12 @@ export function machineBlueprint(value) {
       toggles.set(key(interaction.block), count + 1);
       return { ...interaction, expectedState: { state: "open_bit", value: count % 2 === 0 } };
     }
-    return { ...interaction, ...behavior };
+    const expectedFaceBlocks = interaction.itemId === "minecraft:flint_and_steel"
+      ? portalInterior(finalPlaced, interaction) : undefined;
+    return { ...interaction, ...behavior, ...(expectedFaceBlocks ? { expectedFaceBlocks } : {}) };
   });
-  const preInteractions = preparedInteractions.filter(({ expectedFaceType }) => expectedFaceType);
-  const interactions = preparedInteractions.filter(({ expectedFaceType }) => !expectedFaceType);
+  const preInteractions = preparedInteractions.filter(({ itemId }) => itemId === "minecraft:water_bucket");
+  const interactions = preparedInteractions.filter(({ itemId }) => itemId !== "minecraft:water_bucket");
   const cropPlacementIndex = farmPipeline ? plan.placements.findIndex((placement) => (
     placement.action !== "break" && key(placement.target) === key(farmPipeline.plant)
   )) : -1;
@@ -239,7 +316,9 @@ export function machineBlueprint(value) {
   }
   for (const interaction of preparedInteractions) {
     if (interaction.expectedFaceType) {
-      verification.push({ kind: "block_type", block: interaction.faceTarget, typeId: interaction.expectedFaceType });
+      for (const block of interaction.expectedFaceBlocks || [interaction.faceTarget]) {
+        verification.push({ kind: "block_type", block, typeId: interaction.expectedFaceType });
+      }
     } else if (interaction.expectedEntity) {
       const entityLocation = interaction.expectedEntity === "minecraft:hopper_minecart"
         ? interaction.block : interaction.faceTarget;
@@ -263,6 +342,8 @@ export function machineBlueprint(value) {
   };
   return {
     title: plan.title,
+    kind: plan.kind,
+    ...(plan.mode === "modify" ? { mode: "modify" } : {}),
     placements,
     preInteractions,
     // Build the dry collection path first, then add water immediately before
@@ -281,8 +362,9 @@ export function machineBlueprint(value) {
 
 export function machinePlanSchemaPrompt() {
   return `build_machine action={"type":"build_machine","version":1,"plan":{"title":"short title","kind":"repeat the requested machine noun exactly","placements":[{"itemId":"minecraft:observer","target":[0,1,2],"support":[0,0,2],"orientationTarget":[0,1,1]}],"interactions":[]}}. `
-    + `This is the bounded player-action plan for a working farm or machine without a fixed skill. Use real inputs, outputs, supports, controls, and collection where the design needs them. Never use build_structure for a functional machine. `
+    + `This is the bounded player-action plan for a working farm or machine without a fixed skill. Use real inputs, outputs, supports, controls, and collection where the design needs them. Never use build_structure for a functional machine. For feedback on the active machine or fixed blueprint, set plan.mode="modify" and return the complete corrected bounded plan; the executor will rebuild it at the existing project origin. `
     + `Limits: ${MACHINE_PLAN_LIMITS.placements} placements, ${MACHINE_PLAN_LIMITS.interactions} interactions; x -${MACHINE_PLAN_LIMITS.x}..${MACHINE_PLAN_LIMITS.x}, y 0..${MACHINE_PLAN_LIMITS.y}, z 0..${MACHINE_PLAN_LIMITS.z}. `
     + `Every placement needs an adjacent ground or earlier support. Directional blocks require an adjacent orientationTarget; other blocks use null. A break placement may only remove earlier smooth-stone or cobblestone scaffolding. `
+    + `For a Nether portal, place a complete full-corner vertical obsidian rectangle at least 4 blocks wide and 5 blocks tall, leave its interior empty, then use flint_and_steel on a frame block with faceTarget inside the frame. `
     + `Allowed placement items: ${Object.keys(PLACE_ITEMS).join(", ")}. Allowed interaction items: ${Object.keys(INTERACTION_ITEMS).join(", ")}.`;
 }

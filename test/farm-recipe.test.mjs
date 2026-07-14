@@ -22,7 +22,10 @@ test("automatic chicken farm physically collects eggs and starts with chickens",
   });
   assert.deepEqual(chest.target, [0, 0, 1]);
   assert.ok(farm.placements.some(({ action, target }) => action === "break" && key(target) === key(chest.target)));
-  assert.equal(farm.placements.filter(({ itemId }) => itemId === "minecraft:glass").length, 7);
+  assert.equal(farm.placements.filter(({ itemId }) => itemId === "minecraft:glass").length, 11);
+  for (const target of ["-1,2,2", "1,2,2", "0,2,3", "0,2,1"]) {
+    assert.ok(farm.placements.some(({ itemId, target: point }) => itemId === "minecraft:glass" && key(point) === target));
+  }
   assert.equal(farm.interactions.length, 4);
   assert.ok(farm.interactions.every(({ action, itemId, expectedEntity }) => (
     action === "use_item_on_block"

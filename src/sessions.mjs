@@ -4,6 +4,9 @@ import { dirname } from "node:path";
 
 const REQUEST_ID = /^[a-zA-Z0-9_-]{1,64}$/;
 const ACTION_STATUSES = new Set(["pending", "started", "completed", "failed", "unknown"]);
+// Bump this when persisted dialogue from an older agent contract would teach the
+// current planner false capabilities or revive invalid projects.
+const BEHAVIOR_REVISION = 3;
 const safeSequence = (value) => Number.isSafeInteger(value) && value >= 1 ? value : undefined;
 
 function safeDetail(value) {
@@ -19,8 +22,17 @@ function persistedTurn(turn) {
       if (value && typeof value === "object" && !Array.isArray(value)) action = value;
     } catch {}
   }
+  let goal = null;
+  if (turn?.goal && typeof turn.goal === "object" && !Array.isArray(turn.goal)) {
+    try {
+      const value = JSON.parse(JSON.stringify(turn.goal));
+      if (value && typeof value === "object" && !Array.isArray(value)) goal = value;
+    } catch {}
+  }
   const requestId = typeof turn?.requestId === "string" && REQUEST_ID.test(turn.requestId)
     ? turn.requestId : undefined;
+  const goalId = typeof turn?.goalId === "string" && REQUEST_ID.test(turn.goalId)
+    ? turn.goalId : undefined;
   const status = action && ACTION_STATUSES.has(turn?.status) ? turn.status : action ? "unknown" : undefined;
   const detail = action ? safeDetail(turn?.detail) : undefined;
   const requestSequence = safeSequence(turn?.requestSequence);
@@ -28,7 +40,9 @@ function persistedTurn(turn) {
     question: turn?.question,
     answer: turn?.answer,
     action,
+    ...(goal && { goal }),
     ...(requestId && { requestId }),
+    ...(goalId && { goalId }),
     ...(status && { status }),
     ...(detail && { detail }),
     ...(requestSequence && { requestSequence }),
@@ -107,6 +121,19 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
       const key = `${mode}:${player}`;
       return reserveSequence(sequences, key, sessions.get(key)?.turns);
     },
+    isCurrent(player, mode, requestSequence) {
+      return safeSequence(requestSequence) === sequences.get(`${mode}:${player}`);
+    },
+    async appendIfCurrent(player, mode, turn) {
+      const key = `${mode}:${player}`;
+      const requestSequence = safeSequence(turn?.requestSequence);
+      if (!requestSequence || requestSequence !== sequences.get(key)) return false;
+      const session = sessions.get(key) || { turns: [], updatedAt: 0 };
+      appendTurn(session, { ...turn, requestSequence }, maxTurns);
+      session.updatedAt = Date.now();
+      sessions.set(key, session);
+      return true;
+    },
     async append(player, mode, turn) {
       const key = `${mode}:${player}`;
       const session = sessions.get(key) || { turns: [], updatedAt: 0 };
@@ -142,10 +169,13 @@ export async function createFileSessionStore({
 } = {}) {
   if (!filePath) throw new Error("session file path is required");
   if (!salt || salt.length < 16) throw new Error("session salt must be at least 16 characters");
-  let data = { version: 1, sessions: {} };
+  let data = { version: 1, behaviorRevision: BEHAVIOR_REVISION, sessions: {} };
   try {
     const parsed = JSON.parse(await readFile(filePath, "utf8"));
-    if (parsed?.version === 1 && parsed.sessions && typeof parsed.sessions === "object") {
+    if (parsed?.version === 1
+      && parsed.behaviorRevision === BEHAVIOR_REVISION
+      && parsed.sessions
+      && typeof parsed.sessions === "object") {
       data = parsed;
       for (const session of Object.values(data.sessions)) {
         session.turns = Array.isArray(session?.turns) ? normalizedTurns(session.turns) : [];
@@ -200,6 +230,24 @@ export async function createFileSessionStore({
     reserve(player, mode) {
       const key = keyFor(player, mode);
       return reserveSequence(sequences, key, data.sessions[key]?.turns);
+    },
+    isCurrent(player, mode, requestSequence) {
+      return safeSequence(requestSequence) === sequences.get(keyFor(player, mode));
+    },
+    async appendIfCurrent(player, mode, turn) {
+      const key = keyFor(player, mode);
+      const requestSequence = safeSequence(turn?.requestSequence);
+      if (!requestSequence || requestSequence !== sequences.get(key)) return false;
+      const session = data.sessions[key] || { turns: [], updatedAt: 0 };
+      appendTurn(session, { ...turn, requestSequence }, maxTurns);
+      session.updatedAt = now();
+      data.sessions[key] = session;
+      await persist();
+      if (requestSequence === sequences.get(key)) return true;
+      session.turns = session.turns.filter((entry) => entry.requestSequence !== requestSequence);
+      session.updatedAt = now();
+      await persist();
+      return false;
     },
     async append(player, mode, turn) {
       const key = keyFor(player, mode);

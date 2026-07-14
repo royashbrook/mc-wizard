@@ -71,12 +71,15 @@ Open [http://127.0.0.1:3001](http://127.0.0.1:3001) on the server Mac. The desk 
 - live Bedrock, brain, and provider health;
 - quick world controls plus a one-line Bedrock console input;
 - recent container logs that refresh every four seconds and follow new output automatically;
+- a live, persistent interaction history with Wizard/general questions, answers, action labels, and verified outcomes;
 - a separate browser dialogue session for testing Wizard and general AI replies; and
 - hot-loaded prompt addenda, AI enable/disable, and output-token limits.
 
 ### Live-chat refinement loop
 
-Do not tune the Wizard from a paraphrase. Inspect the latest persisted chat/session log, label each turn `success`, `partial`, or `failure`, and copy the exact child wording (including typos and follow-up history) into `test/fixtures/live-chat-regressions.json`. Run `npm run eval:live-chat` before and after a fix. The fixture is the durable replay set; adding a case is part of fixing a live failure, not optional cleanup.
+Do not tune the Wizard from a remembered paraphrase. Inspect the latest local chat/session log and label each turn `success`, `partial`, or `failure`. Promote a live turn into the public `test/fixtures/live-chat-regressions.json` only with parent or guardian opt-in, after manually removing names, gamertags, contact/location details, school information, and other identifying text. Prefer a synthetic equivalent that preserves the exact typo or follow-up pattern which triggered the bug. Run `npm run eval:live-chat` before and after a fix.
+
+The brain also appends pseudonymized local JSONL records to ignored `runtime/brain/interactions.jsonl`; set `INTERACTION_LOG_FILE` to override the path. The file is mode `0600` and automatically retains only its newest 2 MiB. Player names are HMAC-pseudonymized and removed from recorded text, but free-form chat can still contain personal information and must not be treated as anonymized. The operator desk polls the same history, so a tester can inspect the request, reply, chosen action, and executor result without relaying it by hand.
 
 AI tuning is stored in ignored `runtime/admin/settings.json` and read on every request, so saving it does not restart Bedrock or the brain. The base safety, action, and book-format contracts remain in code. Console input uses the image's documented [`send-command`](https://github.com/itzg/docker-minecraft-bedrock-server#executing-server-commands) helper without invoking a shell.
 
@@ -111,7 +114,7 @@ AI_API_KEY=your-key-if-required
 AI_MODEL=provider-model-id
 ```
 
-The service sends the question and retrieved excerpts, not the player's coordinates. The player name is used only to derive a salted `safety_identifier` for OpenAI.
+The service sends the question, retrieved excerpts, recent dialogue, and a bounded live-world snapshot—including Minecraft coordinates, nearby block/entity summaries, and current project geometry—to the configured provider. It does not send the player's gamertag; the name is used only to derive a per-install HMAC `safety_identifier` for OpenAI.
 
 For the local subscription-backed bridge used by this spike, start this first:
 
@@ -119,9 +122,9 @@ For the local subscription-backed bridge used by this spike, start this first:
 npm run start:ai
 ```
 
-`mtok-bridge` provides the OpenAI-compatible transport. Its upstream can be the authenticated local Codex, Grok, or Claude CLI. Codex runs ephemerally in a read-only sandbox with user configuration, rules, apps, multi-agent, and shell tools disabled. Grok runs single-turn with memory, subagents, web search, and tools disabled; Claude uses safe mode, an empty tool list, and no session persistence. The provider receives only the model prompt: it cannot act in Minecraft. The bridge allows one request at a time and stops a stuck local model at the configured timeout. Then start the brain with `npm start`.
+`mtok-bridge` provides the OpenAI-compatible transport. Its upstream can be the authenticated local Codex, Grok, or Claude CLI. Codex runs ephemerally in a read-only sandbox with user configuration, rules, apps, multi-agent, and shell tools disabled. Grok runs single-turn with memory, subagents, web search, and tools disabled; Claude uses safe mode, an empty tool list, and no session persistence. The provider receives only the model prompt: it cannot act in Minecraft. The loopback bridge rejects browser-originated and non-JSON requests. It runs three provider jobs by default (bounded to 2–4), bounds queue waits, and terminates the active CLI immediately when a player disconnects or the request times out. Then start the brain with `npm start`.
 
-Greetings, readiness checks, thanks, jokes, calculator builds, T flip-flops, and small castle gates run as immediate local skills without an AI request. Deeper questions use the cached corpus as evidence for the configured model to synthesize; raw documentation is never used as a chat fallback. Joining the server starts a fresh dialogue session, and late replies from an older request are discarded, so a previous build request cannot resume after reconnecting. The Bedrock log message `Running AutoCompaction...` is database maintenance, not an AI request; the operator desk hides those routine lines and reports that they use zero AI tokens.
+Greetings, readiness checks, thanks, jokes, calculator builds, T flip-flops, and small castle gates run as immediate local skills without an AI request. Deeper questions use the cached corpus as evidence for the configured model to synthesize; raw documentation is never used as a chat fallback. Every provider action is checked against the child's explicit intent before it can reach Bedrock, and an unrelated provider goal cannot attach itself to ordinary conversation. Build requests create a persisted goal with observable success criteria. If an unusual shape cannot be planned after the bounded repair attempt, the Wizard places a clearly described footprint-and-height layout as useful progress and automatically continues the same goal; it never labels that layout as the finished object. A completed placement batch is only an observation: Bedrock returns a fresh world snapshot, the goal reviewer either marks the goal complete or issues the next related correction, and at most six automatic actions can run before the Wizard explicitly asks the child to inspect the still-active project. New child requests supersede older planning and late provider replies atomically. The Bedrock log message `Running AutoCompaction...` is database maintenance, not an AI request; the operator desk hides those routine lines and reports that they use zero AI tokens.
 
 In game, `ai <question>` always means this general model route. It requires the `ai` keyword even when the player is alone or beside the Wizard, skips Minecraft RAG and Wizard actions, and prefixes short replies with the configured provider label, such as `[ChatGPT]`. Replies over 700 characters are placed in a signed book at the player's feet. Ordinary chat and `wiz`/`wizard` continue through the Minecraft-specialist route.
 
@@ -215,7 +218,7 @@ container system status
 Then:
 
 1. Either put an exported Beta-APIs-enabled world at `runtime/bedrock/worlds/mc-wizard`, or create a disposable fresh one headlessly with `npm run bootstrap:bds`. The bootstrap container publishes no network port, stops BDS cleanly, backs up `level.dat`, structurally enables the three official Beta API experiment bytes, and deletes only its temporary container.
-2. Choose the Mac's private LAN IPv4 first. Copy `.env.example` to `.env`, set `HOST` to that literal address (not `0.0.0.0`), replace `BRIDGE_TOKEN` with at least 24 random characters, and run `npm start`. The brain refuses to bind beyond loopback with a default or short token.
+2. Choose the Mac's private LAN IPv4 first. Copy `.env.example` to `.env`, set `HOST` to that literal address (not `0.0.0.0`), replace `BRIDGE_TOKEN` with at least 24 random characters, and run `npm start`. Leave `WIZARD_SALT` blank to derive a private stable salt from that token, or set it to a different random secret of at least 24 characters. The brain refuses to bind beyond loopback with a default or short token and ignores the old public salt placeholder.
 3. Supply the Mac's private LAN IPv4 and explicitly opt into an open server on that private network:
 
    ```bash
@@ -274,6 +277,9 @@ Focused runs cover the open-ended child experience without rerunning the whole s
 
 ```bash
 npm run test:e2e:arbitrary
+npm run test:e2e:portal
+npm run test:e2e:travel-rollback
+npm run test:e2e:city
 npm run test:e2e:child
 npm run test:e2e:refinement
 npm run test:e2e:farms
@@ -300,11 +306,16 @@ Content-Type: application/json
 
 The explicit general route sends `"mode":"general"`; that response always has `"kind":"general"`, no sources, and no action.
 
-The brain returns prose, provenance, and an optional typed action:
+The brain returns prose, provenance, a persisted goal, and an optional typed action:
 
 ```json
 {
   "answer": "A T flip-flop stores one bit...",
+  "goal": {
+    "objective": "Build a working T flip-flop nearby",
+    "successCriteria": "Each button press toggles the output and the lamp shows its state",
+    "status": "active"
+  },
   "action": {
     "type": "place_blueprint",
     "id": "copper_bulb_t_flip_flop",
@@ -322,19 +333,21 @@ The brain returns prose, provenance, and an optional typed action:
 }
 ```
 
-The Bedrock adapter ignores every action except the exact allow-listed type, ID, and version above.
+The Bedrock adapter accepts only registered, versioned actions and validates every material, dimension, coordinate, interaction, entity, and operation bound before execution. It reports `started`, `completed`, or `failed` back to `/v1/action-result`; completed results include a bounded live-world snapshot for semantic goal review. Structure and machine corrections retain immutable goal lineage and the prior project location, and unrelated replacement actions are rejected.
 
 ## Why this differs from the reference bot
 
-[`danshorstein/minecraft-ai-bot`](https://github.com/danshorstein/minecraft-ai-bot) is an MIT-licensed Java/Paper companion built around Mineflayer, a large prompt cookbook, OpenRouter tool calls, and OP slash commands. Its best transferable ideas are structured tools, deterministic skills, fixed build anchors, serialized work, and separate planning/verification roles.
+[`danshorstein/minecraft-ai-bot`](https://github.com/danshorstein/minecraft-ai-bot) is an MIT-licensed Java/Paper companion built around Mineflayer, a large prompt cookbook, OpenRouter tool calls, and OP slash commands. Its strongest transferable idea is its continuous goal runner: plan once, execute a step, scan the world, ask an independent QA role whether the criteria pass, and continue at a fixed anchor. It also relies on deterministic city/castle skills and a broad raw-command escape hatch; it is not a RAG or Minecraft-documentation system.
 
-Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not transfer to Bedrock. MC Wizard keeps the structured-skill idea but uses Bedrock's official beta `SimulatedPlayer` for the visible character and puts its actions behind a strict Script API compiler. It does not log in a headless protocol client or hold credentials for a second Xbox account. No source code from the reference project is copied here.
+Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not transfer to Bedrock. The reference character is visible, but its large builds are performed by `/fill`, `/setblock`, and `/summon`, with extra crew players used theatrically. MC Wizard keeps the structured-skill and iterative-QA ideas, uses Bedrock's official beta `SimulatedPlayer` for the visible character, and puts actions behind a strict Script API compiler. It does not log in a headless protocol client or hold credentials for a second Xbox account. No source code from the reference project is copied here.
 
 ## Known limits of this spike
 
 - The live iPad test verified the visible player entity, chat, AI books, and basic mechanics. The custom wand and T-flip-flop's real-client copper-bulb transition still need a quick iPad visual check. The fitted costume was removed after testing because it obscured the player model.
 - The T flip-flop, calculator, command lessons, and validated plans are transactional and undoable. They require bounded clear areas, reject occupied/protected overlaps, and roll back on failure or disconnect.
 - The current documented Script API cannot safely program arbitrary command-block text. Prepared lesson definitions make the Wizard physically place the command block and button, then tell the child exactly what to paste; they deliberately do not `/structure load` a prebuilt result.
+- The simulated player attempts normal placement and interaction first. Large surfaces use bounded fill operations, and a rejected Bedrock placement can be repaired directly after visible player attempts; therefore the current runtime does not guarantee that every final block was accepted through the player-placement API.
+- Goal QA observes validated plans, project memory, nearby blocks/entities, weather, time, and action-specific acceptance results. It is not visual scene understanding yet. Automatic continuation is capped at six actions under one immutable goal; the goal stays active and the Wizard asks for child feedback rather than silently claiming success at the cap.
 - Official Microsoft documentation is not a complete gameplay encyclopedia. Fill gaps with versioned, self-authored mechanic cards backed by reproducible Bedrock tests. Do not ingest the community wiki by default without accepting its attribution, noncommercial, and share-alike requirements.
 - The operator desk is not a parental-control or child-chat-audit system. Dialogue sessions are bounded and stored under hashed player keys for continuity and regression promotion, but there is no retention/consent policy, per-world protected region, semantic cache, embedding index, or broad retrieval evaluation set yet.
 
@@ -345,7 +358,8 @@ MC Wizard is released under the [MIT License](./LICENSE). Microsoft Minecraft do
 ## Next proof points
 
 1. Complete the remaining iPad visual checks for the wand and real-client copper-bulb transition.
-2. Add a scheduled world-backup restore drill for the explicitly open private-LAN server.
-3. Expand the evaluated mechanic-card catalog before broadening the arbitrary-plan block allowlist.
-4. Replace or separately license the calculator geometry before commercial distribution.
-5. Build a retrieval eval set from real questions from one Bedrock-playing child; add embeddings only if the lexical baseline misses them.
+2. Add richer project-region observation—or a visual QA model—without exposing arbitrary world commands.
+3. Prefer a direct provider API for the primary runtime; keep local CLI providers as subscription-backed fallbacks.
+4. Add a scheduled world-backup restore drill for the explicitly open private-LAN server.
+5. Expand the evaluated mechanic-card catalog and build a retrieval eval set from real child questions before broadening the block allowlist or adding embeddings.
+6. Replace or separately license the calculator geometry before commercial distribution.

@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Codex Provider Action Envelope",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "answer",
+    "action_json",
+    "goal_json"
+  ],
+  "properties": {
+    "answer": {
+      "type": "string"
+    },
+    "action_json": {
+      "type": "string"
+    },
+    "goal_json": {
+      "type": "string"
+    }
+  }
+}

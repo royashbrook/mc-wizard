@@ -12,7 +12,7 @@ const response = await fetch(wizardUrl, {
     authorization: `Bearer ${process.env.BRIDGE_TOKEN || "dev-only-change-me"}`,
     "content-type": "application/json",
   },
-  body: JSON.stringify({ player: "local-tester", question }),
+  body: JSON.stringify({ player: process.env.ASK_PLAYER || "local-tester", question }),
 });
 
 const result = await response.json();
