@@ -14,6 +14,17 @@ function safeDetail(value) {
   return value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500) || undefined;
 }
 
+function safeResponseMode(value) {
+  return safeDetail(value)?.slice(0, 64);
+}
+
+function safeFeedback(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || !Number.isInteger(value.grade) || value.grade < 1 || value.grade > 5) return undefined;
+  const note = safeDetail(value.note);
+  return { grade: value.grade, ...(note && { note }) };
+}
+
 function persistedTurn(turn) {
   let action = null;
   if (turn?.action && typeof turn.action === "object" && !Array.isArray(turn.action)) {
@@ -35,6 +46,8 @@ function persistedTurn(turn) {
     ? turn.goalId : undefined;
   const status = action && ACTION_STATUSES.has(turn?.status) ? turn.status : action ? "unknown" : undefined;
   const detail = action ? safeDetail(turn?.detail) : undefined;
+  const responseMode = safeResponseMode(turn?.responseMode);
+  const feedback = safeFeedback(turn?.feedback);
   const requestSequence = safeSequence(turn?.requestSequence);
   return {
     question: turn?.question,
@@ -45,6 +58,8 @@ function persistedTurn(turn) {
     ...(goalId && { goalId }),
     ...(status && { status }),
     ...(detail && { detail }),
+    ...(responseMode && { responseMode }),
+    ...(feedback && { feedback }),
     ...(requestSequence && { requestSequence }),
   };
 }
@@ -101,6 +116,52 @@ function updateAction(turns, requestId, status, detail) {
   return { matched: true, updated: true, status };
 }
 
+function feedbackBinding(turn, extra = {}) {
+  const goalId = turn.goalId || (turn.goal ? turn.requestId : undefined);
+  return {
+    matched: true,
+    requestId: turn.requestId,
+    ...(goalId && { goalId }),
+    question: turn.question,
+    answer: turn.answer,
+    action: turn.action,
+    ...(turn.goal && { goal: turn.goal }),
+    ...(turn.status && { status: turn.status }),
+    ...(turn.detail && { detail: turn.detail }),
+    ...(turn.responseMode && { responseMode: turn.responseMode }),
+    ...extra,
+  };
+}
+
+function updateFeedback(turns, requestId, grade, note) {
+  if (!REQUEST_ID.test(requestId) || !Number.isInteger(grade) || grade < 1 || grade > 5) {
+    return { matched: false, recorded: false, duplicate: false };
+  }
+  const index = turns.findLastIndex((turn) => turn.requestId === requestId);
+  if (index < 0) return { matched: false, recorded: false, duplicate: false };
+  const turn = turns[index];
+  if (turn.action && ["pending", "started", "unknown"].includes(turn.status)) {
+    return feedbackBinding(turn, { recorded: false, duplicate: false, pending: true });
+  }
+  const cleanNote = safeDetail(note);
+  if (turn.feedback && (turn.feedback.note || turn.feedback.grade >= 4 || !cleanNote)) {
+    return feedbackBinding(turn, {
+      recorded: false,
+      duplicate: true,
+      grade: turn.feedback.grade,
+      ...(turn.feedback.note && { note: turn.feedback.note }),
+    });
+  }
+  const feedback = safeFeedback({ grade, note: cleanNote });
+  turns[index] = persistedTurn({ ...turn, feedback });
+  return feedbackBinding(turns[index], {
+    recorded: true,
+    duplicate: false,
+    grade: feedback.grade,
+    ...(feedback.note && { note: feedback.note }),
+  });
+}
+
 export function createMemorySessionStore({ maxTurns = 12 } = {}) {
   const sessions = new Map();
   const sequences = new Map();
@@ -149,6 +210,13 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
       if (!session) return { matched: false, updated: false };
       const outcome = updateAction(session.turns, result.requestId, result.status, result.detail);
       if (outcome.updated) session.updatedAt = Date.now();
+      return outcome;
+    },
+    async recordFeedback(player, mode, { requestId, grade, note }) {
+      const session = sessions.get(`${mode}:${player}`);
+      if (!session) return { matched: false, recorded: false, duplicate: false };
+      const outcome = updateFeedback(session.turns, requestId, grade, note);
+      if (outcome.recorded) session.updatedAt = Date.now();
       return outcome;
     },
     async delete(player, mode) {
@@ -265,6 +333,16 @@ export async function createFileSessionStore({
       if (!session) return { matched: false, updated: false };
       const outcome = updateAction(session.turns, result.requestId, result.status, result.detail);
       if (outcome.updated) {
+        session.updatedAt = now();
+        await persist();
+      }
+      return outcome;
+    },
+    async recordFeedback(player, mode, { requestId, grade, note }) {
+      const session = data.sessions[keyFor(player, mode)];
+      if (!session) return { matched: false, recorded: false, duplicate: false };
+      const outcome = updateFeedback(session.turns, requestId, grade, note);
+      if (outcome.recorded) {
         session.updatedAt = now();
         await persist();
       }

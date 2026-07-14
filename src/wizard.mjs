@@ -3095,6 +3095,87 @@ export function createWizard({
     clearSession(player, mode = "wizard") {
       return sessions.delete(player, mode);
     },
+    async recordFeedback({ player, requestId, grade, feedback, context }) {
+      if (typeof sessions.recordFeedback !== "function") {
+        return { matched: false, recorded: false, duplicate: false };
+      }
+      const note = typeof feedback === "string"
+        ? feedback.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 500)
+        : "";
+      const binding = await sessions.recordFeedback(player, "wizard", {
+        requestId, grade, ...(note && { note }),
+      });
+      const actionLabel = binding.action?.id || binding.action?.plan?.title
+        || binding.action?.title || binding.action?.type;
+      const result = {
+        matched: Boolean(binding.matched),
+        recorded: Boolean(binding.recorded),
+        duplicate: Boolean(binding.duplicate),
+        ...(binding.pending && { pending: true }),
+        requestId,
+        grade: binding.grade || grade,
+        ...(binding.goalId && { goalId: binding.goalId }),
+        ...(note && { note }),
+        ...(binding.responseMode && { responseMode: binding.responseMode }),
+        ...(binding.status && { status: binding.status }),
+        ...(binding.detail && { detail: binding.detail }),
+        ...(actionLabel && { actionLabel: String(actionLabel).slice(0, 120) }),
+      };
+      if (!binding.matched || binding.pending) return result;
+      if (binding.duplicate) {
+        return { ...result, message: "I already saved that grade for this request." };
+      }
+      if (!note) {
+        if (grade <= 3) {
+          return {
+            ...result,
+            needsFeedback: true,
+            message: "Tell me one thing I should change, and I’ll use it as my next instruction.",
+          };
+        }
+        return { ...result, message: "Thanks for the grade! I saved it with this request." };
+      }
+
+      if (binding.goalId) {
+        const projectKind = String(binding.action?.plan?.kind || "project")
+          .replace(/[^a-zA-Z0-9 _-]/g, " ").replace(/\s+/g, " ").trim().slice(0, 64)
+          || "project";
+        const instruction = `Improve this existing ${projectKind} in place using the player's feedback: ${note}`;
+        const refinement = await api.ask({
+          player,
+          mode: "wizard",
+          question: instruction,
+          requestId: randomUUID(),
+          context,
+          goalRetry: { goalId: binding.goalId },
+        });
+        return {
+          ...result,
+          message: "Thanks—that’s my next instruction. I’m improving this same project now.",
+          followUp: refinement,
+        };
+      }
+
+      const originalQuestion = String(binding.question || "the earlier question")
+        .replace(/\s+/g, " ").trim().slice(0, 800);
+      const instruction = `Answer the player's earlier informational question again in MC Wizard character. Use the feedback as the next instruction. Do not promise or return an in-world action. Earlier question: ${originalQuestion}. Player feedback: ${note}`;
+      const refinement = await api.ask({
+        player,
+        mode: "wizard",
+        question: instruction,
+        requestId: randomUUID(),
+        context,
+        answerOnly: {
+          originalQuestion,
+          fallbackAnswer: `Thanks—that helps. Here’s a clearer try: ${String(binding.answer || "I’ll explain it more clearly next time.").slice(0, 12_000)}`,
+        },
+      });
+      return {
+        ...result,
+        message: "Thanks—that’s my next instruction. I answered that again with your feedback in mind.",
+        followUp: refinement,
+      };
+    },
     async recordActionResult({ player, requestId, status, detail, context }) {
       if (typeof sessions.updateAction !== "function") return { matched: false, updated: false };
       const outcome = await sessions.updateAction(player, "wizard", { requestId, status, detail });
@@ -3192,24 +3273,31 @@ export function createWizard({
       goalReview,
       failureRetry,
       goalRetry,
+      answerOnly,
     }) {
       const requestSequence = typeof sessions.reserve === "function"
         ? sessions.reserve(player, requestMode) : undefined;
       const tuning = { aiEnabled: true, ...await settings() };
       const general = requestMode === "general";
+      const answerOnlyRequest = !general && Boolean(answerOnly);
       const reviewRequest = !general && Boolean(goalReview?.goalId);
-      const recipeRequest = !general && !reviewRequest && isRecipeRequest(question);
+      const recipeRequest = !general && !reviewRequest && !answerOnlyRequest && isRecipeRequest(question);
       const history = sessions.get(player, requestMode);
       const actionHistory = general ? history : historyWithObservedStructure(history, context);
-      const satisfied = !general && !reviewRequest && isGoalSatisfaction(question, actionHistory);
+      const satisfied = !general && !reviewRequest && !answerOnlyRequest
+        && isGoalSatisfaction(question, actionHistory);
       const instantAnswer = general || reviewRequest ? undefined : satisfied
         ? "Brilliant. I’ll mark this project complete and stay nearby for your next idea."
-        : instantConversationAnswer(question);
-      const projectFeedback = !general && (reviewRequest || isProjectFeedback(question, actionHistory));
-      const buildRequest = !general && !reviewRequest && isBuildRequest(question, actionHistory);
+        : answerOnlyRequest ? undefined : instantConversationAnswer(question);
+      const projectFeedback = !general && !answerOnlyRequest
+        && (reviewRequest || isProjectFeedback(question, actionHistory));
+      const buildRequest = !general && !reviewRequest && !answerOnlyRequest
+        && isBuildRequest(question, actionHistory);
       const includePreview = /\b(beta|preview|experimental)\b/i.test(question);
-      const conversational = !general && !reviewRequest && isOrdinaryConversation(question);
-      const contextualQuestion = retrievalQuestion(question, actionHistory);
+      const conversational = !general && !reviewRequest && !answerOnlyRequest
+        && isOrdinaryConversation(question);
+      const contextualQuestion = answerOnly?.originalQuestion
+        || retrievalQuestion(question, actionHistory);
       const retrievalQuery = general || conversational ? "" : isTFlipFlopQuestion(question)
         ? `${question} copper bulb t flip flop comparator toggle`
         : isCalculatorQuestion(question)
@@ -3219,10 +3307,14 @@ export function createWizard({
         ? [] : corpus.search(retrievalQuery, { limit: 4, includePreview });
       const relevanceFloor = (rankedHits[0]?.score || 0) * 0.5;
       const hits = rankedHits.filter((hit) => hit.score >= relevanceFloor);
-      const action = general || reviewRequest ? null : classifyAction(question, actionHistory);
-      const groundedAnswer = reviewRequest ? undefined : groundedQuickAnswer(question, hits);
+      const action = general || reviewRequest || answerOnlyRequest
+        ? null : classifyAction(question, actionHistory);
+      const groundedAnswer = reviewRequest || answerOnlyRequest
+        ? undefined : groundedQuickAnswer(question, hits);
       let answer = reviewRequest
         ? "I’m checking the finished work against the goal."
+        : answerOnlyRequest && answerOnly?.fallbackAnswer
+          ? answerOnly.fallbackAnswer
         : instantAnswer || groundedAnswer || (general
         ? `${provider.label} did not answer yet. I’ll keep this request short and try again when you ask.`
         : localAnswer(question, hits, action));
@@ -3231,13 +3323,15 @@ export function createWizard({
       let providerActionRejection;
       let rejectedProviderAction;
       let title = general ? bookTitle(question) : undefined;
-      let responseMode = reviewRequest ? "review-deferred"
+      let responseMode = answerOnlyRequest ? "feedback-answer-fallback" : reviewRequest ? "review-deferred"
         : instantAnswer ? "local-instant" : groundedAnswer ? "local-grounded" : action ? "local-skill" : "offline";
       const askModel = !instantAnswer && !groundedAnswer && provider.enabled && tuning.aiEnabled
-        && (reviewRequest || !action || wantsModelAuthoredStructure(action, buildRequest, question));
+        && (answerOnlyRequest || reviewRequest || !action
+          || wantsModelAuthoredStructure(action, buildRequest, question));
       if (askModel) {
         const safeFallback = {
-          answer: !general && !hits.length && !selectedAction && !buildRequest && !projectFeedback && !reviewRequest
+          answer: !general && !answerOnlyRequest && !hits.length && !selectedAction
+            && !buildRequest && !projectFeedback && !reviewRequest
             ? "That spell wandered away from your question, so I won’t pretend it was right. Ask me one specific thing, and I’ll answer it plainly."
             : answer,
           action: selectedAction,
@@ -3253,6 +3347,14 @@ export function createWizard({
           answer = envelope?.answer || providerAnswer;
           responseMode = provider.name;
           if (general) title = envelope?.title || title;
+          else if (answerOnlyRequest) {
+            if (envelope.action || envelope.rawActionLabel !== "none" || envelope.rawGoalPresent
+              || answerPromisesAction(envelope.answer)) {
+              throw new Error("AI provider returned an action for answer-only feedback");
+            }
+            selectedAction = null;
+            providerGoal = undefined;
+          }
           else {
             const carriedProviderCandidate = carryForwardStructurePrimitives(envelope.action, actionHistory, question);
             const providerCandidate = repairProviderGift(carriedProviderCandidate, question);
@@ -3309,7 +3411,7 @@ export function createWizard({
               responseMode = "local-action-repair";
             }
           }
-          if (!general && recipeRequest) {
+          if (!general && !answerOnlyRequest && recipeRequest) {
             if (selectedAction?.type === "show_recipe") {
               answer = localAnswer(question, hits, selectedAction);
               responseMode = "local-recipe-action";
@@ -3319,7 +3421,8 @@ export function createWizard({
               responseMode = "local-recipe-fallback";
             }
           }
-          if (!general && !reviewRequest && answerPromisesAction(answer) && !selectedAction
+          if (!general && !reviewRequest && !answerOnlyRequest
+            && answerPromisesAction(answer) && !selectedAction
             && !(buildRequest && providerActionRejection)) {
             selectedAction = classifyAction(question, actionHistory);
             if (!selectedAction) {
@@ -3387,12 +3490,12 @@ export function createWizard({
       } else if (!tuning.aiEnabled) {
         responseMode = "admin-disabled";
       }
-      if (!general && buildRequest && selectedAction
+      if (!general && !answerOnlyRequest && buildRequest && selectedAction
         && !actionAdvancesBuildRequest(selectedAction, question, actionHistory)) {
         selectedAction = null;
         answer = localAnswer(question, hits, null);
       }
-      if (!general && buildRequest && !selectedAction) {
+      if (!general && !answerOnlyRequest && buildRequest && !selectedAction) {
         const fallback = localStructureFallback(question, actionHistory);
         if (fallback && actionAdvancesBuildRequest(fallback, question, actionHistory)) {
           selectedAction = fallback;
@@ -3403,7 +3506,7 @@ export function createWizard({
           answer = PLANNING_DEFERRED_ANSWER;
         }
       }
-      if (!general && !reviewRequest && selectedAction) {
+      if (!general && !reviewRequest && !answerOnlyRequest && selectedAction) {
         answer = localAnswer(question, hits, selectedAction);
       }
       if (!general && unsafeCommandAnswer(answer, question)) {
@@ -3456,6 +3559,7 @@ export function createWizard({
         ...(safeRequestId && { requestId: safeRequestId }),
         ...(goalId && { goalId }),
         ...(selectedAction && { status: "pending" }),
+        responseMode,
         ...(requestSequence && { requestSequence }),
       };
       if (requestSequence && typeof sessions.appendIfCurrent === "function") {
@@ -3472,6 +3576,7 @@ export function createWizard({
         label: provider.label,
         title,
         ...(safeRequestId && { requestId: safeRequestId }),
+        ...(goalId && { goalId }),
       };
     },
   };

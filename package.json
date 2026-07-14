@@ -36,6 +36,7 @@
     "test:e2e:city": "MC_WIZARD_E2E_SCOPE=city sh scripts/run-e2e-container.sh",
     "test:e2e:child": "MC_WIZARD_E2E_SCOPE=child sh scripts/run-e2e-container.sh",
     "test:e2e:refinement": "MC_WIZARD_E2E_SCOPE=refinement sh scripts/run-e2e-container.sh",
+    "test:e2e:feedback": "MC_WIZARD_E2E_SCOPE=feedback sh scripts/run-e2e-container.sh",
     "test:e2e:farms": "MC_WIZARD_E2E_SCOPE=farms sh scripts/run-e2e-container.sh",
     "test:e2e:kelp": "MC_WIZARD_E2E_SCOPE=kelp sh scripts/run-e2e-container.sh",
     "test:e2e:logs": "container logs -f mc-wizard-bedrock 2>&1 | node scripts/wait-e2e.mjs"

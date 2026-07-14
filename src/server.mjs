@@ -339,6 +339,53 @@ export function validateActionResultBody(body) {
   };
 }
 
+export function validateFeedbackBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    const error = new Error("request body must be a JSON object");
+    error.status = 400;
+    throw error;
+  }
+  const player = typeof body.player === "string"
+    ? body.player.replace(/[^a-zA-Z0-9 _-]/g, "").slice(0, 64).trim()
+    : "";
+  if (!player) {
+    const error = new Error("player must be 1–64 safe characters");
+    error.status = 400;
+    throw error;
+  }
+  const requestId = typeof body.requestId === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(body.requestId)
+    ? body.requestId : undefined;
+  if (!requestId) {
+    const error = new Error("requestId must be 1–64 letters, numbers, underscores, or dashes");
+    error.status = 400;
+    throw error;
+  }
+  if (!Number.isInteger(body.grade) || body.grade < 1 || body.grade > 5) {
+    const error = new Error("grade must be an integer from 1 to 5");
+    error.status = 400;
+    throw error;
+  }
+  if (body.feedback !== undefined
+    && (typeof body.feedback !== "string" || body.feedback.length > 500)) {
+    const error = new Error("feedback must be at most 500 characters");
+    error.status = 400;
+    throw error;
+  }
+  const feedback = body.feedback
+    ?.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  const context = validateWorldContext(body.context);
+  if (body.context !== undefined && !context) {
+    const error = new Error("context must be a valid live-world snapshot");
+    error.status = 400;
+    throw error;
+  }
+  return {
+    player, requestId, grade: body.grade,
+    ...(feedback && { feedback }),
+    ...(context && { context }),
+  };
+}
+
 export function createHttpServer({
   wizard,
   corpus,
@@ -372,6 +419,40 @@ export function createHttpServer({
         sendJson(response, 200, { deleted });
       } catch (error) {
         sendJson(response, error.status || 500, { error: error.status ? error.message : "internal error" });
+      }
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/v1/feedback") {
+      if (!authorized(request, token)) {
+        sendJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      if (inFlight >= maxConcurrent) {
+        sendJson(response, 429, { error: "wizard is busy; try again in a moment" });
+        return;
+      }
+      inFlight += 1;
+      try {
+        const feedback = validateFeedbackBody(await readJson(request));
+        const result = await wizard.recordFeedback(feedback);
+        if (!result.matched) {
+          sendJson(response, 404, { error: "matching request was not found" });
+          return;
+        }
+        if (result.pending) {
+          sendJson(response, 409, { error: "the matching action is still running" });
+          return;
+        }
+        if (result.recorded) {
+          await recordInteraction(interactionLog, "recordFeedback", { ...feedback, result }, logger);
+        }
+        sendJson(response, 200, result);
+        logger.log(`[mc-wizard] feedback recorded; grade=${result.grade}`);
+      } catch (error) {
+        if (!error.status || error.status >= 500) logger.error(`[server] ${error.stack || error}`);
+        sendJson(response, error.status || 500, { error: error.status ? error.message : "internal error" });
+      } finally {
+        inFlight -= 1;
       }
       return;
     }

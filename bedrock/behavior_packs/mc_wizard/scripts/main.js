@@ -8,6 +8,7 @@ import {
   world,
 } from "@minecraft/server";
 import { getPlayerSkin, LookDuration, spawnSimulatedPlayer } from "@minecraft/server-gametest";
+import { FormCancelationReason, ModalFormData } from "@minecraft/server-ui";
 import { variables, secrets } from "@minecraft/server-admin";
 import { http, HttpRequest, HttpRequestMethod } from "@minecraft/server-net";
 import { startE2E } from "./e2e.js";
@@ -84,6 +85,9 @@ const buildMoveNotices = new Set();
 const pendingQuestions = new Map();
 const pendingActionReports = new Map();
 const actionReportsByToken = new Map();
+const pendingFeedback = new Map();
+const queuedFeedback = new Map();
+const promptedFeedbackRequests = new Set();
 const lastUndo = new Map();
 const lastStructures = new Map();
 const lastProjects = new Map();
@@ -249,13 +253,17 @@ async function postActionResult(report, status, detail) {
       console.warn(`[MC Wizard] action ${report.requestId} ${status}`);
       const terminal = status === "completed" || status === "failed";
       const abandoned = /\b(?:superseded|player left|all players left|server stopp)/i.test(detail || "");
-      if (!terminal || result.updated === false || abandoned
-        || result.superseded || result.replan?.superseded) return;
+      if (!terminal || abandoned || result.superseded || result.replan?.superseded) return;
+      if (result.updated === false) {
+        if (result.matched) queueFeedback(report);
+        return;
+      }
       if (result.reviewLimitReached || result.retryLimitReached) {
         withCurrentActionPlayer(report, (player) => speak(
           player,
           "Our goal is still active, but I’ve reached my automatic retry limit. Come take a look and tell me what to change; I’ll continue from there.",
         ));
+        queueFeedback(report);
         return;
       }
       const executableReplan = result.replan?.action && result.replan?.requestId
@@ -291,14 +299,20 @@ async function postActionResult(report, status, detail) {
       }
       if (retry) {
         scheduleActionResultRetry(report, retry);
-      } else if (status === "failed") {
+        return;
+      }
+      if (result.reviewDeferred || result.review?.goal?.status === "active") {
+        withCurrentActionPlayer(report, (player) => speak(player, "I’ve finished this pass and kept our project active. Come take a look—tell me what to change, and I’ll keep working on this same build."));
+        queueFeedback(report);
+        return;
+      }
+      if (status === "failed") {
         withCurrentActionPlayer(report, (player) => speak(
           player,
           "That attempt didn’t hold, but our goal is still active. Tell me what to change and I’ll keep working from here.",
         ));
-      } else if (result.reviewDeferred || result.review?.goal?.status === "active") {
-        withCurrentActionPlayer(report, (player) => speak(player, "I’ve finished this pass and kept our project active. Come take a look—tell me what to change, and I’ll keep working on this same build."));
       }
+      queueFeedback(report);
       return;
     } catch (error) {
       if (attempt === 2) {
@@ -914,6 +928,166 @@ function speak(player, message) {
     }
     player.sendMessage(`${PREFIX}${line}`);
   }
+}
+
+function parseGradeMessage(message) {
+  const match = /^grade\s+([1-5])\b(?:\s*(?::|-)\s*|\s+)?(.*)$/i.exec(message.trim());
+  if (!match) return undefined;
+  return {
+    grade: Number(match[1]),
+    feedback: String(match[2] || "").replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500),
+  };
+}
+
+function feedbackChatFallback(prompt) {
+  if (pendingFeedback.get(prompt.playerId) !== prompt || prompt.fallbackOffered) return;
+  prompt.fallbackOffered = true;
+  const player = playerById(prompt.playerId);
+  if (player) speak(player, "How did I do? Reply with ‘grade 1’ through ‘grade 5’. You can add what I should do next after a colon, like ‘grade 2: add more windows’.");
+}
+
+async function submitFeedback(prompt, grade, feedback) {
+  if (pendingFeedback.get(prompt.playerId) !== prompt || prompt.submitting) return;
+  const player = playerById(prompt.playerId);
+  if (!player) return;
+  prompt.submitting = true;
+  speak(player, feedback
+    ? "Thanks—I’m saving that and using your note as the next instruction."
+    : "Thanks—I’m saving your grade.");
+  try {
+    const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/feedback"))
+      .setMethod(HttpRequestMethod.Post)
+      .setBody(JSON.stringify({
+        player: prompt.playerName,
+        requestId: prompt.requestId,
+        grade,
+        feedback,
+        context: liveWorldSnapshot(player),
+      }))
+      .addHeader("Content-Type", "application/json");
+    if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+    const response = await http.request(request);
+    if (response.status < 200 || response.status >= 300) throw new Error(`brain returned HTTP ${response.status}`);
+    const result = JSON.parse(response.body || "{}");
+    system.run(() => {
+      if (pendingFeedback.get(prompt.playerId) !== prompt) return;
+      const current = playerById(prompt.playerId);
+      if (!current) return;
+      const message = typeof result.message === "string" ? result.message : undefined;
+      const followUp = result.followUp && typeof result.followUp === "object"
+        ? result.followUp : result.refinement;
+      if (result.needsFeedback && !feedback) {
+        prompt.submitting = false;
+        prompt.fallbackOffered = true;
+        speak(current, `${message || "Tell me one thing I should change."} Reply with ‘grade ${grade}:’ followed by what I should do next.`);
+        return;
+      }
+      completeFeedbackPrompt(prompt);
+      if (feedback) {
+        if (followUp && typeof followUp === "object") applyResponse(current.id, followUp, feedback);
+      }
+    });
+  } catch {
+    system.run(() => {
+      if (pendingFeedback.get(prompt.playerId) !== prompt) return;
+      prompt.submitting = false;
+      const current = playerById(prompt.playerId);
+      if (current) speak(current, "I couldn’t save that grade just yet. Try the grade message again in a moment.");
+      feedbackChatFallback(prompt);
+    });
+  }
+}
+
+async function showFeedbackForm(prompt, busyRetries = 0) {
+  if (pendingFeedback.get(prompt.playerId) !== prompt) return;
+  const player = playerById(prompt.playerId);
+  if (!player) return;
+  try {
+    const response = await new ModalFormData()
+      .title("Grade MC Wizard")
+      .dropdown("How did Wiz do?", [
+        "1 — Not right",
+        "2 — Needs lots of work",
+        "3 — Partly right",
+        "4 — Good",
+        "5 — Great",
+      ], { defaultValueIndex: 2 })
+      .textField("What should Wiz change or do next?", "Optional", { defaultValue: "" })
+      .submitButton("Send to Wiz")
+      .show(player);
+    if (pendingFeedback.get(prompt.playerId) !== prompt) return;
+    if (response.canceled) {
+      if (response.cancelationReason === FormCancelationReason.UserBusy && busyRetries < 3) {
+        system.runTimeout(() => void showFeedbackForm(prompt, busyRetries + 1), 40);
+      } else {
+        feedbackChatFallback(prompt);
+      }
+      return;
+    }
+    const index = Number(response.formValues?.[0]);
+    if (!Number.isInteger(index) || index < 0 || index > 4) {
+      feedbackChatFallback(prompt);
+      return;
+    }
+    const feedback = String(response.formValues?.[1] || "")
+      .replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500);
+    await submitFeedback(prompt, index + 1, feedback);
+  } catch {
+    feedbackChatFallback(prompt);
+  }
+}
+
+function queueFeedback(report) {
+  if (!report?.playerId || typeof report.requestId !== "string"
+    || !/^[a-zA-Z0-9_-]{1,64}$/.test(report.requestId)
+    || pendingQuestions.has(`${report.playerId}:wizard`)
+    || hasNewerAction(report.playerId, report.requestId)
+    || promptedFeedbackRequests.has(report.requestId)) return;
+  promptedFeedbackRequests.add(report.requestId);
+  if (promptedFeedbackRequests.size > 256) {
+    promptedFeedbackRequests.delete(promptedFeedbackRequests.values().next().value);
+  }
+  const prompt = {
+    playerId: report.playerId,
+    playerName: report.playerName,
+    requestId: report.requestId,
+    submitting: false,
+    fallbackOffered: false,
+  };
+  if (pendingFeedback.has(report.playerId)) {
+    const queue = queuedFeedback.get(report.playerId) || [];
+    if (queue.length < 16) {
+      queue.push(prompt);
+      queuedFeedback.set(report.playerId, queue);
+    }
+    return;
+  }
+  pendingFeedback.set(report.playerId, prompt);
+  system.runTimeout(() => void showFeedbackForm(prompt), 20);
+}
+
+function completeFeedbackPrompt(prompt) {
+  if (pendingFeedback.get(prompt.playerId) !== prompt) return;
+  pendingFeedback.delete(prompt.playerId);
+  const queue = queuedFeedback.get(prompt.playerId);
+  const next = queue?.shift();
+  if (!queue?.length) queuedFeedback.delete(prompt.playerId);
+  if (!next) return;
+  pendingFeedback.set(prompt.playerId, next);
+  system.runTimeout(() => void showFeedbackForm(next), 20);
+}
+
+function routeFeedbackMessage(player, message) {
+  const question = message.trim().replace(
+    /^!?(?:mc\s+)?wiz(?:ard)?(?:\s*[:,]\s*|\s+)/i,
+    "",
+  );
+  const grade = parseGradeMessage(question);
+  if (!grade) return false;
+  const prompt = pendingFeedback.get(player.id);
+  if (!prompt) return false;
+  system.run(() => void submitFeedback(prompt, grade.grade, grade.feedback));
+  return true;
 }
 
 function worldSmallTalk(player, question) {
@@ -4836,6 +5010,13 @@ function applyResponse(playerId, payload, question) {
     console.warn(`[MC Wizard] no in-world executor matched action ${action.type || "unknown"}`);
     failPendingAction(player, "no in-world executor matched the selected action");
   }
+  if (!action) {
+    queueFeedback({
+      playerId: player.id,
+      playerName: player.name,
+      requestId: payload.requestId,
+    });
+  }
 }
 
 async function askBackend(playerId, question, mode = "wizard", planningAttempt = 0, expectedToken, goalRetryId) {
@@ -5099,6 +5280,18 @@ function routeAIMessage(player, message) {
 world.beforeEvents.chatSend.subscribe((event) => {
   if (wizardSpeaking) return;
   if (isWizardPlayer(event.sender) || event.sender.name === WIZARD_NAME) return;
+  if (routeFeedbackMessage(event.sender, event.message)) return;
+  if (parseGradeMessage(event.message.replace(
+    /^!?(?:mc\s+)?wiz(?:ard)?(?:\s*[:,]\s*|\s+)/i,
+    "",
+  ))) {
+    const playerId = event.sender.id;
+    system.run(() => {
+      const player = playerById(playerId);
+      if (player) speak(player, "I don’t have a finished request waiting for a grade yet.");
+    });
+    return;
+  }
   if (!routeAIMessage(event.sender, event.message)
     && !routeAddressedMessage(event.sender, event.message)) return;
   engineAddressedMessageCounts.set(
@@ -5126,8 +5319,10 @@ world.afterEvents.playerSpawn.subscribe((event) => {
   }, 20);
 });
 
-world.afterEvents.playerLeave.subscribe(() => {
+world.afterEvents.playerLeave.subscribe((event) => {
   system.run(() => {
+    pendingFeedback.delete(event.playerId);
+    queuedFeedback.delete(event.playerId);
     if (humanPlayers().length) return;
     if (wizardIsValid()) {
       try {
@@ -5157,6 +5352,8 @@ world.afterEvents.playerLeave.subscribe(() => {
       endImmediateAction(report, "failed", "all players left before the action started");
     }
     pendingActionReports.clear();
+    pendingFeedback.clear();
+    queuedFeedback.clear();
   });
 });
 
@@ -5194,6 +5391,7 @@ world.afterEvents.worldLoad.subscribe(() => {
   if (variable("mc_wizard_e2e", false) === true) {
     system.runTimeout(() => startE2E({
       routeAddressedMessage,
+      routeFeedbackMessage,
       engineAddressedMessageCount: (playerId) => engineAddressedMessageCounts.get(playerId) || 0,
       undoLastBuild,
       hasCommittedBuild: (playerId) => lastUndo.has(playerId),

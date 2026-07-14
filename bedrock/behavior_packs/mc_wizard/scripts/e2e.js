@@ -268,6 +268,17 @@ function routeWizardRequest(kid, message, label) {
   return new Promise((resolve, reject) => sendWizardRequest(kid, message, label, resolve, reject));
 }
 
+async function routeFeedbackRequest(kid, message, label) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (await chatCallbacks.routeFeedbackMessage(kid, message)) {
+      report("CHECK", "feedback-chat-transport", `${label}: direct-harness-fallback`);
+      return;
+    }
+    await system.waitTicks(20);
+  }
+  throw new Error(`the shared feedback router rejected the ${label} request`);
+}
+
 async function prepareAcceptanceStation(kid, station) {
   const dimension = kid.dimension;
   dimension.runCommand(
@@ -1281,6 +1292,18 @@ function findCompletedCastle(kid, station, size) {
   return undefined;
 }
 
+function castleFoundationKeys(kid, station, size) {
+  const foundations = new Set();
+  for (let x = station.x - 24; x <= station.x + 24; x += 1) {
+    for (let z = station.z - 24; z <= station.z + 24; z += 1) {
+      if (rectangleIsStructural(kid.dimension, x, station.y, z, size, size)) {
+        foundations.add(`${x},${station.y},${z}`);
+      }
+    }
+  }
+  return foundations;
+}
+
 const LIVE_CASTLE_RAINBOW_BLOCKS = [
   "minecraft:red_concrete",
   "minecraft:orange_concrete",
@@ -2251,6 +2274,81 @@ async function runCastleRefinementAcceptance(kid) {
   }
 }
 
+async function runFeedbackAcceptance(kid) {
+  const fail = (request, detail) => {
+    report("FAIL", "feedback-refinement", `${request}: ${detail}`);
+    try { kid.disconnect(); } catch {}
+  };
+  const station = {
+    x: Math.floor(kid.location.x),
+    y: Math.round(kid.location.y),
+    z: Math.floor(kid.location.z),
+  };
+  let currentRequest = "fixture preparation";
+  let castleOrigin;
+  try {
+    kid.dimension.runCommand(`tickingarea remove ${TICKING_AREA}`);
+    kid.dimension.runCommand(`tickingarea add circle ${station.x} ${station.y} ${station.z} 4 ${TICKING_AREA} true`);
+    if (chatCallbacks.hasCommittedBuild(kid.id) && !chatCallbacks.undoLastBuild(kid)) {
+      throw new Error("could not clear the preceding workshop transaction");
+    }
+    await teleportToStation(kid, station);
+    prepareArbitraryStructureStation(kid, station);
+    await system.waitTicks(20);
+
+    currentRequest = "build a 12x12 castle right here";
+    const beforeCastleCommit = chatCallbacks.buildCommitToken(kid.id);
+    const castleTransport = await routeWizardRequest(
+      kid,
+      `wizard, ${currentRequest}`,
+      "feedback-castle",
+    );
+    await waitFor(
+      () => {
+        if (chatCallbacks.buildCommitToken(kid.id) === beforeCastleCommit) return false;
+        castleOrigin = findCompletedCastle(kid, station, 12);
+        return Boolean(castleOrigin);
+      },
+      TIMEOUT_TICKS * 2,
+      "the initial 12x12 castle",
+    );
+    const bounds = {
+      minX: castleOrigin.x,
+      maxX: castleOrigin.x + 11,
+      minZ: castleOrigin.z,
+      maxZ: castleOrigin.z + 11,
+      y: castleOrigin.y,
+    };
+    const foundationsBefore = castleFoundationKeys(kid, station, 12);
+    const lightsBefore = liveCastleRegressionMetrics(kid, bounds).lights;
+    const beforeFeedbackCommit = chatCallbacks.buildCommitToken(kid.id);
+
+    currentRequest = "grade 2: it is too dark, add more lights";
+    await routeFeedbackRequest(kid, currentRequest, "low-grade-lighting-correction");
+    await waitFor(
+      () => chatCallbacks.buildCommitToken(kid.id) !== beforeFeedbackCommit
+        && liveCastleRegressionMetrics(kid, bounds).lights >= lightsBefore + 8,
+      TIMEOUT_TICKS * 2,
+      "the low-grade feedback to add at least eight lights to the original castle",
+    );
+    const foundationsAfter = castleFoundationKeys(kid, station, 12);
+    const addedFoundations = [...foundationsAfter].filter((key) => !foundationsBefore.has(key));
+    const originalKey = `${castleOrigin.x},${castleOrigin.y},${castleOrigin.z}`;
+    if (!foundationsAfter.has(originalKey) || addedFoundations.length > 0) {
+      throw new Error(`feedback abandoned the original castle; added foundations=${addedFoundations.join("|") || "none"}`);
+    }
+    const lightsAfter = liveCastleRegressionMetrics(kid, bounds).lights;
+    report(
+      "PASS",
+      "feedback-refinement",
+      `build via ${castleTransport}; grade chat refined the same origin ${originalKey}; lights ${lightsBefore}->${lightsAfter}`,
+    );
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    fail(currentRequest, String(error));
+  }
+}
+
 function commonFarmIsWorking(kid, station, spec) {
   const dimension = kid.dimension;
   const origin = machineOrigin(station);
@@ -2911,7 +3009,7 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "mc_wizard_e2e_run is required");
     return;
   }
-  if (scope !== "full" && scope !== "machines" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "farms" && scope !== "kelp") {
+  if (scope !== "full" && scope !== "machines" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp") {
     report("FAIL", "configuration", `unsupported mc_wizard_e2e_scope: ${scope}`);
     return;
   }
@@ -2926,13 +3024,19 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "shared chat router callbacks are required");
     return;
   }
+  if (scope === "feedback" && (typeof callbacks?.routeFeedbackMessage !== "function"
+    || typeof callbacks?.buildCommitToken !== "function")) {
+    report("FAIL", "configuration", "the shared feedback and build-token callbacks are required");
+    return;
+  }
   const startCheck = scope === "machines" ? "machine-action-pipeline"
     : scope === "arbitrary" ? "arbitrary-exact-structure"
       : scope === "portal" ? "portal-travel-pipeline"
         : scope === "travel-rollback" ? "dimension-travel-rollback"
         : scope === "city" ? "city-goal-pipeline"
-      : scope === "child" ? "child-action-pipeline"
+        : scope === "child" ? "child-action-pipeline"
         : scope === "refinement" ? "castle-refinement"
+          : scope === "feedback" ? "feedback-refinement"
           : scope === "farms" ? "common-farm-pipeline"
             : scope === "kelp" ? "kelp-farm-pipeline" : "visible-player-t-flip-flop";
   report("START", startCheck);
@@ -2987,6 +3091,10 @@ export async function startE2E(callbacks) {
     }
     if (scope === "refinement") {
       system.runTimeout(() => void runCastleRefinementAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "feedback") {
+      system.runTimeout(() => void runFeedbackAcceptance(kid), 80);
       return;
     }
     if (scope === "farms") {

@@ -83,7 +83,7 @@ export function createInteractionLog({
     recordAsk({ player, question, mode, requestId: suppliedRequestId, result }) {
       const id = requestId(result?.requestId, player) || requestId(suppliedRequestId, player);
       const goal = goalId(result, player);
-      const label = actionLabel(result?.action, player);
+      const label = privateText(result?.actionLabel, 120, player) || actionLabel(result?.action, player);
       return append({
         timestamp: new Date(now()).toISOString(),
         event: "ask",
@@ -121,6 +121,37 @@ export function createInteractionLog({
         ...(answer && { answer }),
         ...(goal && { goalId: goal }),
         ...(label && { actionLabel: label }),
+      });
+    },
+    recordFeedback({ player, requestId: suppliedRequestId, grade, feedback, result }) {
+      const id = requestId(result?.requestId, player) || requestId(suppliedRequestId, player);
+      const goal = goalId(result, player);
+      const label = privateText(result?.actionLabel, 120, player) || actionLabel(result?.action, player);
+      const note = privateText(feedback || result?.note, 500, player);
+      const responseMode = privateText(result?.responseMode, 64, player);
+      const status = ["completed", "failed"].includes(result?.status) ? result.status
+        : result?.action ? "unknown" : "answered";
+      const detail = privateText(result?.detail, 500, player);
+      const followUpId = requestId(result?.followUp?.requestId, player);
+      const followUpAnswer = privateText(result?.followUp?.answer, 12_000, player);
+      const followUpLabel = actionLabel(result?.followUp?.action, player);
+      const followUp = followUpId || followUpAnswer || followUpLabel ? {
+        ...(followUpId && { requestId: followUpId }),
+        ...(followUpAnswer && { answer: followUpAnswer }),
+        ...(followUpLabel && { actionLabel: followUpLabel }),
+      } : undefined;
+      return append({
+        timestamp: new Date(now()).toISOString(),
+        event: "feedback",
+        playerHash: playerHash(player),
+        requestId: id,
+        grade,
+        ...(note && { note }),
+        ...(goal && { goalId: goal }),
+        ...(responseMode && { responseMode }),
+        ...(label && { actionLabel: label }),
+        outcome: { status, ...(detail && { detail }) },
+        ...(followUp && { followUp }),
       });
     },
   };
