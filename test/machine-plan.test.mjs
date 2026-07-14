@@ -129,6 +129,27 @@ test("builds and lights a complete model-authored Nether portal before verifying
   assert.equal(allowedWizardAction({ type: "build_machine", version: 1, plan: netherPortalPlan }).plan.kind, "nether portal");
 });
 
+test("an unlit portal has no false portal verification and deactivation preserves the frame", () => {
+  const unlit = machineBlueprint({ ...netherPortalPlan, interactions: [] });
+  assert.equal(unlit.interactions.length, 0);
+  assert.equal(unlit.verification.some(({ typeId }) => typeId === "minecraft:portal"), false);
+  assert.match(unlit.success, /intentionally left unlit/i);
+
+  const off = machineBlueprint({
+    ...netherPortalPlan,
+    mode: "modify",
+    placements: [
+      ...netherPortalPlan.placements,
+      place("minecraft:smooth_stone", [1, 1, 2], [0, 1, 2]),
+      { action: "break", target: [1, 1, 2] },
+    ],
+    interactions: [],
+  });
+  assert.equal(off.placements.at(-1).action, "break");
+  assert.match(off.success, /switched off/i);
+  assert.equal(foldPlacementSteps(off.placements).some(({ target }) => target?.join() === "1,1,2"), false);
+});
+
 test("folds ordered placement and break operations into final project state", () => {
   assert.deepEqual(foldPlacementSteps([
     place("minecraft:smooth_stone", [0, 0, 1], [0, -1, 1]),

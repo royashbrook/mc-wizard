@@ -53,6 +53,28 @@ test("castle refinement acceptance is material-agnostic and feature-semantic", (
   assert.doesNotMatch(metrics, /minecraft:(?:stone_bricks|cobblestone|sea_lantern)/);
 });
 
+test("live castle acceptance replays color, compound refinement, and lighting failures", () => {
+  const helpers = sourceBetween(e2eScript, "const LIVE_CASTLE_RAINBOW_BLOCKS", "function castleUpgradeMetrics");
+  const acceptance = sourceBetween(e2eScript, "async function runCastleRefinementAcceptance", "function commonFarmIsWorking");
+  assert.match(acceptance, /build a 17x26 rainbow castle with 3 villagers and a goat in it/);
+  assert.match(acceptance, /the colors are wrong\. fix the colors/);
+  assert.match(acceptance, /castleWallColorSample/);
+  assert.match(acceptance, /but it's not rainbow colored\. make it taller/);
+  assert.match(acceptance, /moat filled with lava, a redstone powered bridge/);
+  assert.match(acceptance, /it's too dark in the castle\. light it up/);
+  assert.match(acceptance, /buildCommitToken/);
+  assert.match(acceptance, /lightsBefore \+ 8/);
+  assert.match(helpers, /LIVE_CASTLE_RAINBOW_BLOCKS\.length/);
+  assert.match(helpers, /metrics\.lavaMoat >= metrics\.perimeter - 2/);
+  assert.match(helpers, /minecraft:lit_redstone_lamp/);
+  assert.match(helpers, /metrics\.redstoneBlocks >= 8/);
+  assert.match(helpers, /metrics\.bridgeLamps >= 8/);
+  assert.match(helpers, /metrics\.upperFloor >= innerArea \* 0\.9/);
+  assert.match(helpers, /metrics\.villagers === 3/);
+  assert.match(helpers, /metrics\.goats === 1/);
+  assert.match(helpers, /metrics\.ironGolems === 4/);
+});
+
 test("balcony acceptance requires new attached projection, rail, and headroom", () => {
   const balcony = sourceBetween(e2eScript, "function castleBalconyProfile", "function removeAcceptanceEntities");
   assert.match(balcony, /!before\.has/);

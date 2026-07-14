@@ -178,7 +178,7 @@
                 "features": {
                   "type": "array",
                   "minItems": 1,
-                  "items": { "type": "string", "enum": ["floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers", "supports", "walkway", "railings", "rooms", "second_floor", "decorations"] }
+                  "items": { "type": "string", "enum": ["floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers", "supports", "walkway", "railings", "rooms", "second_floor", "decorations", "rainbow"] }
                 },
                 "phases": {
                   "type": "array",
@@ -211,7 +211,7 @@
                     "additionalProperties": false,
                     "required": ["typeId", "location"],
                     "properties": {
-                      "typeId": { "type": "string", "const": "minecraft:villager_v2" },
+                      "typeId": { "type": "string", "enum": ["minecraft:villager_v2", "minecraft:goat", "minecraft:iron_golem"] },
                       "location": { "$ref": "#/$defs/vector" }
                     }
                   }

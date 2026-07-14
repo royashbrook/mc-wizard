@@ -87,7 +87,7 @@ test("new primitive structures require solid geometry in every phase and across 
   );
 });
 
-test("validates bounded in-place structure modifications and villagers", () => {
+test("validates bounded in-place structure modifications, inhabitants, and primitive-only lava", () => {
   const modification = validateBuildStructurePlan({
     ...customPlan,
     mode: "modify",
@@ -97,7 +97,8 @@ test("validates bounded in-place structure modifications and villagers", () => {
     ],
     entities: [
       { typeId: "minecraft:villager_v2", location: [4, 1, 4] },
-      { typeId: "minecraft:villager_v2", location: [6, 1, 4] },
+      { typeId: "minecraft:goat", location: [6, 1, 4] },
+      { typeId: "minecraft:iron_golem", location: [8, 1, 4] },
     ],
   });
   assert.equal(modification.mode, "modify");
@@ -105,8 +106,20 @@ test("validates bounded in-place structure modifications and villagers", () => {
   assert.equal(modification.primitives[0].blockId, "minecraft:air");
   assert.deepEqual(modification.entities, [
     { typeId: "minecraft:villager_v2", location: [4, 1, 4] },
-    { typeId: "minecraft:villager_v2", location: [6, 1, 4] },
+    { typeId: "minecraft:goat", location: [6, 1, 4] },
+    { typeId: "minecraft:iron_golem", location: [8, 1, 4] },
   ]);
+
+  const lavaMoat = validateBuildStructurePlan({
+    ...customPlan,
+    mode: "modify",
+    primitives: [{ shape: "line", phase: "foundation", blockId: "minecraft:lava", from: [-1, 0, 0], to: [-1, 0, 7] }],
+  });
+  assert.equal(lavaMoat.primitives[0].blockId, "minecraft:lava");
+  assert.throws(() => validateBuildStructurePlan({
+    ...customPlan,
+    materials: { ...customPlan.materials, primary: "minecraft:lava" },
+  }), /materials\.primary is not allowed/);
 
   const generatedModification = validateBuildStructurePlan({
     ...customPlan,
@@ -262,7 +275,10 @@ test("the structured response lets ordinary buildings omit primitives while vali
     schema.$defs[contains.$ref.split("/").at(-1)].properties.blockId.not.const === "minecraft:air"
   )));
   const pack = readFileSync(new URL("../bedrock/behavior_packs/mc_wizard/scripts/main.js", import.meta.url), "utf8");
-  assert.match(pack, /function structurePlanOperations\(plan\)/);
+  assert.match(pack, /function structurePlanOperations\(plan, previousPlan\)/);
+  assert.match(pack, /sameGeneratedStructureBase\(plan, previousPlan\)/);
+  assert.match(pack, /else if \(detailOnlyPatch\)/);
+  assert.match(pack, /previousPrimitiveKeys\.has\(JSON\.stringify\(operation\)\)/);
   assert.match(pack, /\[\.\.\.structureOperations\(plan\), \.\.\.primitives\]/);
   assert.match(pack, /obsoleteExpansionOperations\(modificationSite\.previous\.plan, plan, previousOperations\)/);
   assert.match(pack, /worldStructureBox\(\s*modificationSite\.previous\.origin,/);

@@ -119,6 +119,8 @@ const TRAVEL_GROUND_HAZARDS = new Set([
 ]);
 const STRUCTURE_ENTITY_ITEMS = Object.freeze({
   "minecraft:villager_v2": "minecraft:villager_spawn_egg",
+  "minecraft:goat": "minecraft:goat_spawn_egg",
+  "minecraft:iron_golem": "minecraft:iron_golem_spawn_egg",
 });
 // Entity spawns can be visible for a tick and then disappear if the target is
 // blocked or the mob walks out. Require five seconds of aggregate presence
@@ -128,7 +130,7 @@ const STRUCTURE_ENTITY_REACH_POLLS = 20;
 const MAX_BULK_STRUCTURE_RETRIES = 8;
 const MAX_STRUCTURE_POST_RETRIES = 120;
 const GENERATED_STRUCTURE_KINDS = new Set([
-  "castle", "house", "tower", "bridge", "barn", "base", "shop", "school", "wall", "monument",
+  "castle", "mansion", "house", "tower", "bridge", "barn", "base", "shop", "school", "wall", "monument",
 ]);
 
 let wizard;
@@ -2244,7 +2246,7 @@ function structureOperations(plan) {
   const operations = [];
   const interiorOpenings = [];
   const add = (phase, blockId, from, to = from) => operations.push(structureBox(phase, blockId, from, to));
-  const houseLike = /house|home|cottage|cabin|barn|hall|workshop/.test(plan.kind);
+  const houseLike = /house|home|cottage|cabin|mansion|barn|hall|workshop/.test(plan.kind);
   const battlements = features.has("battlements") && height >= 3;
   const roofRise = houseLike && features.has("roof") && width >= 3 && height >= 4
     ? Math.min(Math.floor((width - 1) / 2), Math.max(1, Math.floor((height - 2) / 3)))
@@ -2260,6 +2262,22 @@ function structureOperations(plan) {
     if (depth > 2) {
       add("shell", plan.materials.primary, [0, 1, 1], [0, wallTop, depth - 2]);
       if (width > 1) add("shell", plan.materials.primary, [width - 1, 1, 1], [width - 1, wallTop, depth - 2]);
+    }
+  }
+  if (features.has("rainbow") && features.has("walls") && wallTop >= 1) {
+    const colors = [
+      "minecraft:red_concrete", "minecraft:orange_concrete", "minecraft:yellow_concrete",
+      "minecraft:lime_concrete", "minecraft:light_blue_concrete", "minecraft:blue_concrete",
+      "minecraft:purple_concrete",
+    ];
+    for (let y = 1; y <= wallTop; y += 1) {
+      const color = colors[(y - 1) % colors.length];
+      add("shell", color, [0, y, 0], [width - 1, y, 0]);
+      if (depth > 1) add("shell", color, [0, y, depth - 1], [width - 1, y, depth - 1]);
+      if (depth > 2) {
+        add("shell", color, [0, y, 1], [0, y, depth - 2]);
+        if (width > 1) add("shell", color, [width - 1, y, 1], [width - 1, y, depth - 2]);
+      }
     }
   }
   if (wallTop >= 1 && (features.has("supports") || features.has("towers"))) {
@@ -2359,10 +2377,16 @@ function structureOperations(plan) {
     }
   }
   if (height > 1 && features.has("lighting")) {
-    const y = Math.max(1, Math.min(wallTop, height - 2));
-    for (const [x, z] of [[1, 1], [Math.max(1, width - 2), Math.max(1, depth - 2)]]) {
-      add("details", "minecraft:sea_lantern", [Math.min(x, width - 1), y, Math.min(z, depth - 1)]);
+    const step = Math.max(4, Math.ceil(Math.sqrt((width * depth) / 32)));
+    let lights = 0;
+    for (let x = Math.min(2, width - 1); x < Math.max(1, width - 1); x += step) {
+      for (let z = Math.min(2, depth - 1); z < Math.max(1, depth - 1); z += step) {
+        add("details", "minecraft:sea_lantern", [x, 0, z]);
+        if (secondFloorY !== undefined) add("details", "minecraft:sea_lantern", [x, secondFloorY, z]);
+        lights += 1;
+      }
     }
+    if (!lights) add("details", "minecraft:sea_lantern", [0, 0, 0]);
   }
   if (features.has("decorations") && width >= 5 && depth >= 5 && wallTop >= 2) {
     const centerX = Math.floor(width / 2);
@@ -2374,7 +2398,8 @@ function structureOperations(plan) {
       add("details", "minecraft:sea_lantern", [centerX, secondFloorY - 1, centerZ]);
     }
   }
-  for (const { location: [x, y, z] } of plan.entities || []) {
+  for (const { typeId, location: [x, y, z] } of plan.entities || []) {
+    if (typeId === "minecraft:iron_golem") continue;
     if (x < 1 || x >= width - 1 || z < 1 || z >= depth - 1 || y < 1) continue;
     add("details", "minecraft:oak_fence", [x - 1, y, z - 1], [x + 1, y, z - 1]);
     add("details", "minecraft:oak_fence", [x - 1, y, z + 1], [x + 1, y, z + 1]);
@@ -2384,11 +2409,30 @@ function structureOperations(plan) {
   return operations;
 }
 
-function structurePlanOperations(plan) {
+function sameGeneratedStructureBase(plan, previousPlan) {
+  return Boolean(previousPlan)
+    && plan.kind === previousPlan.kind
+    && JSON.stringify(plan.dimensions) === JSON.stringify(previousPlan.dimensions)
+    && JSON.stringify(plan.materials) === JSON.stringify(previousPlan.materials)
+    && JSON.stringify(plan.features) === JSON.stringify(previousPlan.features)
+    && JSON.stringify(plan.entities || []) === JSON.stringify(previousPlan.entities || []);
+}
+
+function structurePlanOperations(plan, previousPlan) {
   const primitives = primitiveStructureOperations(plan);
+  const detailOnlyPatch = primitives.length > 0
+    && plan.mode === "modify"
+    && GENERATED_STRUCTURE_KINDS.has(plan.kind)
+    && sameGeneratedStructureBase(plan, previousPlan);
   let operations;
   if (!primitives.length) operations = structureOperations(plan);
   else if (plan.mode !== "modify" || !GENERATED_STRUCTURE_KINDS.has(plan.kind)) operations = primitives;
+  else if (detailOnlyPatch) {
+    const previousPrimitiveKeys = new Set(
+      primitiveStructureOperations(previousPlan).map((operation) => JSON.stringify(operation)),
+    );
+    operations = primitives.filter((operation) => !previousPrimitiveKeys.has(JSON.stringify(operation)));
+  }
   else {
     const phaseOrder = new Map(["foundation", "shell", "roof", "details"].map((phase, index) => [phase, index]));
     operations = [...structureOperations(plan), ...primitives]
@@ -2398,7 +2442,7 @@ function structurePlanOperations(plan) {
   // Provider geometry may otherwise put a hollow-box floor or room detail in
   // the model's own spawn cell. Clear feet and headroom last, after every
   // authored detail, while preserving the supported floor below.
-  const clearance = (plan.entities || []).map(({ location: [x, y, z] }) => (
+  const clearance = (detailOnlyPatch ? [] : plan.entities || []).map(({ location: [x, y, z] }) => (
     structureBox("details", "minecraft:air", [x, y, z], [x, y + 1, z])
   ));
   return [...operations, ...clearance];
@@ -2950,7 +2994,7 @@ async function buildStructure(player, value) {
       speak(player, "I can’t find that earlier structure in this dimension, so I’m rebuilding the complete improved version nearby instead of stopping.");
     }
   }
-  const operations = structurePlanOperations(plan);
+  const operations = structurePlanOperations(plan, modificationSite?.previous?.plan);
   const previousOperations = modifying
     ? structurePlanOperations(modificationSite.previous.plan)
     : [];
@@ -4252,6 +4296,13 @@ function travelPartyOffsets(count) {
 
 function travelAnchor(player, destination) {
   if (destination.name === "overworld") {
+    if (player.dimension.id === "minecraft:nether") {
+      return {
+        x: Math.floor(player.location.x * 8),
+        y: Math.min(100, Math.max(32, Math.floor(player.location.y))),
+        z: Math.floor(player.location.z * 8),
+      };
+    }
     const spawn = world.getDefaultSpawnLocation();
     return { x: Math.floor(spawn.x), y: Math.floor(spawn.y), z: Math.floor(spawn.z) };
   }

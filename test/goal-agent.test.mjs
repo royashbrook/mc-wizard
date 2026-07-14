@@ -76,6 +76,77 @@ test("routes dimension travel as an immediate typed capability", () => {
   assert.equal(portal.type, "build_machine");
   assert.equal(portal.plan.kind, "nether portal");
   assert.equal(portal.plan.placements.length, 14);
+  assert.equal(portal.plan.interactions.length, 0);
+});
+
+test("portal intent controls ignition and can switch the same frame off", () => {
+  for (const question of [
+    "Build another Nether portal",
+    "Build an unlit Nether portal",
+    "Build a Nether portal but do not light it",
+  ]) {
+    const portal = classifyAction(question);
+    assert.equal(portal.plan.placements.length, 14, question);
+    assert.equal(portal.plan.interactions.length, 0, question);
+  }
+  const lit = classifyAction("Build and light a Nether portal");
+  assert.equal(lit.plan.interactions.length, 1);
+  const history = [{
+    question: "Build and light a Nether portal", answer: "Done.", action: lit, status: "completed",
+    goal: { objective: "Build a portal", successCriteria: "The portal is active", status: "complete" },
+  }];
+  for (const question of [
+    "turn off the portal",
+    "turn it off",
+    "switch off the portal",
+    "switch it off",
+    "make it unlit",
+    "deactivate it",
+    "ok, so you can break one block for me",
+  ]) {
+    const off = classifyAction(question, history);
+    assert.equal(off.plan.mode, "modify", question);
+    assert.equal(off.plan.interactions.length, 0, question);
+    assert.equal(off.plan.placements.length, 16, question);
+    assert.deepEqual(off.plan.placements.at(-1), { action: "break", target: [1, 1, 0] });
+  }
+  const unlitHistory = [{ ...history[0], action: classifyAction("Build an unlit Nether portal") }];
+  for (const question of ["light it", "light the portal", "activate it"]) {
+    const activated = classifyAction(question, unlitHistory);
+    assert.equal(activated.plan.mode, "modify", question);
+    assert.equal(activated.plan.interactions.length, 1, question);
+  }
+  assert.equal(classifyAction("Build and light another Nether portal", unlitHistory).plan.mode, undefined);
+  assert.equal(
+    classifyAction("well we need to get back. so take us back to the overworld").destination,
+    "overworld",
+  );
+});
+
+test("portal pronoun follow-ups stay local instead of waiting for the planner", async () => {
+  const sessions = createMemorySessionStore();
+  let providerCalls = 0;
+  const wizard = createWizard({
+    corpus,
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalls += 1;
+      throw new Error("portal follow-ups must stay local");
+    },
+  });
+  const player = "PortalKid";
+  let result = await wizard.ask({ player, question: "build an unlit Nether portal" });
+  await sessions.updateAction(player, "wizard", { requestId: result.requestId, status: "completed", detail: "built" });
+  result = await wizard.ask({ player, question: "light it" });
+  assert.equal(result.action.plan.mode, "modify");
+  assert.equal(result.action.plan.interactions.length, 1);
+  assert.match(result.answer, /light this same portal frame/i);
+  await sessions.updateAction(player, "wizard", { requestId: result.requestId, status: "completed", detail: "lit" });
+  result = await wizard.ask({ player, question: "switch it off" });
+  assert.equal(result.action.plan.mode, "modify");
+  assert.equal(result.action.plan.interactions.length, 0);
+  assert.equal(providerCalls, 0);
 });
 
 test("compiles a planner-selected portal into the exact safe player-action contract", async () => {
@@ -106,6 +177,122 @@ test("compiles a planner-selected portal into the exact safe player-action contr
     block: [1, 0, 0], faceTarget: [1, 1, 0],
   });
   assert.match(result.goal.successCriteria, /exact request/i);
+});
+
+test("replays the live rainbow castle refinements immediately without a planner wait", async () => {
+  const sessions = createMemorySessionStore();
+  let providerCalls = 0;
+  const wizard = createWizard({
+    corpus,
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalls += 1;
+      throw new Error("ordinary castle changes must stay local");
+    },
+  });
+  const player = "RainbowKid";
+  const initialQuestion = "build a 17x26 rainbow castle with 3 villagers and a goat in it";
+  const initial = await wizard.ask({ player, question: initialQuestion });
+  assert.equal(providerCalls, 0);
+  assert.equal(initial.action.type, "build_structure");
+  assert.deepEqual(initial.action.plan.dimensions, { width: 17, depth: 26, height: 9 });
+  assert.ok(initial.action.plan.features.includes("rainbow"));
+  assert.equal(initial.action.plan.entities.filter(({ typeId }) => typeId === "minecraft:villager_v2").length, 3);
+  assert.equal(initial.action.plan.entities.filter(({ typeId }) => typeId === "minecraft:goat").length, 1);
+  assert.equal(initial.action.plan.entities.every(({ location }) => location[1] === 1), true);
+  await sessions.updateAction(player, "wizard", { requestId: initial.requestId, status: "completed", detail: "built" });
+
+  const afterCompletedReview = classifyAction("the colors are wrong. fix the colors", [
+    {
+      question: initialQuestion,
+      answer: initial.answer,
+      action: initial.action,
+      status: "completed",
+      requestId: initial.requestId,
+      goalId: initial.requestId,
+      goal: { ...initial.goal, status: "active" },
+    },
+    {
+      question: "Review the completed in-world attempt using the fresh live-world snapshot.",
+      answer: "Goal complete.",
+      goalId: initial.requestId,
+      goal: { ...initial.goal, status: "complete" },
+    },
+  ]);
+  assert.equal(afterCompletedReview?.type, "build_structure");
+  assert.equal(afterCompletedReview?.plan.mode, "modify");
+
+  const repaint = await wizard.ask({ player, question: "the colors are wrong. fix the colors" });
+  assert.equal(providerCalls, 0);
+  assert.equal(repaint.action.type, "build_structure");
+  assert.equal(repaint.action.plan.mode, "modify");
+  assert.equal(new Set(repaint.action.plan.primitives
+    .filter(({ phase }) => phase === "shell")
+    .map(({ blockId }) => blockId)).size, 7);
+  await sessions.updateAction(player, "wizard", { requestId: repaint.requestId, status: "completed", detail: "repainted" });
+
+  const correctionQuestion = "but it's not rainbow colored. make it taller, add stairs so we can get to another floor and add some rooms, a moat filled with lava, a redstone powered bridge, and several iron golem guards around.";
+  const correction = await wizard.ask({ player, question: correctionQuestion });
+  assert.equal(providerCalls, 0);
+  assert.equal(correction.action.type, "build_structure");
+  assert.equal(correction.action.plan.mode, "modify");
+  assert.deepEqual(correction.action.plan.dimensions, { width: 17, depth: 26, height: 13 });
+  assert.ok(correction.action.plan.features.includes("rooms"));
+  assert.ok(correction.action.plan.features.includes("second_floor"));
+  assert.ok(correction.action.plan.primitives.some(({ blockId }) => blockId === "minecraft:lava"));
+  assert.ok(correction.action.plan.primitives.some(({ blockId, from, to }) => (
+    blockId === "minecraft:polished_blackstone_bricks" && from[2] === -2 && to[2] === -2
+  )));
+  assert.ok(correction.action.plan.primitives.some(({ blockId }) => blockId === "minecraft:redstone_lamp"));
+  assert.ok(correction.action.plan.primitives.some(({ blockId, from, to }) => (
+    blockId === "minecraft:redstone_lamp" && from[2] === -2 && to[2] === 2
+  )));
+  assert.equal(correction.action.plan.primitives.filter(({ blockId }) => blockId === "minecraft:redstone_block").length, 2);
+  assert.ok(correction.action.plan.primitives
+    .filter(({ blockId }) => blockId === "minecraft:redstone_block")
+    .every(({ from, to }) => from[2] === -2 && to[2] === 2));
+  assert.equal(correction.action.plan.entities.filter(({ typeId }) => typeId === "minecraft:iron_golem").length, 4);
+  assert.notEqual(correction.action.type, "place_blueprint");
+  await sessions.updateAction(player, "wizard", { requestId: correction.requestId, status: "completed", detail: "upgraded" });
+
+  const lighting = await wizard.ask({ player, question: "it's too dark in the castle. light it up" });
+  assert.equal(providerCalls, 0);
+  assert.equal(lighting.action.plan.mode, "modify");
+  assert.ok(lighting.action.plan.primitives.filter(({ blockId }) => blockId === "minecraft:sea_lantern").length >= 8);
+});
+
+test("removes each supported castle inhabitant locally and preserves the others", async () => {
+  const sessions = createMemorySessionStore();
+  let providerCalls = 0;
+  const wizard = createWizard({
+    corpus,
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalls += 1;
+      throw new Error("inhabitant removal must stay local");
+    },
+  });
+  const player = "CastleKeeper";
+  const initial = await wizard.ask({
+    player,
+    question: "build a castle with two villagers, a goat, and two iron golems",
+  });
+  await sessions.updateAction(player, "wizard", { requestId: initial.requestId, status: "completed", detail: "built" });
+
+  const removals = [
+    ["remove the villagers", "minecraft:villager_v2"],
+    ["remove the goat", "minecraft:goat"],
+    ["remove the iron golems", "minecraft:iron_golem"],
+  ];
+  for (const [question, removedType] of removals) {
+    const result = await wizard.ask({ player, question });
+    assert.equal(providerCalls, 0, question);
+    assert.equal(result.action.plan.mode, "modify", question);
+    assert.equal((result.action.plan.entities || []).some(({ typeId }) => typeId === removedType), false, question);
+    await sessions.updateAction(player, "wizard", { requestId: result.requestId, status: "completed", detail: "updated" });
+  }
 });
 
 test("keeps a child-owned city goal and revises that same project", async () => {
@@ -686,7 +873,7 @@ test("open-ended style wording never changes the requested action family", async
     },
   });
   const result = await wizard.ask({ player: "SurpriseKid", question: "Build me a castle, surprise me" });
-  assert.equal(providerCalls, 2);
+  assert.equal(providerCalls, 0);
   assert.equal(result.action.type, "build_structure");
   assert.equal(result.action.plan.kind, "castle");
   assert.doesNotMatch(result.answer, /calculator/i);
@@ -1046,7 +1233,7 @@ test("keeps active-project feedback across chat but starts explicit new builds o
   const newBuild = await wizard.ask({ player: "NewBuildKid", question: "Build a bigger chicken farm" });
   assert.equal(newBuild.action.id, "automated_chicken_farm");
   assert.notEqual(sessions.get("NewBuildKid", "wizard").at(-1).goalId, "castle-goal");
-  assert.equal(providerCalls, 1);
+  assert.equal(providerCalls, 0);
 });
 
 test("a failed build automatically replans the active goal with a bounded retry", async () => {

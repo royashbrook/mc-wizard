@@ -55,7 +55,7 @@ function isTFlipFlopQuestion(question) {
 
 function isCalculatorQuestion(question) {
   return /\b(?:calculator|binary\s+adder|full\s+adder)\b/i.test(question)
-    || /\badd(?:ing)?\b.{0,50}\b(?:numbers?|binary|redstone)\b/i.test(question);
+    || /\badd(?:ing)?\b.{0,50}\b(?:numbers?|binary(?:\s+(?:numbers?|bits?))?)\b/i.test(question);
 }
 
 function requestClauses(question) {
@@ -98,7 +98,8 @@ const STRUCTURE_TYPES = [
   ["village", /\bvillages?\b/i],
   ["settlement", /\bsettlements?\b/i],
   ["castle", /\b(?:castle|fort|fortress)\b/i],
-  ["house", /\b(?:house|home|cabin|cottage|mansion)\b/i],
+  ["mansion", /\bmansions?\b/i],
+  ["house", /\b(?:house|home|cabin|cottage)\b/i],
   ["tower", /\b(?:tower|lighthouse)\b/i],
   ["bridge", /\bbridge\b/i],
   ["barn", /\bbarn\b/i],
@@ -110,7 +111,7 @@ const STRUCTURE_TYPES = [
 ];
 
 const STRUCTURE_DEFAULTS = Object.freeze({
-  castle: [17, 17, 9], house: [9, 9, 5], tower: [9, 9, 16], bridge: [5, 15, 5],
+  castle: [17, 17, 9], mansion: [21, 17, 10], house: [9, 9, 5], tower: [9, 9, 16], bridge: [5, 15, 5],
   barn: [11, 15, 7], base: [13, 13, 6], shop: [9, 11, 5], school: [17, 13, 6],
   wall: [15, 3, 5], monument: [9, 9, 9], structure: [9, 9, 5],
 });
@@ -302,7 +303,7 @@ function isProjectFeedback(question, history = []) {
   const project = latestProjectTurn(history);
   if (!project || isGoalSatisfaction(question, history) || isShortAcknowledgement(question)) return false;
   const text = question.trim();
-  const corrective = /\b(?:refine|fix|repair|redo|rework|revise|research|change|modify|improve|upgrade|expand|enlarge|finish|complete|continue|add|remove|replace|move|light|activate|contain|enclose|make it|make that|make (?:a )?(?:real|better)|too (?:short|small|big|tall|plain)|doesn['’]?t|didn['’]?t|isn['’]?t|not (?:working|right|done|enough)|wrong|broken|escape|popping out|walk out|fell out|leak|bigger|smaller|taller|wider|more rooms?|more towers?)\b/i
+  const corrective = /\b(?:refine|fix|repair|redo|rework|revise|research|change|modify|improve|upgrade|expand|enlarge|finish|complete|continue|add|remove|replace|move|light|activate|deactivate|extinguish|turn off|contain|enclose|make it|make that|make (?:a )?(?:real|better)|too (?:short|small|big|tall|plain)|doesn['’]?t|didn['’]?t|isn['’]?t|not (?:working|right|done|enough)|wrong|broken|escape|popping out|walk out|fell out|leak|bigger|smaller|taller|wider|more rooms?|more towers?)\b/i
     .test(text);
   const refersToProject = /\b(?:it|that|this|those|them|the (?:build|project|farm|machine|portal|city|castle|house|structure|one)|your (?:build|project|farm|machine))\b/i
     .test(text);
@@ -310,12 +311,14 @@ function isProjectFeedback(question, history = []) {
     && !refersToProject;
   if (explicitNewBuild) return false;
   const directCorrectionVerb = /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+|please\s+)?(?:add|remove|replace|fix|repair|redo|rework|revise|change|modify|upgrade|expand|enlarge|finish|complete|continue|make\s+(?:it|this|that)|bigger|smaller|taller|wider)\b/i.test(text);
-  const concreteEditTarget = /\b(?:balcon(?:y|ies)|battlements?|chimneys?|doors?|floors?|flags?|gardens?|grass|lights?|lighting|moats?|parks?|railings?|rooms?|roofs?|stairs?|towers?|turrets?|villagers?|walkways?|walls?|windows?|inside|outside|decorations?|furnishings?)\b/i.test(text)
+  const concreteEditTarget = /\b(?:balcon(?:y|ies)|battlements?|chimneys?|colors?|colou?rs?|doors?|floors?|flags?|gardens?|goats?|grass|iron\s+golems?|lights?|lighting|moats?|parks?|rainbow|railings?|rooms?|roofs?|stairs?|towers?|turrets?|villagers?|walkways?|walls?|windows?|inside|outside|decorations?|furnishings?)\b/i.test(text)
     || /\b(?:bigger|larger|smaller|taller|shorter|wider|narrower|deeper|fancier|prettier|cooler)\b/i.test(text)
     || Boolean(parseRequestedDimensions(text) || requestedMaterialBlock(text));
   const directCorrection = directCorrectionVerb && concreteEditTarget;
+  const reversedCorrection = concreteEditTarget
+    && /\b(?:wrong|off|not\s+right|fix|change|correct|repair)\b/i.test(text);
   const observedFailure = /^(?:the\s+)?(?:chickens?|sheep|animals?|items?|blocks?)\b.{0,100}\b(?:escape|escaped|escaping|leak|leaking|fell|falling|popping|broken|stuck)\b/i.test(text);
-  return corrective && (refersToProject || directCorrection || observedFailure);
+  return corrective && (refersToProject || directCorrection || reversedCorrection || observedFailure);
 }
 
 function defaultGoal(question, action) {
@@ -370,7 +373,7 @@ function requestsStructureEdit(question) {
   const operation = "(?:add|decorate|furnish|upgrade|improve|expand|enlarge|finish|change|replace|rebuild|put|place|remove)";
   const framed = new RegExp(`(?:^|[.!?,]\\s*)(?:(?:hey|wiz|wizard)[,:]?\\s*)?(?:(?:can|could|would|will)\\s+you\\b.{0,100}\\b${operation}\\b|(?:please\\s+)?${operation}\\b)`, "i")
     .test(question);
-  const makeEdit = /\bmake\s+(?:it|this|that|(?:the|my|our)\s+(?:build|structure|one|castle|fort|fortress|house|home|cabin|cottage|mansion|tower|lighthouse|bridge|barn|base|shop|store|market|school|wall|monument|treehouse|dragon|statue|maze))\s+(?:bigger|larger|wider|deeper|taller|higher|fancier|prettier|cooler|\d+|(?:out of|with|using)\b|(?:spruce|birch|oak|wood|stone|cobblestone|deepslate|bricks?|concrete|quartz|glass)\b)/i
+  const makeEdit = /\bmake\s+(?:it|this|that|(?:the|my|our)\s+(?:build|structure|one|castle|fort|fortress|house|home|cabin|cottage|mansion|tower|lighthouse|bridge|barn|base|shop|store|market|school|wall|monument|treehouse|dragon|statue|maze))\s+(?:bigger|larger|wider|deeper|taller|higher|fancier|prettier|cooler|rainbow|colou?rful|\d+|(?:out of|with|using)\b|(?:spruce|birch|oak|wood|stone|cobblestone|deepslate|bricks?|concrete|quartz|glass)\b)/i
     .test(question);
   const giveEdit = /\bgive\s+(?:it|this|that|(?:the|my|our)\s+(?:build|structure|one|castle|fort|fortress|house|home|cabin|cottage|mansion|tower|lighthouse|bridge|barn|base|shop|store|market|school|wall|monument|treehouse|dragon|statue|maze))\s+\S+/i.test(question);
   const framedMakeOrGive = /(?:^|[.!?,]\s*)(?:(?:hey|wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+|please\s+)?(?:make|give)\b/i
@@ -380,14 +383,16 @@ function requestsStructureEdit(question) {
 
 function isStructureModification(question, history = []) {
   const context = priorStructureContext(history);
-  if (!context || (!requestsStructureEdit(question) && !isProjectFeedback(question, history))) return false;
+  const projectFeedback = isProjectFeedback(question, history);
+  if (!context || (!requestsStructureEdit(question) && !projectFeedback)) return false;
   if (/\b(?:another|new|separate|next to it|beside it)\b/i.test(question)
     && /\b(?:build|make|create|construct)\b/i.test(question)) return false;
   const onlyAcknowledgementsSince = history.slice(context.index + 1)
     .every((turn) => isShortAcknowledgement(turn?.question));
   return Boolean(activeWizardGoal(history))
     || onlyAcknowledgementsSince
-    || namesPriorStructure(question, context.action);
+    || namesPriorStructure(question, context.action)
+    || projectFeedback;
 }
 
 function structureKind(question, history = []) {
@@ -517,6 +522,7 @@ function structureFeatures(kind) {
   if (kind === "bridge") return ["floor", "supports", "walkway", "railings", "lighting"];
   if (kind === "wall") return ["walls", "door", "battlements", "lighting"];
   if (kind === "castle") return ["floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers"];
+  if (kind === "mansion") return ["floor", "walls", "door", "windows", "roof", "lighting", "rooms", "second_floor", "decorations"];
   return ["floor", "walls", "door", "windows", "roof", "lighting"];
 }
 
@@ -554,8 +560,17 @@ function resizeStructureEntities(entities, previousDimensions, dimensions) {
   return (entities || []).map((entity) => ({ ...entity, location: resize(entity.location) }));
 }
 
+function removedStructureEntityTypes(question) {
+  return [
+    ["minecraft:villager_v2", "villagers?"],
+    ["minecraft:goat", "goats?"],
+    ["minecraft:iron_golem", "iron\\s+golems?"],
+  ].filter(([, noun]) => new RegExp(`\\b(?:remove|delete|get rid of|without|no)\\b.{0,24}\\b(?:${noun})\\b`, "i").test(question))
+    .map(([typeId]) => typeId);
+}
+
 function removesStructureEntities(question) {
-  return /\b(?:remove|delete|get rid of|without|no)\b.{0,24}\bvillagers?\b/i.test(question);
+  return removedStructureEntityTypes(question).length > 0;
 }
 
 function dragonPrimitives(dimensions) {
@@ -681,19 +696,33 @@ function requestedStructureFeatures(question) {
   if (/\bwalkways?\b/i.test(question)) features.push("walkway");
   if (/\brailings?\b/i.test(question)) features.push("railings");
   if (/\b(?:lighting|lights?|street\s*lights?|lanterns?|torches?)\b/i.test(question)) features.push("lighting");
+  if (/\b(?:rainbow|colou?rful|many colou?rs?)\b/i.test(question)) features.push("rainbow");
+  if (/\bbridge\b/i.test(question)) features.push("walkway");
   return features;
 }
 
-function requestedVillagerCount(question) {
-  if (!/\bvillagers?\b/i.test(question)) return 0;
-  const words = new Map([
-    ["a", 1], ["an", 1], ["one", 1], ["two", 2], ["three", 3], ["four", 4],
-    ["five", 5], ["six", 6], ["seven", 7], ["eight", 8],
-  ]);
-  const match = question.match(/\b(a|an|one|two|three|four|five|six|seven|eight|[1-8])\s+villagers?\b/i);
-  if (!match) return 0;
-  const requested = words.get(match[1].toLowerCase()) || Number(match[1]);
+const ENTITY_COUNT_WORDS = new Map([
+  ["a", 1], ["an", 1], ["one", 1], ["two", 2], ["some", 2], ["three", 3],
+  ["four", 4], ["several", 4], ["five", 5], ["six", 6], ["seven", 7], ["eight", 8],
+]);
+
+function requestedNamedEntityCount(question, noun, fallback = 0) {
+  const named = new RegExp(`\\b(?:${noun})\\b`, "i");
+  if (!named.test(question)) return 0;
+  const match = question.match(new RegExp(`\\b(a|an|one|two|some|three|four|several|five|six|seven|eight|[1-8])\\s+(?:${noun})\\b`, "i"));
+  if (!match) return fallback;
+  const requested = ENTITY_COUNT_WORDS.get(match[1].toLowerCase()) || Number(match[1]);
   return Math.min(8, Math.max(1, requested));
+}
+
+const requestedVillagerCount = (question) => requestedNamedEntityCount(question, "villagers?", 0);
+
+function requestedStructureEntityCounts(question, vagueVillagers = 1) {
+  return [
+    ["minecraft:villager_v2", requestedNamedEntityCount(question, "villagers?", vagueVillagers)],
+    ["minecraft:goat", requestedNamedEntityCount(question, "goats?", 1)],
+    ["minecraft:iron_golem", requestedNamedEntityCount(question, "iron\\s+golems?", 2)],
+  ].filter(([, count]) => count > 0);
 }
 
 const mentionsVillagers = (question) => /\bvillagers?\b/i.test(question);
@@ -713,12 +742,16 @@ function structurePlanSatisfiesRequest(plan, question) {
   const features = new Set(plan.features || []);
   if (!requestedStructureFeatures(question).every((feature) => features.has(feature))) return false;
 
+  const plannedEntityCounts = (plan.entities || []).reduce((counts, { typeId }) => (
+    counts.set(typeId, (counts.get(typeId) || 0) + 1)
+  ), new Map());
+  const removedTypes = new Set(removedStructureEntityTypes(question));
+  for (const [typeId, count] of requestedStructureEntityCounts(question)) {
+    if ((plannedEntityCounts.get(typeId) || 0) !== (removedTypes.has(typeId) ? 0 : count)) return false;
+  }
   const villagerCount = requestedVillagerCount(question);
-  const plannedVillagers = (plan.entities || [])
-    .filter(({ typeId }) => typeId === "minecraft:villager_v2").length;
-  if (villagerCount && plannedVillagers !== villagerCount) return false;
   if (!villagerCount && mentionsVillagers(question) && !removesStructureEntities(question)
-    && plannedVillagers < 1) return false;
+    && (plannedEntityCounts.get("minecraft:villager_v2") || 0) < 1) return false;
 
   const requestedMaterial = requestedMaterialBlock(question);
   if (requestedMaterial) {
@@ -733,16 +766,88 @@ function structurePlanSatisfiesRequest(plan, question) {
   return true;
 }
 
+const RAINBOW_BLOCK_IDS = [
+  "minecraft:red_concrete",
+  "minecraft:orange_concrete",
+  "minecraft:yellow_concrete",
+  "minecraft:lime_concrete",
+  "minecraft:light_blue_concrete",
+  "minecraft:blue_concrete",
+  "minecraft:purple_concrete",
+];
+const RAINBOW_BLOCK_ID_SET = new Set(RAINBOW_BLOCK_IDS);
+
+function requestsRainbowColorCorrection(question) {
+  return /\b(?:fix|change|correct|redo|repair)\b.{0,48}\b(?:the\s+)?colou?rs?\b/i.test(question)
+    || /\bcolou?rs?\b.{0,48}\b(?:wrong|off|not\s+right|fix|change|correct)\b/i.test(question)
+    || /\b(?:not|isn['’]?t|doesn['’]?t\s+look)\b.{0,24}\brainbow\b/i.test(question);
+}
+
+function rainbowWallPrimitives(kind, dimensions, features, offset = 1) {
+  const { width, depth, height } = dimensions;
+  const featureSet = new Set(features);
+  const houseLike = /house|home|cottage|cabin|mansion|barn|hall|workshop/.test(kind);
+  const battlements = featureSet.has("battlements") && height >= 3;
+  const roofRise = houseLike && featureSet.has("roof") && width >= 3 && height >= 4
+    ? Math.min(Math.floor((width - 1) / 2), Math.max(1, Math.floor((height - 2) / 3)))
+    : 0;
+  const wallTop = Math.max(0, height - 1 - Math.max(roofRise, battlements ? 1 : 0));
+  const primitives = [];
+  for (let y = 1; y <= wallTop; y += 1) {
+    const blockId = RAINBOW_BLOCK_IDS[(y - 1 + offset) % RAINBOW_BLOCK_IDS.length];
+    primitives.push(primitive("shell", blockId, [0, y, 0], [width - 1, y, 0]));
+    if (depth > 1) primitives.push(primitive("shell", blockId, [0, y, depth - 1], [width - 1, y, depth - 1]));
+    if (depth > 2) {
+      primitives.push(primitive("shell", blockId, [0, y, 1], [0, y, depth - 2]));
+      if (width > 1) primitives.push(primitive("shell", blockId, [width - 1, y, 1], [width - 1, y, depth - 2]));
+    }
+  }
+  return primitives;
+}
+
 function requestedDetailPrimitives(question, dimensions, materials) {
   const { width: w, depth: d, height: h } = dimensions;
   const primitives = [];
   if (/\bmoat\b/i.test(question)) {
+    const moatBlock = /\blava\b/i.test(question) ? "minecraft:lava" : "minecraft:blue_concrete";
+    const rimBlock = "minecraft:polished_blackstone_bricks";
     primitives.push(
-      primitive("foundation", "minecraft:blue_concrete", [0, 0, 0], [w - 1, 0, 0]),
-      primitive("foundation", "minecraft:blue_concrete", [0, 0, d - 1], [w - 1, 0, d - 1]),
-      primitive("foundation", "minecraft:blue_concrete", [0, 0, 0], [0, 0, d - 1]),
-      primitive("foundation", "minecraft:blue_concrete", [w - 1, 0, 0], [w - 1, 0, d - 1]),
+      // Keep the moat outside the existing walls. The blackstone outer rim
+      // contains every source block so lava cannot spill into the workshop.
+      primitive("foundation", rimBlock, [-2, 0, -2], [w + 1, 0, -2]),
+      primitive("foundation", rimBlock, [-2, 0, d + 1], [w + 1, 0, d + 1]),
+      primitive("foundation", rimBlock, [-2, 0, -1], [-2, 0, d]),
+      primitive("foundation", rimBlock, [w + 1, 0, -1], [w + 1, 0, d]),
+      primitive("foundation", moatBlock, [-1, 0, -1], [w, 0, -1]),
+      primitive("foundation", moatBlock, [-1, 0, d], [w, 0, d]),
+      primitive("foundation", moatBlock, [-1, 0, 0], [-1, 0, d - 1]),
+      primitive("foundation", moatBlock, [w, 0, 0], [w, 0, d - 1]),
     );
+  }
+  if (/\bredstone[- ]powered\s+bridge\b|\bpowered\s+bridge\b/i.test(question)) {
+    const center = at(w, 0.5);
+    const start = /\bmoat\b/i.test(question) ? -2 : 0;
+    const end = Math.min(d - 1, 2);
+    const left = Math.max(0, center - 1);
+    const right = Math.min(w - 1, center + 1);
+    primitives.push(
+      primitive("foundation", "minecraft:redstone_block", [left, 0, start], [left, 0, end]),
+      primitive("foundation", "minecraft:redstone_block", [right, 0, start], [right, 0, end]),
+      primitive("details", materials.accent, [center, 1, start], [center, 1, end]),
+      primitive("details", "minecraft:redstone_lamp", [left, 1, start], [left, 1, end]),
+      primitive("details", "minecraft:redstone_lamp", [right, 1, start], [right, 1, end]),
+    );
+  }
+  if (/\b(?:too\s+dark|dark\s+inside|light\s+it\s+up|make\s+it\s+brighter|add\s+(?:more\s+)?lights?)\b/i.test(question)) {
+    const step = Math.max(4, Math.ceil(Math.sqrt((w * d) / 48)));
+    // The generated structure already uses a grid beginning at offset 2.
+    // Start this patch at `step` so "light it up" adds new lights instead of
+    // placing sea lanterns onto the same cells and claiming nothing changed.
+    for (let x = Math.min(step, Math.max(1, w - 2)); x < Math.max(1, w - 1); x += step) {
+      for (let z = Math.min(step, Math.max(1, d - 2)); z < Math.max(1, d - 1); z += step) {
+        primitives.push(primitive("details", "minecraft:sea_lantern", [x, 0, z]));
+      }
+    }
   }
   if (/\bbalcony\b/i.test(question)) {
     const y = at(h, 0.5);
@@ -804,21 +909,29 @@ function structureEditGeometrySatisfies(plan, question, previous) {
   if (!previous) return false;
   const explicit = parseRequestedDimensions(question);
   const expectedWidth = explicit?.width
-    ?? Math.min(STRUCTURE_LIMITS.width, previous.dimensions.width + 4);
+    ?? Math.min(STRUCTURE_LIMITS.width, previous.dimensions.width
+      + (/\b(?:bigger|larger|expand|enlarge)\b/i.test(question) ? 4 : 0));
   const expectedDepth = explicit?.depth
-    ?? Math.min(STRUCTURE_LIMITS.depth, previous.dimensions.depth + 4);
+    ?? Math.min(STRUCTURE_LIMITS.depth, previous.dimensions.depth
+      + (/\b(?:bigger|larger|expand|enlarge)\b/i.test(question) ? 4 : 0));
   if (plan.dimensions.width !== expectedWidth || plan.dimensions.depth !== expectedDepth) return false;
-  const blue = (plan.primitives || []).filter(({ blockId, from, to }) => (
-    blockId === "minecraft:blue_concrete" && from[1] === 0 && to[1] === 0
+  const moatBlock = /\blava\b/i.test(question) ? "minecraft:lava" : "minecraft:blue_concrete";
+  const moat = (plan.primitives || []).filter(({ blockId, from, to }) => (
+    blockId === moatBlock && from[1] === 0 && to[1] === 0
   ));
-  const spansX = (entry, z) => entry.from[2] === z && entry.to[2] === z
-    && entry.from[0] === 0 && entry.to[0] === expectedWidth - 1;
-  const spansZ = (entry, x) => entry.from[0] === x && entry.to[0] === x
-    && entry.from[2] === 0 && entry.to[2] === expectedDepth - 1;
-  return blue.some((entry) => spansX(entry, 0))
-    && blue.some((entry) => spansX(entry, expectedDepth - 1))
-    && blue.some((entry) => spansZ(entry, 0))
-    && blue.some((entry) => spansZ(entry, expectedWidth - 1));
+  const spansX = (entry, z, minX, maxX) => entry.from[2] === z && entry.to[2] === z
+    && entry.from[0] === minX && entry.to[0] === maxX;
+  const spansZ = (entry, x, minZ, maxZ) => entry.from[0] === x && entry.to[0] === x
+    && entry.from[2] === minZ && entry.to[2] === maxZ;
+  const contained = (plan.primitives || []).filter(({ blockId }) => blockId === "minecraft:polished_blackstone_bricks");
+  return moat.some((entry) => spansX(entry, -1, -1, expectedWidth))
+    && moat.some((entry) => spansX(entry, expectedDepth, -1, expectedWidth))
+    && moat.some((entry) => spansZ(entry, -1, 0, expectedDepth - 1))
+    && moat.some((entry) => spansZ(entry, expectedWidth, 0, expectedDepth - 1))
+    && contained.some((entry) => spansX(entry, -2, -2, expectedWidth + 1))
+    && contained.some((entry) => spansX(entry, expectedDepth + 1, -2, expectedWidth + 1))
+    && contained.some((entry) => spansZ(entry, -2, -1, expectedDepth))
+    && contained.some((entry) => spansZ(entry, expectedWidth + 1, -1, expectedDepth));
 }
 
 function destructiveCityPatch(plan) {
@@ -897,7 +1010,7 @@ function editNeedsAuthoredPrimitives(question) {
     || parseRequestedDimensions(question)
     || /\b(?:bigger|larger|expand|enlarge)\b/i.test(question)
     || requestedMaterialBlock(question)
-    || /\bvillagers?\b/i.test(question)
+    || /\b(?:villagers?|goats?|iron\s+golems?)\b/i.test(question)
     || requestedDetailPrimitives(question, { width: 1, depth: 1, height: 1 }, {
       primary: "minecraft:stone", accent: "minecraft:stone", roof: "minecraft:stone",
     }).length;
@@ -927,13 +1040,11 @@ function plannedSecondFloorY(kind, dimensions, features) {
     : undefined;
 }
 
-function requestedStructureEntities(question, kind, dimensions, features, vagueDefault = 1) {
-  const count = requestedVillagerCount(question) || (mentionsVillagers(question) ? vagueDefault : 0);
-  if (!count) return [];
+function requestedStructureEntities(question, kind, dimensions, features, vagueDefault = 1, previousEntities = []) {
   const { width, depth, height } = dimensions;
   const secondFloorY = plannedSecondFloorY(kind, dimensions, features);
   const upperY = secondFloorY === undefined
-    ? Math.min(Math.max(1, Math.floor(height / 2) - 1), height - 1)
+    ? Math.min(1, height - 1)
     : Math.min(height - 1, secondFloorY + 1);
   const nearX = width >= 9 ? 3 : Math.min(2, width - 1);
   const farX = Math.max(nearX, width - 1 - nearX);
@@ -949,7 +1060,18 @@ function requestedStructureEntities(question, kind, dimensions, features, vagueD
     [farX, upperY, nearZ],
     [Math.floor((width - 1) / 2), upperY, Math.floor((depth - 1) / 2)],
   ];
-  return spots.slice(0, count).map((location) => ({ typeId: "minecraft:villager_v2", location }));
+  const requested = new Map(requestedStructureEntityCounts(question, vagueDefault));
+  for (const typeId of removedStructureEntityTypes(question)) requested.set(typeId, 0);
+  const priorCounts = previousEntities.reduce((counts, { typeId }) => (
+    counts.set(typeId, (counts.get(typeId) || 0) + 1)
+  ), new Map());
+  for (const [typeId, count] of priorCounts) {
+    if (!requested.has(typeId)) requested.set(typeId, count);
+  }
+  const inhabitants = [...requested].flatMap(([typeId, count]) => (
+    Array.from({ length: count }, () => typeId)
+  )).slice(0, spots.length);
+  return inhabitants.map((typeId, index) => ({ typeId, location: spots[index] }));
 }
 
 function structureAction(question, history = [], { allowModify = true } = {}) {
@@ -968,10 +1090,10 @@ function structureAction(question, history = [], { allowModify = true } = {}) {
     height: explicitDimensions?.height ?? previous?.plan.dimensions?.height ?? defaults[2],
   };
   const bigger = !explicitDimensions && /\b(?:bigger|larger|expand|enlarge)\b/i.test(question);
-  const moatExpansion = !explicitDimensions && modifying && /\bmoat\b/i.test(question) ? 4 : 0;
-  const width = Math.min(STRUCTURE_LIMITS.width, Math.max(1, requested.width + (bigger ? 4 : 0) + moatExpansion));
-  const depth = Math.min(STRUCTURE_LIMITS.depth, Math.max(1, requested.depth + (bigger ? 4 : 0) + moatExpansion));
-  const height = Math.min(STRUCTURE_LIMITS.height, Math.max(1, requested.height + (bigger ? 2 : 0)));
+  const taller = !explicitDimensions && /\b(?:taller|higher|second floor|another floor|upper floor|upstairs)\b/i.test(question);
+  const width = Math.min(STRUCTURE_LIMITS.width, Math.max(1, requested.width + (bigger ? 4 : 0)));
+  const depth = Math.min(STRUCTURE_LIMITS.depth, Math.max(1, requested.depth + (bigger ? 4 : 0)));
+  const height = Math.min(STRUCTURE_LIMITS.height, Math.max(1, requested.height + (bigger ? 2 : 0) + (taller ? 4 : 0)));
   const explicitMaterial = Boolean(requestedMaterialBlock(question));
   const [primary, accent, roof] = materialPalette(question, canonicalKind);
   const templateMaterials = templateKind === "dragon"
@@ -996,33 +1118,50 @@ function structureAction(question, history = [], { allowModify = true } = {}) {
     };
   }
   const dimensions = { width, depth, height };
-  const detailPrimitives = modifying ? requestedDetailPrimitives(question, dimensions, materials) : [];
+  const requestedFeatures = requestedStructureFeatures(question);
+  const rainbowCorrection = modifying && requestsRainbowColorCorrection(question)
+    && (previous?.plan.features?.includes("rainbow")
+      || history.some((turn) => /\brainbow\b/i.test(turn?.question || "")));
+  if (rainbowCorrection) requestedFeatures.push("rainbow");
+  const features = [...new Set([
+    ...(previous?.plan.features || representational.features || structureFeatures(canonicalKind)),
+    ...requestedFeatures,
+  ])];
+  const repaintOffset = 1 + (history.filter((turn) => requestsRainbowColorCorrection(turn?.question || "")).length
+    % RAINBOW_BLOCK_IDS.length);
+  const repaintPrimitives = rainbowCorrection
+    ? rainbowWallPrimitives(kind, dimensions, features, repaintOffset)
+    : [];
+  const detailPrimitives = modifying
+    ? [...requestedDetailPrimitives(question, dimensions, materials), ...repaintPrimitives]
+    : [];
   const resizedPreviousPrimitives = previous?.plan.primitives?.length
     ? resizePrimitives(previous.plan.primitives, previous.plan.dimensions, dimensions)
     : representational.primitives;
-  const priorPrimitives = modifying && explicitMaterial && resizedPreviousPrimitives
+  const recoloredPriorPrimitives = modifying && explicitMaterial && resizedPreviousPrimitives
     ? recolorPrimitives(resizedPreviousPrimitives, materials, { roofOnly: /\broof\b/i.test(question) })
     : resizedPreviousPrimitives;
+  const priorPrimitives = rainbowCorrection
+    ? (recoloredPriorPrimitives || []).filter(({ blockId, phase }) => (
+      phase !== "shell" || !RAINBOW_BLOCK_ID_SET.has(blockId)
+    ))
+    : recoloredPriorPrimitives;
   const modificationPrimitives = modifying
     ? [...(priorPrimitives || []), ...detailPrimitives]
       .sort((a, b) => ["foundation", "shell", "roof", "details"].indexOf(a.phase)
         - ["foundation", "shell", "roof", "details"].indexOf(b.phase))
     : detailPrimitives;
   if (modificationPrimitives.length > STRUCTURE_PRIMITIVE_LIMIT) return null;
-  const requestedFeatures = requestedStructureFeatures(question);
   if (modifying && kind !== "city" && !ordinaryKind && requestedFeatures.length
     && (!previous?.plan.primitives?.length
       || sameStructureValue("primitives", resizedPreviousPrimitives, modificationPrimitives))) return null;
-  const features = [...new Set([
-    ...(previous?.plan.features || representational.features || structureFeatures(canonicalKind)),
-    ...requestedFeatures,
-  ])];
   const requestedEntities = requestedStructureEntities(
     question,
     kind,
     dimensions,
     features,
     previous && !requestsVillagerAddition(question) ? 0 : 1,
+    previous?.plan.entities || [],
   );
   const entities = requestedEntities.length || removesStructureEntities(question)
     ? requestedEntities
@@ -1158,6 +1297,16 @@ function giveItemsAction(question) {
       items: ["sword", "pickaxe", "axe", "shovel", "hoe"].map((tool) => ({ itemId: `minecraft:iron_${tool}`, amount: 1 })),
     };
   }
+  if (/\b(?:nether\s+)?portal\s+(?:item|block|blocl)\b/i.test(clause)) {
+    return allowedWizardAction({
+      type: "give_items",
+      version: 1,
+      items: [
+        { itemId: "minecraft:obsidian", amount: 10 },
+        { itemId: "minecraft:flint_and_steel", amount: 1 },
+      ],
+    });
+  }
   const itemId = LOCAL_GIFT_ITEMS.get(requestedGiftTerms(clause).join(" "));
   if (!itemId) return null;
   return allowedWizardAction({
@@ -1171,7 +1320,7 @@ function dimensionTravelAction(question) {
   if (/\b(?:build|make|create|construct|light|activate)\b.{0,80}\bportal\b/i.test(question)
     && !/\b(?:don't|dont|do\s+not|never)\b.{0,30}\b(?:build|make|create|construct|light|activate)\b/i.test(question)) return null;
   const clause = requestClauses(question).find((candidate) => {
-    const prefix = "(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\\s*)?(?:just\\s+)?";
+    const prefix = "(?:(?:(?:hey|hi|well|so|okay|alright)[, ]+)+)?(?:(?:wiz|wizard)[,:]?\\s*)?(?:just\\s+)?";
     const destination = "(?:nether|(?:the\\s+)?end|end\\s+dimension|overworld|normal\\s+world)";
     return new RegExp(`^${prefix}(?:(?:can|could|would|will)\\s+you\\s+)?(?:please\\s+)?(?:take|teleport|transport|send|move|bring)\\s+(?:me|us|everyone|all of us|the (?:players?|party))\\s+(?:back\\s+)?(?:to|into)\\s+(?:the\\s+)?${destination}\\b`, "i").test(candidate)
       || new RegExp(`^${prefix}(?:can|could|may|should|would)\\s+(?:i|we)\\s+(?:please\\s+)?(?:go|travel)\\s+(?:back\\s+)?(?:to|into)\\s+(?:the\\s+)?${destination}\\b`, "i").test(candidate)
@@ -1186,7 +1335,7 @@ function dimensionTravelAction(question) {
   return destination ? allowedWizardAction({ type: "dimension_travel", version: 1, destination }) : null;
 }
 
-function canonicalNetherPortalAction() {
+function canonicalNetherPortalAction({ lit = false, deactivate = false, modify = false } = {}) {
   const place = (target, support) => ({
     itemId: "minecraft:obsidian", target, support, orientationTarget: null,
   });
@@ -1196,28 +1345,45 @@ function canonicalNetherPortalAction() {
     plan: {
       title: "Nether Portal",
       kind: "nether portal",
+      ...(deactivate || modify ? { mode: "modify" } : {}),
       placements: [
         ...Array.from({ length: 4 }, (_, x) => place([x, 0, 0], x === 0 ? [0, -1, 0] : [x - 1, 0, 0])),
         ...Array.from({ length: 3 }, (_, offset) => place([0, offset + 1, 0], [0, offset, 0])),
         ...Array.from({ length: 3 }, (_, offset) => place([3, offset + 1, 0], [3, offset, 0])),
         ...Array.from({ length: 4 }, (_, x) => place([x, 4, 0], x === 0 ? [0, 3, 0] : [x - 1, 4, 0])),
+        ...(deactivate ? [
+          { itemId: "minecraft:smooth_stone", target: [1, 1, 0], support: [0, 1, 0], orientationTarget: null },
+          { action: "break", target: [1, 1, 0] },
+        ] : []),
       ],
-      interactions: [{
+      interactions: lit ? [{
         action: "use_item_on_block",
         itemId: "minecraft:flint_and_steel",
         block: [1, 0, 0],
         faceTarget: [1, 1, 0],
-      }],
+      }] : [],
     },
   });
 }
 
-function netherPortalAction(question) {
+function netherPortalAction(question, history = []) {
+  const previous = allowedWizardAction(latestActionTurn(history)?.turn?.action);
+  const previousPortal = previous?.type === "build_machine" && /\bnether\s+portal\b/i.test(previous.plan.kind);
+  const deactivate = /\b(?:(?:turn|switch)\s+(?:(?:the\s+)?portal\s+off|off\s+(?:the\s+)?portal)|make\s+(?:the\s+)?portal\s+unlit|(?:deactivate|extinguish|unlight)\b.{0,40}\b(?:the\s+)?portal)\b/i.test(question)
+    || previousPortal && /\b(?:(?:turn|switch)\s+(?:(?:it|that)\s+off|off\s+(?:it|that))|make\s+(?:it|that)\s+unlit|(?:deactivate|extinguish|unlight)\s+(?:it|that))\b/i.test(question)
+    || previousPortal && /\bbreak\s+(?:one|1|a)\s+(?:obsidian\s+)?block\b/i.test(question);
+  if (deactivate && previousPortal) return canonicalNetherPortalAction({ deactivate: true });
+  const build = explicitlyRequestsBuild(question);
+  const activatePrevious = previousPortal && !build
+    && /\b(?:light|activate|ignite)\s+(?:it|that|(?:the\s+)?portal)\b/i.test(question);
+  if (activatePrevious) return canonicalNetherPortalAction({ lit: true, modify: true });
   const portal = /\bnether\b.{0,120}\bportal\b|\bportal\b.{0,120}\bnether\b/i.test(question);
-  const action = explicitlyRequestsBuild(question)
-    || requestClauses(question).some((clause) => /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:light|activate)\b/i.test(clause));
-  const negated = /\b(?:don't|dont|do\s+not|never)\b.{0,30}\b(?:build|make|create|construct|light|activate)\b/i.test(question);
-  return portal && action && !negated ? canonicalNetherPortalAction() : null;
+  const action = build
+    || requestClauses(question).some((clause) => /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:light|activate|ignite)\b/i.test(clause));
+  const buildNegated = /\b(?:don't|dont|do\s+not|never)\b.{0,30}\b(?:build|make|create|construct)\b/i.test(question);
+  const ignitionNegated = /\b(?:unlit|without\s+(?:lighting|light)|(?:don't|dont|do\s+not|never)\s+(?:light|activate))\b/i.test(question);
+  const lit = !ignitionNegated && /\b(?:light|lit|activate|ignite)\b/i.test(question);
+  return portal && action && !buildNegated ? canonicalNetherPortalAction({ lit }) : null;
 }
 
 function isOrdinaryConversation(question) {
@@ -1297,7 +1463,7 @@ export function classifyAction(question, history = []) {
   const dimensionTravel = dimensionTravelAction(question);
   if (dimensionTravel) return dimensionTravel;
   if (refusesBuild) return null;
-  const portal = netherPortalAction(question);
+  const portal = netherPortalAction(question, history);
   if (portal) return portal;
   const pending = isActionConfirmation(question) ? pendingActionTurn(history) : undefined;
   if (pending) {
@@ -1371,8 +1537,12 @@ function isFunctionalBuildRequest(question, history = []) {
     && /\b(?:farm|machine|harvester|generator|elevator|engine|factory|smelter|sorter|door|contraption|circuit|clock|launcher|railway|station|system|device|trap|portal)\b/i.test(question);
 }
 
-function wantsModelAuthoredStructure(action, buildRequest) {
-  return buildRequest && action?.type === "build_structure";
+const CUSTOM_STRUCTURE_DETAIL = /\b(?:armou?ry|ballroom|basement|courtyard|dungeon|garage|great hall|kitchen|library|pool|secret rooms?|swimming pool|throne rooms?)\b/i;
+
+function wantsModelAuthoredStructure(action, buildRequest, question) {
+  return buildRequest && action?.type === "build_structure"
+    && (!Object.hasOwn(STRUCTURE_DEFAULTS, action.plan.kind)
+      || CUSTOM_STRUCTURE_DETAIL.test(question));
 }
 
 const PLANNING_DEFERRED_ANSWER = "I’m keeping this as our active project, but I don’t have a safe executable change yet. Tell me one specific block or behavior to change and I’ll continue from there.";
@@ -1466,13 +1636,24 @@ function localAnswer(question, hits, action) {
   if (action?.type === "build_structure") {
     const { width, depth, height } = action.plan.dimensions;
     if (action.plan.mode === "modify") {
-      const additions = action.plan.features.filter((feature) => ["rooms", "second_floor", "towers", "decorations", "windows", "lighting"].includes(feature))
+      if (requestsRainbowColorCorrection(question)) {
+        return `I’ll repaint this same ${action.plan.kind} now with all seven rainbow colors. I’ll keep its size, location, rooms, and inhabitants exactly where they are.`;
+      }
+      const requestedFeatures = new Set(requestedStructureFeatures(question));
+      const additions = action.plan.features.filter((feature) => requestedFeatures.has(feature)
+        && ["rooms", "second_floor", "towers", "decorations", "windows", "lighting"].includes(feature))
         .map((feature) => feature.replaceAll("_", " "));
       if (/\bchimney\b/i.test(question)) additions.push("a chimney");
       if (/\bbalcony\b/i.test(question)) additions.push("a balcony");
-      if (/\bmoat\b/i.test(question)) additions.push("a blue-lined moat");
-      const villagers = action.plan.entities?.length ? ` and place ${action.plan.entities.length} villagers inside` : "";
-      return `I’ll upgrade the existing ${action.plan.kind} in place—${additions.join(", ") || "the requested details"}${villagers}. I’ll keep its current location instead of starting another one.`;
+      if (/\bmoat\b/i.test(question)) additions.push(/\blava\b/i.test(question) ? "a lava moat" : "a water-colored moat");
+      if (/\bpowered\s+bridge\b/i.test(question)) additions.push("a glowing redstone-powered bridge");
+      const inhabitants = Object.entries((action.plan.entities || []).reduce((counts, { typeId }) => ({
+        ...counts, [typeId]: (counts[typeId] || 0) + 1,
+      }), {})).map(([typeId, count]) => (
+        `${count} ${typeId.replace("minecraft:", "").replace("villager_v2", "villager").replaceAll("_", " ")}${count === 1 ? "" : "s"}`
+      ));
+      const population = inhabitants.length ? ` and keep ${inhabitants.join(", ")}` : "";
+      return `I’ll upgrade the existing ${action.plan.kind} in place—${additions.join(", ") || "the requested details"}${population}. I’ll keep its current location instead of starting another one.`;
     }
     if (action.plan.primitives?.length && !representationalKind(action.plan.kind)) {
       return `I can still make that. I’ll build a complete ${action.plan.kind} as a bold block-sculpture interpretation, exactly ${width} by ${depth} by ${height}, with a real base, main shape, top, and details.`;
@@ -1480,6 +1661,16 @@ function localAnswer(question, hits, action) {
     return `A complete ${width} by ${depth} ${action.plan.kind}, coming up. I’ll finish all ${height} blocks of height and every planned phase—foundation, main shape, top, and details—right here nearby.`;
   }
   if (action?.type === "build_machine") {
+    if (/\bnether\s+portal\b/i.test(action.plan.kind)) {
+      const deactivating = action.plan.mode === "modify"
+        && action.plan.placements.some((placement) => placement.action === "break");
+      const lighting = action.plan.interactions.some(({ itemId }) => itemId === "minecraft:flint_and_steel");
+      if (deactivating) return "I’ll switch off this same portal like a player: place one temporary stone block inside it, then break that stone and leave the obsidian frame ready to relight.";
+      if (lighting && action.plan.mode === "modify") return "I’ll light this same portal frame now with flint and steel.";
+      return lighting
+        ? "I’ll build the complete obsidian frame here, then light it with flint and steel."
+        : "I’ll build the complete obsidian frame here and leave it unlit, ready for you to activate later.";
+    }
     if (action.plan.mode === "modify" && /\bchicken\s+farm\b/i.test(action.plan.kind)
       && /\b(?:contain|escape|walk out|stay in)\b/i.test(question)) {
       return "I’ll close this same chicken farm in place with three-block-high glass walls and a glass roof, while keeping the hopper and collection chest working.";
@@ -2477,7 +2668,7 @@ function plannerRepairDetail(question, action, history = [], rejection) {
       return "The balcony stayed inside the old walls. Return mode modify with a solid supported platform and railings that project 1-4 blocks outside x or z while remaining attached to the existing structure.";
     }
     if (/\bmoat\b/i.test(question)) {
-      return "The moat did not surround the existing project. Expand width and depth by four around the same center, keep the complete structure, and add four separate minecraft:blue_concrete perimeter primitives at y=0 spanning every edge of the new footprint.";
+      return "The moat did not safely surround the existing project. Keep the castle footprint intact; add four source-block lines one block outside every wall and a complete solid outer rim one block beyond them so the moat cannot spill away.";
     }
     if (action.plan.kind !== requestedKind) {
       return `The plan kind was ${action.plan.kind}, but the child requested ${requestedKind}. Replan the requested kind.`;
@@ -2496,7 +2687,10 @@ function plannerRepairDetail(question, action, history = [], rejection) {
 function localStructureFallback(question, history) {
   const commonFarm = commonFarmAction(question);
   if (commonFarm) return allowedWizardAction(commonFarm);
-  if (isProjectFeedback(question, history)) return projectFeedbackFallback(question, history);
+  if (isProjectFeedback(question, history)) {
+    return projectFeedbackFallback(question, history)
+      || (priorStructureAction(history) ? structureAction(question, history) : null);
+  }
   if (isFunctionalBuildRequest(question, history)) return stagedMachineProgressAction(question, history);
   const kind = structureKind(question, history);
   if ((Object.hasOwn(STRUCTURE_DEFAULTS, kind) && kind !== "structure")
@@ -2836,7 +3030,7 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const maxOutputTokens = Math.min(Math.max(Number(configuredTokens) || defaultTokens, 64), tokenLimit);
   const addendum = general ? tuning.generalPromptAddendum : tuning.wizardPromptAddendum;
   const actionRequirement = !general && buildRequest
-    ? `\n\nMC_WIZARD_ACTION_REQUIRED\nThis is an executable build turn. action and goal must both be non-null. Produce the complete allowed action now; prose without that action is an invalid response. Every requested or promised dimension, material, feature, and quantity must be present in the executable action itself. If the child requests a numbered group of villagers, include exactly that many minecraft:villager_v2 entries in plan.entities; mentioning them only in answer or goal is invalid.`
+    ? `\n\nMC_WIZARD_ACTION_REQUIRED\nThis is an executable build turn. action and goal must both be non-null. Produce the complete allowed action now; prose without that action is an invalid response. Every requested or promised dimension, material, feature, and quantity must be present in the executable action itself. If the child requests villagers, goats, or iron golems, include the exact requested counts in plan.entities using minecraft:villager_v2, minecraft:goat, or minecraft:iron_golem; mentioning them only in answer or goal is invalid.`
     : "";
   const reviewRequirement = reviewRequest
     ? `\n\nMC_WIZARD_GOAL_REVIEW\nThis is a semantic review of an already completed executor batch. Use the fresh live-world snapshot and active success criteria. Return either goal.status="complete" with action=null, or goal.status="active" with one corrective action for the same existing project.`
@@ -3040,7 +3234,7 @@ export function createWizard({
       let responseMode = reviewRequest ? "review-deferred"
         : instantAnswer ? "local-instant" : groundedAnswer ? "local-grounded" : action ? "local-skill" : "offline";
       const askModel = !instantAnswer && !groundedAnswer && provider.enabled && tuning.aiEnabled
-        && (reviewRequest || !action || wantsModelAuthoredStructure(action, buildRequest) || projectFeedback);
+        && (reviewRequest || !action || wantsModelAuthoredStructure(action, buildRequest, question));
       if (askModel) {
         const safeFallback = {
           answer: !general && !hits.length && !selectedAction && !buildRequest && !projectFeedback && !reviewRequest

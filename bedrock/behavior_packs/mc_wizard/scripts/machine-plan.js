@@ -340,6 +340,10 @@ export function machineBlueprint(value) {
     min: [0, 1, 2].map((axis) => Math.min(...points.map((point) => point[axis]))),
     max: [0, 1, 2].map((axis) => Math.max(...points.map((point) => point[axis]))),
   };
+  const portal = /\bnether\s+portal\b/i.test(plan.kind);
+  const portalLit = portal && plan.interactions.some(({ itemId }) => itemId === "minecraft:flint_and_steel");
+  const portalDeactivated = portal && plan.mode === "modify"
+    && plan.placements.some((placement) => placement.action === "break");
   return {
     title: plan.title,
     kind: plan.kind,
@@ -353,10 +357,18 @@ export function machineBlueprint(value) {
     interactions,
     verification,
     bounds,
-    success: farmPipeline
+    success: portalDeactivated
+      ? `${plan.title} is switched off. The obsidian frame is intact and ready to relight.`
+      : portalLit
+        ? `${plan.title} is built, lit, and showing active portal blocks.`
+        : portal
+          ? `${plan.title} frame is built and intentionally left unlit.`
+          : farmPipeline
       ? `${plan.title} is built. I sent a real ${farmPipeline.expectedOutput.split(":")[1].replace("_", " ")} item through its collector and found it in the output chest.`
       : `${plan.title} is built. I checked every planned block, direction, and working interaction.`,
-    usage: "Try its control or input while I watch; if one part behaves strangely, tell me what moved and I’ll tune it.",
+    usage: portal
+      ? "Tell me to light it, turn it off, or travel when you are ready."
+      : "Try its control or input while I watch; if one part behaves strangely, tell me what moved and I’ll tune it.",
   };
 }
 

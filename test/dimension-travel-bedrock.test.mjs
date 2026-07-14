@@ -57,6 +57,10 @@ test("dimension travel finds or creates a safe non-stacking arrival site", () =>
   assert.match(executor, /findTravelSite\(targetDimension, anchor, offsets\)\s*\|\| prepareTravelPad/);
   assert.match(executor, /dimension\.setBlockType\(\{ x, y: anchor\.y - 1, z \}, "minecraft:obsidian"\)/);
   assert.match(executor, /dimension\.setBlockType\(\{ x, y, z \}, "minecraft:air"\)/);
+  assert.match(executor, /destination\.name === "overworld"/);
+  assert.match(executor, /player\.dimension\.id === "minecraft:nether"/);
+  assert.match(executor, /Math\.floor\(player\.location\.x \* 8\)/);
+  assert.match(executor, /Math\.floor\(player\.location\.z \* 8\)/);
 });
 
 test("dimension travel uses entity teleportation and never relays a teleport command", () => {
@@ -76,7 +80,7 @@ test("dimension travel reports the observed destination result", () => {
   assert.match(executor, /endImmediateAction\(report, "failed", "requested dimension was not supported"\)/);
 });
 
-test("live acceptance requires a lit portal and the visible Wizard to travel with the child", () => {
+test("live acceptance requires a lit portal and a complete Nether round trip with the visible Wizard", () => {
   const start = e2eScript.indexOf("function findLitNetherPortal");
   const end = e2eScript.indexOf("function isHouseWindow", start);
   const acceptance = e2eScript.slice(start, end);
@@ -86,6 +90,16 @@ test("live acceptance requires a lit portal and the visible Wizard to travel wit
   assert.match(acceptance, /kid\.dimension\.id === "minecraft:nether"/);
   assert.match(acceptance, /player\.name === "MC Wizard"/);
   assert.match(acceptance, /wizardPlayer\?\.dimension\.id === "minecraft:nether"/);
+  assert.match(acceptance, /well we need to get back\. so take us back to the overworld/);
+  assert.match(acceptance, /kid\.dimension\.id === "minecraft:overworld"/);
+  assert.match(acceptance, /wizardPlayer\?\.dimension\.id === "minecraft:overworld"/);
+  assert.match(acceptance, /horizontalReturnDistance > 32/);
+  assert.match(acceptance, /build another nether portal\. we'll call that portal b/);
+  assert.match(acceptance, /second frame stayed unlit/);
+  assert.match(acceptance, /light it/);
+  assert.match(acceptance, /switch it off/);
+  assert.match(acceptance, /findUnlitNetherPortal\(kid, returnStation, firstPortal\)/);
+  assert.match(acceptance, /same frame deactivated and preserved/);
 });
 
 test("rollback fault injection is impossible outside its disposable E2E scope", () => {

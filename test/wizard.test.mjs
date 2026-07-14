@@ -824,7 +824,7 @@ test("plans a bounded two-bit redstone calculator and all 16 sums", () => {
   }
 });
 
-test("falls back to a complete local castle when model planning fails", async () => {
+test("starts a complete local castle without waiting for model planning", async () => {
   let providerCalled = false;
   const castleWizard = createWizard({
     corpus,
@@ -835,8 +835,8 @@ test("falls back to a complete local castle when model planning fails", async ()
     },
   });
   const result = await castleWizard.ask({ player: "Kid", question: "Build me a castle" });
-  assert.equal(providerCalled, true);
-  assert.equal(result.mode, "local-structure-fallback");
+  assert.equal(providerCalled, false);
+  assert.equal(result.mode, "local-skill");
   assert.equal(result.action.type, "build_structure");
   const plan = validateBuildStructurePlan(result.action.plan);
   assert.equal(plan.kind, "castle");
@@ -847,7 +847,7 @@ test("falls back to a complete local castle when model planning fails", async ()
   assert.match(result.answer, /complete 17 by 17 castle/i);
 });
 
-test("lets the model author a recognized structure before using the local fallback", async () => {
+test("uses the immediate deterministic plan for a recognized structure", async () => {
   const providerPlan = {
     ...classifyAction("Build me a castle").plan,
     title: "Moonlit Castle",
@@ -857,21 +857,48 @@ test("lets the model author a recognized structure before using the local fallba
       roof: "minecraft:deepslate_bricks",
     },
   };
+  let providerCalled = false;
   const modelWizard = createWizard({
     corpus: { search: () => [] },
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
-    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
-      answer: "I’ll raise a moonlit castle here, with amethyst tower trim.",
-      action: { type: "build_structure", version: 1, plan: providerPlan },
-    }) } }] }), { status: 200 }),
+    fetchImpl: async () => {
+      providerCalled = true;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "I’ll raise a moonlit castle here, with amethyst tower trim.",
+        action: { type: "build_structure", version: 1, plan: providerPlan },
+      }) } }] }), { status: 200 });
+    },
   });
 
   const result = await modelWizard.ask({ player: "MoonKid", question: "Build me a castle" });
-  assert.equal(result.mode, "chat:model");
-  assert.equal(result.action.plan.title, "Moonlit Castle");
-  assert.equal(result.action.plan.materials.accent, "minecraft:gold_block");
+  assert.equal(providerCalled, false);
+  assert.equal(result.mode, "local-skill");
+  assert.equal(result.action.plan.title, "17x17 castle");
+  assert.equal(result.action.plan.materials.accent, "minecraft:cobblestone");
   assert.match(result.answer, /complete 17 by 17 castle.*coming up/i);
-  assert.doesNotMatch(result.answer, /amethyst tower trim/i);
+});
+
+test("retains model planning for custom details on otherwise recognized structures", async () => {
+  for (const [question, kind] of [
+    ["Build me a mansion with a swimming pool and library", "mansion"],
+    ["Build me a castle with a dungeon and throne room", "castle"],
+  ]) {
+    let providerCalls = 0;
+    const wizard = createWizard({
+      corpus: { search: () => [] },
+      env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+      logger: { warn() {} },
+      fetchImpl: async () => {
+        providerCalls += 1;
+        throw new Error("planner unavailable");
+      },
+    });
+
+    const result = await wizard.ask({ player: `Custom-${kind}`, question });
+    assert.equal(providerCalls, 1, question);
+    assert.equal(result.action.plan.kind, kind, question);
+    assert.equal(result.mode, "local-structure-fallback", question);
+  }
 });
 
 test("replaces every premature provider success phrase while keeping its pending action", async () => {
@@ -903,7 +930,7 @@ test("replaces every premature provider success phrase while keeping its pending
     const result = await modelWizard.ask({ player: `HonestKid-${providerAnswer}`, question });
     assert.deepEqual(result.action, action, providerAnswer);
     assert.equal(result.goal?.status, "active", providerAnswer);
-    assert.equal(result.mode, "chat:model", providerAnswer);
+    assert.equal(result.mode, action.type === "build_structure" ? "local-skill" : "chat:model", providerAnswer);
     assert.notEqual(result.answer, providerAnswer);
     assert.match(result.answer, truthfulAnswer, providerAnswer);
   }
@@ -949,8 +976,8 @@ test("keeps decorated castle villagers in usable rooms on both floors", () => {
   assert.deepEqual(action.plan.entities.map(({ location }) => location), [
     [3, 1, 3],
     [8, 1, 3],
-    [3, 5, 8],
-    [8, 5, 8],
+    [3, 7, 8],
+    [8, 7, 8],
   ]);
   const balcony = classifyAction("add a balcony", [{
     question: "add rooms, towers, second floor, decorations, and four villagers",
@@ -979,7 +1006,7 @@ test("keeps decorated castle villagers in usable rooms on both floors", () => {
   }
 });
 
-test("repairs provider prose that promises villagers missing from the executable plan", async () => {
+test("builds requested castle residents locally without provider repair", async () => {
   const player = "VillagerContractKid";
   const question = "add rooms, towers, second floor, decorations, and four villagers";
   const first = classifyAction("Build me a 12x12 castle");
@@ -1015,8 +1042,7 @@ test("repairs provider prose that promises villagers missing from the executable
   });
 
   const result = await contractWizard.ask({ player, question });
-  assert.equal(requests.length, 2);
-  assert.match(requests[1].messages.at(-1).content, /requested exactly 4 villagers.*contained 0/is);
+  assert.equal(requests.length, 0);
   assert.equal(result.action.plan.entities.length, 4);
   assert.equal(result.action.plan.entities.every(({ typeId }) => typeId === "minecraft:villager_v2"), true);
 });
@@ -1095,8 +1121,12 @@ test("keeps explicit edit dimensions exact and represents common physical additi
   assert.ok(chimney.plan.primitives.some(({ blockId, from, to }) => blockId === "minecraft:oak_log" && to[1] > from[1]));
   assert.ok(balcony.plan.primitives.length >= 6);
   assert.ok(balcony.plan.primitives.some(({ from, to }) => from[2] < 0 || to[2] < 0));
-  assert.deepEqual(moat.plan.dimensions, { width: 13, depth: 13, height: 5 });
+  assert.deepEqual(moat.plan.dimensions, { width: 9, depth: 9, height: 5 });
   assert.equal(moat.plan.primitives.filter(({ blockId }) => blockId === "minecraft:blue_concrete").length, 4);
+  assert.equal(moat.plan.primitives.filter(({ blockId }) => blockId === "minecraft:polished_blackstone_bricks").length, 4);
+  assert.ok(moat.plan.primitives.some(({ blockId, from, to }) => (
+    blockId === "minecraft:blue_concrete" && from[2] === -1 && to[2] === -1
+  )));
 
   const chimneyAndBalcony = classifyAction("add a balcony", [{
     question: "add a chimney",
@@ -1107,7 +1137,7 @@ test("keeps explicit edit dimensions exact and represents common physical additi
   assert.ok(chimneyAndBalcony.plan.primitives.length > chimney.plan.primitives.length);
 });
 
-test("rejects provider refinements that ignore exact requested dimensions", async () => {
+test("keeps exact requested refinement dimensions without a provider round trip", async () => {
   const player = "ExactEditContractKid";
   const first = classifyAction("Build me a 9x9x5 house");
   const history = [{
@@ -1135,12 +1165,12 @@ test("rejects provider refinements that ignore exact requested dimensions", asyn
   });
 
   const result = await wizard.ask({ player, question: "make it bigger, exactly 20x14x8" });
-  assert.equal(calls, 2);
+  assert.equal(calls, 0);
   assert.deepEqual(result.action.plan.dimensions, { width: 20, depth: 14, height: 8 });
   assert.equal(result.action.plan.mode, "modify");
 });
 
-test("rejects a moat drawn over the existing floor instead of around the project", async () => {
+test("adds a contained exterior moat locally without a provider round trip", async () => {
   const player = "MoatContractKid";
   const first = classifyAction("Build me a 16x16 castle");
   const history = [{
@@ -1176,8 +1206,7 @@ test("rejects a moat drawn over the existing floor instead of around the project
   });
 
   const result = await wizard.ask({ player, question: "add a moat" });
-  assert.equal(requests.length, 2);
-  assert.match(requests[1].messages.at(-1).content, /expand width and depth by four/i);
+  assert.equal(requests.length, 0);
   assert.deepEqual(result.action.plan.dimensions, correct.plan.dimensions);
   assert.equal(result.action.plan.primitives.filter(({ blockId }) => blockId === "minecraft:blue_concrete").length, 4);
 });
@@ -1200,7 +1229,7 @@ test("open-ended wording cannot bypass explicit size, material, or population", 
     player: "SurpriseContractKid",
     question: "build me a 20x20 castle out of gold with four villagers; surprise me",
   });
-  assert.equal(calls, 2);
+  assert.equal(calls, 0);
   assert.deepEqual(result.action.plan.dimensions, { width: 20, depth: 20, height: 9 });
   assert.equal(result.action.plan.materials.primary, "minecraft:gold_block");
   assert.equal(result.action.plan.entities.length, 4);
@@ -1392,7 +1421,7 @@ test("routes an unrepresented edit to bounded provider primitives", async () => 
   await editWizard.ask({ player: "FlagKid", question: "Build me a house" });
   const balcony = await editWizard.ask({ player: "FlagKid", question: "add a balcony" });
   const result = await editWizard.ask({ player: "FlagKid", question: "add a flag" });
-  assert.ok(providerCalls >= 3);
+  assert.equal(providerCalls, 1);
   assert.equal(result.action.plan.mode, "modify");
   assert.ok(result.action.plan.primitives.length > balcony.action.plan.primitives.length);
   assert.ok(result.action.plan.primitives.some(({ blockId }) => blockId === "minecraft:gold_block"));
@@ -1594,7 +1623,7 @@ test("rejects every provider world-action promise while allowing explanation ver
   }
 });
 
-test("preserves a requested 7x7 house when model planning is offline", async () => {
+test("preserves a requested 7x7 house without waiting for model planning", async () => {
   let providerCalled = false;
   const fallbackWizard = createWizard({
     corpus,
@@ -1606,8 +1635,8 @@ test("preserves a requested 7x7 house when model planning is offline", async () 
     },
   });
   const result = await fallbackWizard.ask({ player: "Kid", question: "Build me a 7x7 house" });
-  assert.equal(providerCalled, true);
-  assert.equal(result.mode, "local-structure-fallback");
+  assert.equal(providerCalled, false);
+  assert.equal(result.mode, "local-skill");
   assert.equal(result.action.type, "build_structure");
   assert.deepEqual(result.action.plan.dimensions, { width: 7, depth: 7, height: 5 });
   assert.deepEqual(result.action.plan.phases, ["foundation", "shell", "roof", "details"]);
@@ -1916,6 +1945,14 @@ test("constructs exact safe gifts locally and never guesses unsafe item ids", as
     ["Give me 16 torches", { type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 16 }] }],
     ["Give me torches", { type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 1 }] }],
     ["Give me a diamond sword", { type: "give_items", version: 1, items: [{ itemId: "minecraft:diamond_sword", amount: 1 }] }],
+    ["give me a portal blocl", { type: "give_items", version: 1, items: [
+      { itemId: "minecraft:obsidian", amount: 10 },
+      { itemId: "minecraft:flint_and_steel", amount: 1 },
+    ] }],
+    ["give me a nether portal item", { type: "give_items", version: 1, items: [
+      { itemId: "minecraft:obsidian", amount: 10 },
+      { itemId: "minecraft:flint_and_steel", amount: 1 },
+    ] }],
   ];
   const offlineWizard = createWizard({ corpus: { search: () => [] }, env: {} });
   for (const [question, action] of expected) {

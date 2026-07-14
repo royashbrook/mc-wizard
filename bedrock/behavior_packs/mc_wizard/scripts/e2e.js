@@ -523,28 +523,50 @@ async function runArbitraryStructureAcceptance(kid) {
 }
 
 function findLitNetherPortal(kid, station) {
+  return findNetherPortal(kid, station, "minecraft:portal");
+}
+
+function findUnlitNetherPortal(kid, station, excluded) {
+  return findNetherPortal(kid, station, "minecraft:air", excluded);
+}
+
+function netherPortalInteriorMatches(kid, portal, typeId) {
+  if (!portal) return false;
+  const dimension = kid.dimension;
+  const point = (horizontal, vertical) => portal.axis === "x"
+    ? { x: portal.x + horizontal, y: portal.y + vertical, z: portal.z }
+    : { x: portal.x, y: portal.y + vertical, z: portal.z + horizontal };
+  for (let vertical = 1; vertical < 4; vertical += 1) {
+    for (let horizontal = 1; horizontal < 3; horizontal += 1) {
+      if (dimension.getBlock(point(horizontal, vertical))?.typeId !== typeId) return false;
+    }
+  }
+  return true;
+}
+
+function findNetherPortal(kid, station, interiorType, excluded) {
   const dimension = kid.dimension;
   const frameAt = (x, y, z, axis) => {
+    const portal = { x, y, z, axis };
+    if (excluded && x === excluded.x && y === excluded.y && z === excluded.z && axis === excluded.axis) return undefined;
     const point = (horizontal, vertical) => axis === "x"
       ? { x: x + horizontal, y: y + vertical, z }
       : { x, y: y + vertical, z: z + horizontal };
     for (let horizontal = 0; horizontal < 4; horizontal += 1) {
-      if (dimension.getBlock(point(horizontal, 0))?.typeId !== "minecraft:obsidian") return false;
-      if (dimension.getBlock(point(horizontal, 4))?.typeId !== "minecraft:obsidian") return false;
+      if (dimension.getBlock(point(horizontal, 0))?.typeId !== "minecraft:obsidian") return undefined;
+      if (dimension.getBlock(point(horizontal, 4))?.typeId !== "minecraft:obsidian") return undefined;
     }
     for (let vertical = 1; vertical < 4; vertical += 1) {
-      if (dimension.getBlock(point(0, vertical))?.typeId !== "minecraft:obsidian") return false;
-      if (dimension.getBlock(point(3, vertical))?.typeId !== "minecraft:obsidian") return false;
-      for (let horizontal = 1; horizontal < 3; horizontal += 1) {
-        if (dimension.getBlock(point(horizontal, vertical))?.typeId !== "minecraft:portal") return false;
-      }
+      if (dimension.getBlock(point(0, vertical))?.typeId !== "minecraft:obsidian") return undefined;
+      if (dimension.getBlock(point(3, vertical))?.typeId !== "minecraft:obsidian") return undefined;
     }
-    return true;
+    return netherPortalInteriorMatches(kid, portal, interiorType) ? portal : undefined;
   };
   for (let x = station.x - 18; x <= station.x + 18; x += 1) {
     for (let y = station.y; y <= station.y + 8; y += 1) {
       for (let z = station.z - 18; z <= station.z + 18; z += 1) {
-        if (frameAt(x, y, z, "x") || frameAt(x, y, z, "z")) return { x, y, z };
+        const portal = frameAt(x, y, z, "x") || frameAt(x, y, z, "z");
+        if (portal) return portal;
       }
     }
   }
@@ -591,10 +613,73 @@ async function runPortalTravelAcceptance(kid) {
         && wizardPlayer?.dimension.id === "minecraft:nether";
     }, 600, "Test Kid and MC Wizard to arrive together in the Nether");
     report("CHECK", "dimension-travel", `request via ${travelTransport}; child and visible Wizard arrived together`);
+
+    currentRequest = "well we need to get back. so take us back to the overworld";
+    const returnTransport = await routeWizardRequest(
+      kid,
+      "wizard, well we need to get back. so take us back to the overworld",
+      "overworld-party-return",
+    );
+    await waitFor(() => {
+      const wizardPlayer = world.getAllPlayers().find((player) => player.name === "MC Wizard");
+      return kid.dimension.id === "minecraft:overworld"
+        && wizardPlayer?.dimension.id === "minecraft:overworld";
+    }, 600, "Test Kid and MC Wizard to return together to the Overworld");
+    const horizontalReturnDistance = Math.hypot(
+      kid.location.x - station.x,
+      kid.location.z - station.z,
+    );
+    if (horizontalReturnDistance > 32) {
+      throw new Error(`the return landed ${horizontalReturnDistance.toFixed(1)} blocks from the source site`);
+    }
+    report("CHECK", "dimension-return", `request via ${returnTransport}; child and visible Wizard returned near the source site`);
+
+    const firstPortal = findLitNetherPortal(kid, station);
+    const returnStation = {
+      x: Math.floor(kid.location.x),
+      y: Math.round(kid.location.y),
+      z: Math.floor(kid.location.z),
+    };
+    currentRequest = "build another nether portal. we'll call that portal b";
+    const beforeUnlitCommit = chatCallbacks.buildCommitToken(kid.id);
+    const unlitTransport = await routeWizardRequest(
+      kid,
+      "wizard, build another nether portal. we'll call that portal b",
+      "unlit-nether-portal",
+    );
+    let unlitPortal;
+    await waitFor(() => {
+      if (chatCallbacks.buildCommitToken(kid.id) === beforeUnlitCommit) return false;
+      unlitPortal = findUnlitNetherPortal(kid, returnStation, firstPortal);
+      return Boolean(unlitPortal);
+    }, TIMEOUT_TICKS * 2, "a second complete obsidian frame with an empty, unlit interior");
+    report("CHECK", "portal-unlit", `request via ${unlitTransport}; second frame stayed unlit`);
+
+    currentRequest = "light it";
+    const beforeLightCommit = chatCallbacks.buildCommitToken(kid.id);
+    const lightTransport = await routeWizardRequest(kid, "wizard, light it", "light-existing-portal");
+    await waitFor(
+      () => chatCallbacks.buildCommitToken(kid.id) !== beforeLightCommit
+        && netherPortalInteriorMatches(kid, unlitPortal, "minecraft:portal"),
+      TIMEOUT_TICKS * 2,
+      "the same unlit frame to activate",
+    );
+    report("CHECK", "portal-light-followup", `request via ${lightTransport}; same frame activated`);
+
+    currentRequest = "switch it off";
+    const beforeOffCommit = chatCallbacks.buildCommitToken(kid.id);
+    const offTransport = await routeWizardRequest(kid, "wizard, switch it off", "deactivate-existing-portal");
+    await waitFor(
+      () => chatCallbacks.buildCommitToken(kid.id) !== beforeOffCommit
+        && netherPortalInteriorMatches(kid, unlitPortal, "minecraft:air"),
+      TIMEOUT_TICKS * 2,
+      "the same frame to deactivate while keeping its obsidian",
+    );
+    report("CHECK", "portal-off-followup", `request via ${offTransport}; same frame deactivated and preserved`);
     report(
       "PASS",
       check,
-      "the Wizard built and physically lit a complete Nether portal, then moved the child and his visible player body safely into the Nether",
+      "the Wizard completed the Nether round trip, then built a second unlit frame and handled natural light-it/switch-it-off follow-ups on that same portal",
     );
     try { kid.disconnect(); } catch {}
   } catch (error) {
@@ -1194,6 +1279,178 @@ function findCompletedCastle(kid, station, size) {
     }
   }
   return undefined;
+}
+
+const LIVE_CASTLE_RAINBOW_BLOCKS = [
+  "minecraft:red_concrete",
+  "minecraft:orange_concrete",
+  "minecraft:yellow_concrete",
+  "minecraft:lime_concrete",
+  "minecraft:light_blue_concrete",
+  "minecraft:blue_concrete",
+  "minecraft:purple_concrete",
+];
+
+function findRectangularCastleFoundation(kid, station, width, depth) {
+  const dimension = kid.dimension;
+  for (const [spanX, spanZ] of [[width, depth], [depth, width]]) {
+    for (let x = station.x - 18; x + spanX - 1 <= station.x + 18; x += 1) {
+      for (let z = station.z - 18; z + spanZ - 1 <= station.z + 40; z += 1) {
+        const corners = [
+          { x, y: station.y, z },
+          { x: x + spanX - 1, y: station.y, z },
+          { x, y: station.y, z: z + spanZ - 1 },
+          { x: x + spanX - 1, y: station.y, z: z + spanZ - 1 },
+        ];
+        if (!corners.every((location) => blockIsStructural(dimension, location))) continue;
+        if (!rectangleIsStructural(dimension, x, station.y, z, spanX, spanZ)) continue;
+        return {
+          minX: x,
+          maxX: x + spanX - 1,
+          minZ: z,
+          maxZ: z + spanZ - 1,
+          y: station.y,
+        };
+      }
+    }
+  }
+  return undefined;
+}
+
+function countCastleEntities(kid, bounds, typeId) {
+  if (!bounds) return 0;
+  return kid.dimension.getEntities({ type: typeId }).filter(({ location }) => (
+    location.x >= bounds.minX && location.x < bounds.maxX + 1
+    && location.z >= bounds.minZ && location.z < bounds.maxZ + 1
+    && location.y >= bounds.y && location.y < bounds.y + 16
+  )).length;
+}
+
+function rainbowColorsInCastle(kid, bounds) {
+  if (!bounds) return 0;
+  return LIVE_CASTLE_RAINBOW_BLOCKS.filter((typeId) => countBlocks(
+    kid.dimension,
+    { x: bounds.minX, y: bounds.y + 1, z: bounds.minZ },
+    { x: bounds.maxX, y: bounds.y + 12, z: bounds.maxZ },
+    typeId,
+  ) > 0).length;
+}
+
+function castleWallColorSample(kid, bounds) {
+  if (!bounds) return undefined;
+  const width = bounds.maxX - bounds.minX + 1;
+  return kid.dimension.getBlock({
+    x: bounds.minX + Math.min(width - 4, Math.max(3, Math.floor(width / 4))),
+    y: bounds.y + 1,
+    z: bounds.minZ,
+  })?.typeId;
+}
+
+function castlePerimeterLocations(bounds) {
+  const locations = new Map();
+  for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
+    for (const z of [bounds.minZ, bounds.maxZ]) locations.set(`${x},${z}`, { x, y: bounds.y, z });
+  }
+  for (let z = bounds.minZ; z <= bounds.maxZ; z += 1) {
+    for (const x of [bounds.minX, bounds.maxX]) locations.set(`${x},${z}`, { x, y: bounds.y, z });
+  }
+  return [...locations.values()];
+}
+
+function strongestRoomCross(kid, bounds, y) {
+  const dimension = kid.dimension;
+  const centerXs = [Math.floor((bounds.minX + bounds.maxX) / 2), Math.ceil((bounds.minX + bounds.maxX) / 2)];
+  const centerZs = [Math.floor((bounds.minZ + bounds.maxZ) / 2), Math.ceil((bounds.minZ + bounds.maxZ) / 2)];
+  let strongest = 0;
+  for (const centerX of centerXs) {
+    for (const centerZ of centerZs) {
+      let blocks = 0;
+      for (let x = bounds.minX; x <= bounds.maxX; x += 1) {
+        if (blockIsStructural(dimension, { x, y, z: centerZ })) blocks += 1;
+      }
+      for (let z = bounds.minZ; z <= bounds.maxZ; z += 1) {
+        if (blockIsStructural(dimension, { x: centerX, y, z })) blocks += 1;
+      }
+      strongest = Math.max(strongest, blocks);
+    }
+  }
+  return strongest;
+}
+
+function liveCastleRegressionMetrics(kid, bounds) {
+  if (!bounds) return {};
+  const dimension = kid.dimension;
+  const spanX = bounds.maxX - bounds.minX + 1;
+  const spanZ = bounds.maxZ - bounds.minZ + 1;
+  const moatBounds = {
+    minX: bounds.minX - 1,
+    maxX: bounds.maxX + 1,
+    minZ: bounds.minZ - 1,
+    maxZ: bounds.maxZ + 1,
+    y: bounds.y,
+  };
+  const perimeter = castlePerimeterLocations(moatBounds);
+  const perimeterTypes = perimeter.map((location) => dimension.getBlock(location)?.typeId);
+  return {
+    spanX,
+    spanZ,
+    innerFoundation: countStructuralBlocks(
+      dimension,
+      { x: bounds.minX + 1, y: bounds.y, z: bounds.minZ + 1 },
+      { x: bounds.maxX - 1, y: bounds.y, z: bounds.maxZ - 1 },
+    ),
+    lavaMoat: perimeterTypes.filter((typeId) => /minecraft:(?:flowing_)?lava/.test(typeId || "")).length,
+    redstoneBlocks: countBlocks(
+      dimension,
+      { x: bounds.minX - 2, y: bounds.y, z: bounds.minZ - 2 },
+      { x: bounds.maxX + 2, y: bounds.y, z: bounds.maxZ + 2 },
+      "minecraft:redstone_block",
+    ),
+    bridgeLamps: countBlocks(
+      dimension,
+      { x: bounds.minX - 2, y: bounds.y + 1, z: bounds.minZ - 2 },
+      { x: bounds.maxX + 2, y: bounds.y + 2, z: bounds.maxZ + 2 },
+      "minecraft:lit_redstone_lamp",
+    ),
+    upperFloor: countStructuralBlocks(
+      dimension,
+      { x: bounds.minX + 1, y: bounds.y + 6, z: bounds.minZ + 1 },
+      { x: bounds.maxX - 1, y: bounds.y + 6, z: bounds.maxZ - 1 },
+    ),
+    roomCross: strongestRoomCross(kid, bounds, bounds.y + 2),
+    roof: countStructuralBlocks(
+      dimension,
+      { x: bounds.minX, y: bounds.y + 12, z: bounds.minZ },
+      { x: bounds.maxX, y: bounds.y + 12, z: bounds.maxZ },
+    ),
+    rainbowColors: rainbowColorsInCastle(kid, bounds),
+    lights: countBlocks(
+      dimension,
+      { x: bounds.minX, y: bounds.y, z: bounds.minZ },
+      { x: bounds.maxX, y: bounds.y + 12, z: bounds.maxZ },
+      "minecraft:sea_lantern",
+    ),
+    villagers: countCastleEntities(kid, bounds, "minecraft:villager_v2"),
+    goats: countCastleEntities(kid, bounds, "minecraft:goat"),
+    ironGolems: countCastleEntities(kid, bounds, "minecraft:iron_golem"),
+    perimeter: perimeter.length,
+  };
+}
+
+function liveCastleCompoundUpgradeIsComplete(kid, bounds) {
+  const metrics = liveCastleRegressionMetrics(kid, bounds);
+  const innerArea = Math.max(0, (metrics.spanX - 2) * (metrics.spanZ - 2));
+  return metrics.innerFoundation >= innerArea
+    && metrics.lavaMoat >= metrics.perimeter - 2
+    && metrics.redstoneBlocks >= 8
+    && metrics.bridgeLamps >= 8
+    && metrics.upperFloor >= innerArea * 0.9
+    && metrics.roomCross >= metrics.spanX + metrics.spanZ - 10
+    && metrics.roof >= metrics.spanX * metrics.spanZ * 0.9
+    && metrics.rainbowColors === LIVE_CASTLE_RAINBOW_BLOCKS.length
+    && metrics.villagers === 3
+    && metrics.goats === 1
+    && metrics.ironGolems === 4;
 }
 
 function castleUpgradeMetrics(kid, origin) {
@@ -1878,106 +2135,119 @@ async function runCastleRefinementAcceptance(kid) {
   };
   const castleStation = { ...anchor };
   let currentRequest = "fixture preparation";
-  let castleOrigin;
+  let castleBounds;
+  let upgradeBounds;
   try {
     kid.dimension.runCommand(`tickingarea remove ${TICKING_AREA}`);
     kid.dimension.runCommand(`tickingarea add circle ${anchor.x} ${anchor.y} ${anchor.z} 4 ${TICKING_AREA} true`);
     if (chatCallbacks.hasCommittedBuild(kid.id) && !chatCallbacks.undoLastBuild(kid)) {
       throw new Error("could not clear the preceding workshop transaction");
     }
+    await teleportToStation(kid, castleStation);
+    prepareArbitraryStructureStation(kid, castleStation);
     await system.waitTicks(20);
 
-    currentRequest = "build a 12x12 castle right here";
-    await teleportToStation(kid, castleStation);
+    currentRequest = "build a 17x26 rainbow castle with 3 villagers and a goat in it";
+    const beforeCastleCommit = chatCallbacks.buildCommitToken(kid.id);
     const castleTransport = await routeWizardRequest(
       kid,
-      "wizard, build a 12x12 castle right here",
-      "refinement-12x12-castle",
+      "wizard, build a 17x26 rainbow castle with 3 villagers and a goat in it",
+      "live-rainbow-castle",
     );
     await waitFor(
       () => {
-        castleOrigin = findCompletedCastle(kid, castleStation, 12);
-        return Boolean(castleOrigin);
+        if (chatCallbacks.buildCommitToken(kid.id) === beforeCastleCommit) return false;
+        castleBounds = findRectangularCastleFoundation(kid, castleStation, 17, 26);
+        if (!castleBounds) return false;
+        const roof = countStructuralBlocks(
+          kid.dimension,
+          { x: castleBounds.minX, y: castleBounds.y + 8, z: castleBounds.minZ },
+          { x: castleBounds.maxX, y: castleBounds.y + 8, z: castleBounds.maxZ },
+        );
+        return roof >= 17 * 26 * 0.9
+          && rainbowColorsInCastle(kid, castleBounds) === LIVE_CASTLE_RAINBOW_BLOCKS.length
+          && countCastleEntities(kid, castleBounds, "minecraft:villager_v2") === 3
+          && countCastleEntities(kid, castleBounds, "minecraft:goat") === 1;
       },
       TIMEOUT_TICKS * 2,
-      "the initial 12x12 castle at its first site",
+      "the complete 17x26 rainbow castle with exactly three villagers and one goat",
     );
+    report("CHECK", "castle-rainbow", `request via ${castleTransport}; seven colors and requested inhabitants verified`);
     await system.waitTicks(20);
 
-    currentRequest = "add rooms, towers, second floor, decorations, and four villagers";
+    const colorBefore = castleWallColorSample(kid, castleBounds);
+    if (!LIVE_CASTLE_RAINBOW_BLOCKS.includes(colorBefore)) {
+      throw new Error(`the sampled castle wall was not rainbow before correction (${colorBefore})`);
+    }
+    currentRequest = "the colors are wrong. fix the colors";
+    const beforeColorCommit = chatCallbacks.buildCommitToken(kid.id);
+    const colorTransport = await routeWizardRequest(
+      kid,
+      `wizard, ${currentRequest}`,
+      "live-castle-color-correction",
+    );
+    await waitFor(
+      () => chatCallbacks.buildCommitToken(kid.id) !== beforeColorCommit
+        && LIVE_CASTLE_RAINBOW_BLOCKS.includes(castleWallColorSample(kid, castleBounds))
+        && castleWallColorSample(kid, castleBounds) !== colorBefore
+        && rainbowColorsInCastle(kid, castleBounds) === LIVE_CASTLE_RAINBOW_BLOCKS.length,
+      TIMEOUT_TICKS * 2,
+      "the existing castle walls to be repainted in a different complete rainbow",
+    );
+    report(
+      "CHECK",
+      "castle-color-correction",
+      `request via ${colorTransport}; wall changed ${colorBefore}->${castleWallColorSample(kid, castleBounds)}`,
+    );
+
+    currentRequest = "but it's not rainbow colored. make it taller, add stairs so we can get to another floor and add some rooms, a moat filled with lava, a redstone powered bridge, and several iron golem guards around.";
+    const beforeUpgradeCommit = chatCallbacks.buildCommitToken(kid.id);
     const upgradeTransport = await routeWizardRequest(
       kid,
-      "wizard, add rooms, towers, second floor, decorations, and four villagers",
-      "refinement-in-place-castle-upgrade",
+      `wizard, ${currentRequest}`,
+      "live-compound-castle-refinement",
     );
+    upgradeBounds = castleBounds;
     await waitFor(
-      () => castleUpgradeIsComplete(kid, castleOrigin)
-        && rectangleIsStructural(kid.dimension, castleOrigin.x, castleOrigin.y, castleOrigin.z, 12, 12),
+      () => chatCallbacks.buildCommitToken(kid.id) !== beforeUpgradeCommit
+        && liveCastleCompoundUpgradeIsComplete(kid, upgradeBounds),
       TIMEOUT_TICKS * 2,
-      "the rooms, upper floor, corner towers, and villagers at the original castle site",
+      "the taller rainbow castle, rooms, upper floor, lava moat, powered bridge, and four iron golem guards at the original site",
     );
     report(
       "CHECK",
-      "castle-refinement",
-      `requests via ${castleTransport}/${upgradeTransport}; ${castleUpgradeSnapshot(kid, castleOrigin)}`,
+      "castle-compound-refinement",
+      `request via ${upgradeTransport}; ${JSON.stringify(liveCastleRegressionMetrics(kid, upgradeBounds))}`,
     );
 
-    const beforeBalcony = castleStructuralSnapshot(kid, castleOrigin, 12);
-    currentRequest = "add a balcony";
-    const balconyTransport = await routeWizardRequest(kid, "wizard, add a balcony", "refinement-castle-balcony");
-    await waitFor(
-      () => rectangleIsStructural(kid.dimension, castleOrigin.x, castleOrigin.y, castleOrigin.z, 12, 12)
-        && castleUpgradeIsComplete(kid, castleOrigin)
-        && castleSnapshotRetention(kid, beforeBalcony) >= 0.6
-        && castleBalconyProfile(kid, castleOrigin, 12, beforeBalcony).complete,
-      TIMEOUT_TICKS * 2,
-      "the balcony to appear without replacing the castle base",
+    const lightsBefore = liveCastleRegressionMetrics(kid, upgradeBounds).lights;
+    const beforeLightingCommit = chatCallbacks.buildCommitToken(kid.id);
+    currentRequest = "it's too dark in the castle. light it up";
+    const lightingTransport = await routeWizardRequest(
+      kid,
+      `wizard, ${currentRequest}`,
+      "live-castle-lighting-refinement",
     );
-    report(
-      "CHECK",
-      "castle-refinement-balcony",
-      `request via ${balconyTransport}; retained=${castleSnapshotRetention(kid, beforeBalcony).toFixed(2)}; projecting balcony=${JSON.stringify(castleBalconyProfile(kid, castleOrigin, 12, beforeBalcony))}`,
-    );
-
-    currentRequest = "make it bigger";
-    const biggerTransport = await routeWizardRequest(kid, "wizard, make it bigger", "refinement-bigger-castle");
-    let expandedOrigin;
     await waitFor(
       () => {
-        expandedOrigin = findCompletedCastle(kid, castleStation, 16);
-        return expandedOrigin?.x === castleOrigin.x - 2
-          && expandedOrigin?.z === castleOrigin.z - 2
-          && castleShellIsCompleteAtAnyHeight(kid, expandedOrigin, 16);
+        if (chatCallbacks.buildCommitToken(kid.id) === beforeLightingCommit) return false;
+        const metrics = liveCastleRegressionMetrics(kid, upgradeBounds);
+        return liveCastleCompoundUpgradeIsComplete(kid, upgradeBounds)
+          && metrics.lights >= lightsBefore + 8;
       },
       TIMEOUT_TICKS * 2,
-      "the complete 16x16 castle to replace the old shell around the same center",
+      "at least eight additional lights without losing the corrected castle",
     );
-    report("CHECK", "castle-refinement-bigger", `request via ${biggerTransport}; centered 16x16 base verified`);
-
-    currentRequest = "add a moat";
-    const moatTransport = await routeWizardRequest(kid, "wizard, add a moat", "refinement-castle-moat");
-    const moatOrigin = { x: castleOrigin.x - 4, y: castleOrigin.y, z: castleOrigin.z - 4 };
-    await waitFor(
-      () => countBlocks(
-        kid.dimension,
-        moatOrigin,
-        { x: moatOrigin.x + 19, y: moatOrigin.y, z: moatOrigin.z + 19 },
-        "minecraft:blue_concrete",
-      ) >= 76
-        && rectangleIsStructural(kid.dimension, moatOrigin.x, moatOrigin.y, moatOrigin.z, 20, 20)
-        && castleShellIsCompleteAtAnyHeight(kid, moatOrigin, 20),
-      TIMEOUT_TICKS * 2,
-      "the moat and complete expanded castle foundation at the same center",
-    );
-    report("CHECK", "castle-refinement-moat", `request via ${moatTransport}; 20x20 foundation and full moat verified together`);
+    const finalMetrics = liveCastleRegressionMetrics(kid, upgradeBounds);
+    report("CHECK", "castle-lighting-refinement", `request via ${lightingTransport}; lights ${lightsBefore}->${finalMetrics.lights}`);
     report(
       "PASS",
       "castle-refinement",
-      "the exact follow-ups upgraded, decorated, expanded, and moated the same complete castle without replacing it with a detail fragment",
+      "the exact failed live conversation repainted the same castle, applied its compound correction in place, and added more lights without abandoning the project",
     );
     try { kid.disconnect(); } catch {}
   } catch (error) {
-    fail(currentRequest, `${String(error)}; ${castleUpgradeSnapshot(kid, castleOrigin)}`);
+    fail(currentRequest, `${String(error)}; ${JSON.stringify(liveCastleRegressionMetrics(kid, upgradeBounds || castleBounds))}`);
   }
 }
 

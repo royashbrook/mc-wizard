@@ -24,12 +24,18 @@ test("response schema carries the bounded live-regression actions", () => {
     assert.ok(plan.properties.features.items.enum.includes(feature));
   }
   assert.equal(plan.properties.entities.maxItems, 8);
-  assert.equal(plan.properties.entities.items.properties.typeId.const, "minecraft:villager_v2");
+  assert.ok(plan.properties.entities.items.properties.typeId.enum.includes("minecraft:villager_v2"));
 });
 
 for (const fixture of fixtures) {
   test(`replays live chat regression: ${fixture.id}`, () => {
-    const action = classifyAction(fixture.question, fixture.history);
+    const history = fixture.replayHistory
+      ? fixture.history.reduce((turns, turn) => {
+        const action = classifyAction(turn.question, turns);
+        return [...turns, { ...turn, ...(action && { action }), status: action ? "completed" : undefined }];
+      }, [])
+      : fixture.history;
+    const action = classifyAction(fixture.question, history);
     const expected = fixture.expected;
 
     if (expected.type === null) {
@@ -47,6 +53,10 @@ for (const fixture of fixtures) {
 
     if (expected.kind) assert.equal(action.plan?.kind, expected.kind);
     if (expected.mode) assert.equal(action.plan?.mode || "new", expected.mode);
+    if (expected.destination) assert.equal(action.destination, expected.destination);
+    if (expected.placementCount !== undefined) assert.equal(action.plan?.placements?.length, expected.placementCount);
+    if (expected.interactionCount !== undefined) assert.equal(action.plan?.interactions?.length, expected.interactionCount);
+    if (expected.lastPlacementAction) assert.equal(action.plan?.placements?.at(-1)?.action, expected.lastPlacementAction);
     for (const dimension of ["width", "depth", "height"]) {
       if (expected[dimension] !== undefined) {
         assert.equal(action.plan?.dimensions?.[dimension], expected[dimension], dimension);
@@ -59,6 +69,15 @@ for (const fixture of fixtures) {
     if (expected.entity) {
       assert.ok(action.plan?.entities?.some(({ typeId }) => typeId === expected.entity));
       assert.ok(action.plan.entities.length <= 8);
+    }
+    for (const blockId of expected.blockIds || []) {
+      assert.ok(action.plan?.primitives?.some((primitive) => primitive.blockId === blockId), `missing ${blockId}`);
+    }
+    for (const [typeId, count] of Object.entries(expected.entityCounts || {})) {
+      assert.equal(action.plan?.entities?.filter((entity) => entity.typeId === typeId).length, count, typeId);
+    }
+    for (const [itemId, amount] of Object.entries(expected.itemCounts || {})) {
+      assert.equal(action.items?.find((item) => item.itemId === itemId)?.amount, amount, itemId);
     }
   });
 }
