@@ -198,6 +198,26 @@ test("informational feedback regenerates an answer without a world action", asyn
   assert.equal(sessions.get("CatKid", "wizard")[0].responseMode, "chat:helper");
 });
 
+test("actionable feedback after an informational miss performs the requested world action", async () => {
+  const sessions = createMemorySessionStore();
+  const wizard = createWizard({ corpus, sessions, env: {}, logger: quiet });
+  const missed = await wizard.ask({
+    player: "LostKid", question: "How do cats work?", requestId: "missed-request",
+  });
+  assert.equal(missed.action, null);
+
+  const result = await wizard.recordFeedback({
+    player: "LostKid",
+    requestId: missed.requestId,
+    grade: 1,
+    feedback: "build and light a netherportal",
+  });
+  assert.match(result.message, /doing it now/i);
+  assert.equal(result.followUp.action.type, "build_machine");
+  assert.equal(result.followUp.action.plan.kind, "nether portal");
+  assert.equal(result.followUp.action.plan.interactions[0].itemId, "minecraft:flint_and_steel");
+});
+
 test("feedback endpoint is private, exact, terminal, idempotent, and logged without gamertags", async () => {
   const directory = await mkdtemp(join(tmpdir(), "mc-wizard-feedback-server-"));
   const filePath = join(directory, "interactions.jsonl");

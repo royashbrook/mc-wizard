@@ -34,6 +34,10 @@ test("the behavior pack declares and uses the native Bedrock feedback form", () 
   assert.match(pack, /\], \{ defaultValueIndex: 2 \}\)/);
   assert.match(pack, /\.textField\("What should Wiz change or do next\?", "Optional", \{ defaultValue: "" \}\)/);
   assert.match(pack, /\.submitButton\("Send to Wiz"\)/);
+  assert.match(pack, /const FEEDBACK_FORMS_ENABLED = false/);
+  const offer = section("function offerFeedbackPrompt", "function completeFeedbackPrompt");
+  assert.match(offer, /if \(FEEDBACK_FORMS_ENABLED\) void showFeedbackForm\(prompt\)/);
+  assert.match(offer, /else feedbackChatFallback\(prompt\)/);
 });
 
 test("chat fallback accepts only an explicit grade command", () => {

@@ -123,6 +123,14 @@ test("portal intent controls ignition and can switch the same frame off", () => 
   );
 });
 
+test("common fused chat words still route to local travel and portal actions", () => {
+  assert.equal(classifyAction("takeme to the overworld").destination, "overworld");
+  const portal = classifyAction("build and light a netherportal");
+  assert.equal(portal.type, "build_machine");
+  assert.equal(portal.plan.kind, "nether portal");
+  assert.equal(portal.plan.interactions[0].itemId, "minecraft:flint_and_steel");
+});
+
 test("portal pronoun follow-ups stay local instead of waiting for the planner", async () => {
   const sessions = createMemorySessionStore();
   let providerCalls = 0;

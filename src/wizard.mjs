@@ -1454,7 +1454,14 @@ export function instantConversationAnswer(question) {
   return undefined;
 }
 
+function normalizeActionRequest(question) {
+  return String(question)
+    .replace(/\btakeme\b/gi, "take me")
+    .replace(/\bnetherportal\b/gi, "nether portal");
+}
+
 export function classifyAction(question, history = []) {
+  question = normalizeActionRequest(question);
   const refusesBuild = /\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
     || /\bjust\s+(?:explain|describe|tell)\b/i.test(question);
   if (isPotionRainRequest(question)) {
@@ -3158,6 +3165,20 @@ export function createWizard({
 
       const originalQuestion = String(binding.question || "the earlier question")
         .replace(/\s+/g, " ").trim().slice(0, 800);
+      if (classifyAction(note, sessions.get(player, "wizard"))) {
+        const followUp = await api.ask({
+          player,
+          mode: "wizard",
+          question: note,
+          requestId: randomUUID(),
+          context,
+        });
+        return {
+          ...result,
+          message: "Thanks—that correction asks me to act, so I’m doing it now.",
+          followUp,
+        };
+      }
       const instruction = `Answer the player's earlier informational question again in MC Wizard character. Use the feedback as the next instruction. Do not promise or return an in-world action. Earlier question: ${originalQuestion}. Player feedback: ${note}`;
       const refinement = await api.ask({
         player,
@@ -3275,6 +3296,7 @@ export function createWizard({
       goalRetry,
       answerOnly,
     }) {
+      question = normalizeActionRequest(question);
       const requestSequence = typeof sessions.reserve === "function"
         ? sessions.reserve(player, requestMode) : undefined;
       const tuning = { aiEnabled: true, ...await settings() };

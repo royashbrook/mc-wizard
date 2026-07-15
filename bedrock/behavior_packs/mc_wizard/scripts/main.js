@@ -40,6 +40,8 @@ import { splitMessage } from "./chat.js";
 const PREFIX = "§d[MC Wizard]§r ";
 const WIZARD_NAME = "MC Wizard";
 const WIZARD_TAG = "mcwizard:bot";
+// Keep the native form implementation available, but use non-blocking chat grading for now.
+const FEEDBACK_FORMS_ENABLED = false;
 const SAFE_SPACE = new Set([
   "minecraft:air",
   "minecraft:short_grass",
@@ -1063,7 +1065,14 @@ function queueFeedback(report) {
     return;
   }
   pendingFeedback.set(report.playerId, prompt);
-  system.runTimeout(() => void showFeedbackForm(prompt), 20);
+  offerFeedbackPrompt(prompt);
+}
+
+function offerFeedbackPrompt(prompt) {
+  system.runTimeout(() => {
+    if (FEEDBACK_FORMS_ENABLED) void showFeedbackForm(prompt);
+    else feedbackChatFallback(prompt);
+  }, 20);
 }
 
 function completeFeedbackPrompt(prompt) {
@@ -1074,7 +1083,7 @@ function completeFeedbackPrompt(prompt) {
   if (!queue?.length) queuedFeedback.delete(prompt.playerId);
   if (!next) return;
   pendingFeedback.set(prompt.playerId, next);
-  system.runTimeout(() => void showFeedbackForm(next), 20);
+  offerFeedbackPrompt(next);
 }
 
 function routeFeedbackMessage(player, message) {
