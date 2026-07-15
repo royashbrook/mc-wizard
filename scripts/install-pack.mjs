@@ -52,8 +52,8 @@ const e2eScope = (process.env.MC_WIZARD_E2E_SCOPE || "full").trim();
 if (e2eEnabled && !e2eRun) {
   throw new Error("MC_WIZARD_E2E_RUN is required when MC_WIZARD_E2E=1");
 }
-if (!new Set(["full", "machines", "arbitrary", "portal", "travel-rollback", "city", "child", "refinement", "feedback", "farms", "kelp"]).has(e2eScope)) {
-  throw new Error("MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, portal, travel-rollback, city, child, refinement, feedback, farms, or kelp");
+if (!new Set(["full", "machines", "commands", "arbitrary", "portal", "travel-rollback", "city", "child", "refinement", "feedback", "farms", "kelp"]).has(e2eScope)) {
+  throw new Error("MC_WIZARD_E2E_SCOPE must be full, machines, commands, arbitrary, portal, travel-rollback, city, child, refinement, feedback, farms, or kelp");
 }
 const loopbackBrain = parsedUrl.hostname === "localhost"
   || parsedUrl.hostname === "[::1]"

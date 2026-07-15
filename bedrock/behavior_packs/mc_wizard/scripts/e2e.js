@@ -1986,6 +1986,54 @@ async function runMachineAcceptance(kid) {
   }
 }
 
+async function runCommandAcceptance(kid) {
+  const fail = (request, detail) => {
+    report("FAIL", "command-action-pipeline", `${request}: ${detail}`);
+    try { kid.disconnect(); } catch {}
+  };
+  let currentRequest = "fixture preparation";
+  try {
+    await system.waitTicks(20);
+    kid.removeEffect("night_vision");
+    currentRequest = "give me night vision";
+    const effectTransport = await routeWizardRequest(
+      kid,
+      "wizard, give me the nightvision effect",
+      "requester-night-vision",
+    );
+    await waitFor(
+      () => Boolean(kid.getEffect("night_vision")),
+      400,
+      "night vision to be applied to the requesting simulated child",
+    );
+    report("CHECK", "command-night-vision", `request via ${effectTransport}; effect verified on @s`);
+
+    currentRequest = "light up this area";
+    const lightTransport = await routeWizardRequest(kid, "wizard, light up this area", "requester-area-lighting");
+    await waitFor(
+      () => {
+        const center = kid.location;
+        let torches = 0;
+        for (let x = Math.floor(center.x) - 8; x <= Math.floor(center.x) + 8; x += 1) {
+          for (let z = Math.floor(center.z) - 8; z <= Math.floor(center.z) + 8; z += 1) {
+            for (let y = Math.floor(center.y) - 4; y <= Math.floor(center.y) + 6; y += 1) {
+              if (kid.dimension.getBlock({ x, y, z })?.typeId === "minecraft:torch") torches += 1;
+            }
+          }
+        }
+        return torches >= 8;
+      },
+      TIMEOUT_TICKS,
+      "eight nearby torches placed through the visible Wizard player",
+    );
+    report("CHECK", "command-area-lighting", `request via ${lightTransport}; eight physical torches verified`);
+    report("PASS", "command-action-pipeline", "requester-scoped effects and player-placed lighting executed through the live Wizard path");
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    fail(currentRequest, String(error));
+  }
+}
+
 async function runChildRequestAcceptance(kid) {
   const fail = (request, detail) => {
     report("FAIL", "child-action-pipeline", `${request}: ${detail}`);
@@ -3009,7 +3057,7 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "mc_wizard_e2e_run is required");
     return;
   }
-  if (scope !== "full" && scope !== "machines" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp") {
+  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp") {
     report("FAIL", "configuration", `unsupported mc_wizard_e2e_scope: ${scope}`);
     return;
   }
@@ -3030,7 +3078,8 @@ export async function startE2E(callbacks) {
     return;
   }
   const startCheck = scope === "machines" ? "machine-action-pipeline"
-    : scope === "arbitrary" ? "arbitrary-exact-structure"
+    : scope === "commands" ? "command-action-pipeline"
+      : scope === "arbitrary" ? "arbitrary-exact-structure"
       : scope === "portal" ? "portal-travel-pipeline"
         : scope === "travel-rollback" ? "dimension-travel-rollback"
         : scope === "city" ? "city-goal-pipeline"
@@ -3067,6 +3116,10 @@ export async function startE2E(callbacks) {
     kid.addTag(TEST_TAG);
     if (scope === "machines") {
       system.runTimeout(() => void runMachineAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "commands") {
+      system.runTimeout(() => void runCommandAcceptance(kid), 80);
       return;
     }
     if (scope === "arbitrary") {

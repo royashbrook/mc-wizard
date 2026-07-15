@@ -19,8 +19,8 @@ if [ ! -f "$ROOT/package.json" ]; then
   echo "Run from the MC Wizard repository root." >&2
   exit 1
 fi
-if [ "$E2E_SCOPE" != "full" ] && [ "$E2E_SCOPE" != "machines" ] && [ "$E2E_SCOPE" != "arbitrary" ] && [ "$E2E_SCOPE" != "portal" ] && [ "$E2E_SCOPE" != "travel-rollback" ] && [ "$E2E_SCOPE" != "city" ] && [ "$E2E_SCOPE" != "child" ] && [ "$E2E_SCOPE" != "refinement" ] && [ "$E2E_SCOPE" != "feedback" ] && [ "$E2E_SCOPE" != "farms" ] && [ "$E2E_SCOPE" != "kelp" ]; then
-  echo "MC_WIZARD_E2E_SCOPE must be full, machines, arbitrary, portal, travel-rollback, city, child, refinement, feedback, farms, or kelp." >&2
+if [ "$E2E_SCOPE" != "full" ] && [ "$E2E_SCOPE" != "machines" ] && [ "$E2E_SCOPE" != "commands" ] && [ "$E2E_SCOPE" != "arbitrary" ] && [ "$E2E_SCOPE" != "portal" ] && [ "$E2E_SCOPE" != "travel-rollback" ] && [ "$E2E_SCOPE" != "city" ] && [ "$E2E_SCOPE" != "child" ] && [ "$E2E_SCOPE" != "refinement" ] && [ "$E2E_SCOPE" != "feedback" ] && [ "$E2E_SCOPE" != "farms" ] && [ "$E2E_SCOPE" != "kelp" ]; then
+  echo "MC_WIZARD_E2E_SCOPE must be full, machines, commands, arbitrary, portal, travel-rollback, city, child, refinement, feedback, farms, or kelp." >&2
   exit 1
 fi
 if ! command -v container >/dev/null 2>&1; then

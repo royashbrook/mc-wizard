@@ -4847,6 +4847,129 @@ function applyWorldControl(player, action, report = beginImmediateAction(player)
   }
 }
 
+function runCommandsForPlayer(player, commands, report = beginImmediateAction(player)) {
+  const tag = `mcw_cmd_${system.currentTick}_${Math.floor(Math.random() * 1_000_000)}`;
+  let succeeded = 0;
+  try {
+    player.addTag(tag);
+    for (const command of commands) {
+      const result = player.dimension.runCommand(`execute as @a[tag=${tag}] at @s run ${command}`);
+      if ((result?.successCount || 0) > 0) succeeded += 1;
+    }
+    if (succeeded === 0) throw new Error("every command reported zero successful targets");
+    speak(player, succeeded === commands.length
+      ? "Done—the spell worked right here."
+      : `I cast ${succeeded} of ${commands.length} parts. I’m keeping the result instead of doing nothing.`);
+    endImmediateAction(
+      report,
+      succeeded === commands.length ? "completed" : "partial",
+      `executed ${succeeded} of ${commands.length} requester-scoped commands`,
+    );
+  } catch (error) {
+    console.warn(`[MC Wizard] requester command failed: ${error}`);
+    speak(player, "That command spell misfired. I’ve kept the goal active so I can try another route.");
+    endImmediateAction(report, "failed", `requester command failed: ${String(error).slice(0, 160)}`);
+  } finally {
+    try { player.removeTag(tag); } catch {}
+  }
+}
+
+function nearbyTorchTargets(player) {
+  const dimension = player.dimension;
+  const base = {
+    x: Math.floor(player.location.x),
+    y: Math.floor(player.location.y),
+    z: Math.floor(player.location.z),
+  };
+  const offsets = [
+    [6, 0], [-6, 0], [0, 6], [0, -6], [5, 5], [5, -5], [-5, 5], [-5, -5],
+    [3, 0], [-3, 0], [0, 3], [0, -3], [3, 3], [3, -3], [-3, 3], [-3, -3],
+    [7, 3], [7, -3], [-7, 3], [-7, -3], [3, 7], [3, -7], [-3, 7], [-3, -7],
+  ];
+  const targets = [];
+  for (const [dx, dz] of offsets) {
+    const x = base.x + dx;
+    const z = base.z + dz;
+    for (let y = Math.min(318, base.y + 5); y >= Math.max(-63, base.y - 8); y -= 1) {
+      const support = dimension.getBlock({ x, y, z });
+      const target = dimension.getBlock({ x, y: y + 1, z });
+      if (support?.isSolid && target && SAFE_SPACE.has(target.typeId)) {
+        targets.push({ support: support.location, target: target.location });
+        break;
+      }
+    }
+    if (targets.length === 8) break;
+  }
+  return targets;
+}
+
+async function placeAreaTorches(player) {
+  if (buildInProgress || buildPreparing) {
+    queueBuild(player, (current) => void placeAreaTorches(current), 40, "I’ve queued the torches and will light this exact area as soon as my hands are free.");
+    return;
+  }
+  const bot = bringWizardTo(player, true, true);
+  if (!bot) {
+    queueBuild(player, (current) => void placeAreaTorches(current), 40, "I’m gathering torches and will return to light this area automatically.");
+    return;
+  }
+  const targets = nearbyTorchTargets(player);
+  if (!targets.length) {
+    const report = beginImmediateAction(player);
+    speak(player, "I couldn’t find a torch-safe surface here, so I’m keeping this lighting job active for another route.");
+    endImmediateAction(report, "failed", "no nearby torch-safe surfaces were loaded");
+    return;
+  }
+  const token = ++nextBuildToken;
+  activeBuildToken = token;
+  buildInProgress = true;
+  if (!bindBuildAction(player, token)) {
+    clearBuild(token);
+    return;
+  }
+  let placed = 0;
+  try {
+    beginTransaction(player.id, token, player.dimension, targets.map(({ target }) => ({
+      location: target,
+      typeId: "minecraft:torch",
+    })));
+    for (const { support, target } of targets) {
+      let complete = false;
+      for (let attempt = 0; attempt < 160 && !complete; attempt += 1) {
+        const result = placeAsWizard(
+          player.dimension,
+          "minecraft:torch",
+          support,
+          target,
+          "minecraft:torch",
+          undefined,
+          Direction.Up,
+        );
+        complete = result === true;
+        if (!complete) await system.waitTicks(2);
+      }
+      if (complete) placed += 1;
+    }
+    if (placed > 0) commitTransaction(token);
+    else rollbackTransaction(token);
+    speak(player, placed === targets.length
+      ? `Done—I carried and placed ${placed} torches around you.`
+      : `I placed ${placed} torches on the safe surfaces I could reach. The area is brighter, and I didn’t stop at the tricky spots.`);
+    endBuildAction(
+      token,
+      placed === targets.length ? "completed" : placed > 0 ? "partial" : "failed",
+      `physically placed ${placed} of ${targets.length} nearby torches`,
+    );
+  } catch (error) {
+    if (placed > 0) commitTransaction(token);
+    else rollbackTransaction(token);
+    console.warn(`[MC Wizard] area torch placement failed: ${error}`);
+    endBuildAction(token, placed > 0 ? "partial" : "failed", `placed ${placed} torches before interruption`);
+  } finally {
+    clearBuild(token);
+  }
+}
+
 function nearbyGiftAmount(player, itemId) {
   let amount = 0;
   const inventory = player.getComponent("minecraft:inventory")?.container;
@@ -5013,6 +5136,10 @@ function applyResponse(playerId, payload, question) {
     castPotionRain(player, action);
   } else if (action?.type === "give_items" && action.version === 1) {
     void giveItemsAsWizard(player, action.items || []);
+  } else if (action?.type === "run_commands" && action.version === 1) {
+    runCommandsForPlayer(player, action.commands || []);
+  } else if (action?.type === "place_area_torches" && action.version === 1) {
+    void placeAreaTorches(player);
   } else if (action?.type === "command_lesson" && action.version === 1) {
     buildCommandLesson(player, action.id);
   } else if (action) {

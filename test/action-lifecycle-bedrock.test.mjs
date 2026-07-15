@@ -19,7 +19,7 @@ test("Bedrock reports real action outcomes instead of treating a plan as execute
 test("every build executor binds its request to the allocated build token", () => {
   const allocations = [...packScript.matchAll(/const token = \+\+nextBuildToken;/g)].length;
   const bindings = [...packScript.matchAll(/^\s+(?:if \(!)?bindBuildAction\(player, token/gm)].length;
-  assert.equal(allocations, 6);
+  assert.equal(allocations, 7);
   assert.equal(bindings, allocations);
 });
 

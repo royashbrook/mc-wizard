@@ -1335,6 +1335,50 @@ function dimensionTravelAction(question) {
   return destination ? allowedWizardAction({ type: "dimension_travel", version: 1, destination }) : null;
 }
 
+const LOCAL_EFFECTS = [
+  [/\bnight\s*vision\b/i, "night_vision"],
+  [/\bfire\s+resistance\b/i, "fire_resistance"],
+  [/\bwater\s+breathing\b/i, "water_breathing"],
+  [/\bslow\s+falling\b/i, "slow_falling"],
+  [/\bjump\s+boost\b/i, "jump_boost"],
+  [/\bconduit\s+power\b/i, "conduit_power"],
+  [/\bregeneration\b/i, "regeneration"],
+  [/\bresistance\b/i, "resistance"],
+  [/\binvisibility\b/i, "invisibility"],
+  [/\bstrength\b/i, "strength"],
+  [/\bhaste\b/i, "haste"],
+  [/\bspeed\b/i, "speed"],
+];
+
+function commandAction(question) {
+  if (explicitlyRequestsCommand(question)) return null;
+  const clauses = requestClauses(question);
+  const asksForEffect = clauses.some((clause) => {
+    const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "");
+    return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:give|grant|apply|add|cast)\s+(?:me|on me)\b/i.test(direct)
+      || /^(?:i\s+(?:want|need)|let me have)\b/i.test(direct);
+  });
+  if (asksForEffect) {
+    const effect = LOCAL_EFFECTS.find(([pattern]) => pattern.test(question))?.[1];
+    if (effect) return allowedWizardAction({
+      type: "run_commands",
+      version: 1,
+      commands: [`effect @s ${effect} 999999 0 true`],
+    });
+  }
+  return null;
+}
+
+function areaTorchAction(question) {
+  if (explicitlyRequestsCommand(question)) return null;
+  const asksForLight = requestClauses(question).some((clause) => {
+    const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "");
+    return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:light\s+up|brighten|add\s+lights?\s+(?:to|around|here))\b/i.test(direct)
+      || /^(?:it(?:'| i)s|this\s+is)\s+(?:too\s+)?dark\b.{0,50}\b(?:light|bright)/i.test(direct);
+  });
+  return asksForLight ? allowedWizardAction({ type: "place_area_torches", version: 1 }) : null;
+}
+
 function canonicalNetherPortalAction({ lit = false, deactivate = false, modify = false } = {}) {
   const place = (target, support) => ({
     itemId: "minecraft:obsidian", target, support, orientationTarget: null,
@@ -1467,6 +1511,10 @@ export function classifyAction(question, history = []) {
   if (isPotionRainRequest(question)) {
     return allowedWizardAction({ type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 });
   }
+  const torches = areaTorchAction(question);
+  if (torches) return torches;
+  const command = commandAction(question);
+  if (command) return command;
   const dimensionTravel = dimensionTravelAction(question);
   if (dimensionTravel) return dimensionTravel;
   if (refusesBuild) return null;
@@ -1528,7 +1576,7 @@ export function classifyAction(question, history = []) {
 
 function isBuildRequest(question, history = []) {
   if (dimensionTravelAction(question) || worldControlAction(question) || giveItemsAction(question)
-    || isPotionRainRequest(question)) return false;
+    || areaTorchAction(question) || commandAction(question) || isPotionRainRequest(question)) return false;
   return !/\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
     && !/\bjust\s+(?:explain|describe|tell)\b/i.test(question)
     && !isRecipeRequest(question)
@@ -1600,6 +1648,12 @@ function localAnswer(question, hits, action) {
   if (action?.type === "world_control") {
     const changes = [action.time && `make it ${action.time}`, action.weather && `bring ${action.weather}`].filter(Boolean).join(" and ");
     return `One flick of the wand—I’ll ${changes} now.`;
+  }
+  if (action?.type === "run_commands") {
+    return "I know that spell. I’m casting it here now instead of handing you a command to type.";
+  }
+  if (action?.type === "place_area_torches") {
+    return "I’ll light this area with real torches. Watch—I’ll carry them around and place them where they brighten the ground.";
   }
   if (action?.type === "dimension_travel") {
     const destination = action.destination === "the_end" ? "the End" : `the ${action.destination}`;
@@ -2532,6 +2586,16 @@ function providerActionMatchesRequest(action, question, history = [], {
     return (buildRequest || projectFeedback) && actionCompletesBuildRequest(action, question, history);
   }
   const classified = classifyAction(question, history);
+  if (action.type === "run_commands") {
+    if (classified?.type === "run_commands") return JSON.stringify(action) === JSON.stringify(classified);
+    if (buildRequest || projectFeedback || explicitlyRequestsCommand(question) || isOrdinaryConversation(question)) return false;
+    return requestClauses(question).some((clause) => {
+      const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "");
+      const verb = "(?:give|grant|apply|remove|clear|set|change|turn|make|spawn|summon|teleport|tp|move|fill|replace|clone|enchant|effect|execute|run|cast|light|brighten|strike|kill)";
+      return new RegExp(`^(?:(?:can|could|would|will)\\s+you\\s+)?(?:please\\s+)?${verb}\\b`, "i").test(direct)
+        || new RegExp(`^(?:i|we)\\s+(?:want|need)\\s+(?:you\\s+to\\s+)?${verb}\\b`, "i").test(direct);
+    });
+  }
   if (action.type === "give_items") return providerGiftMatchesRequest(action, question);
   if (action.type === "show_recipe") {
     if (!isRecipeRequest(question)) return false;
@@ -2556,7 +2620,7 @@ const GOAL_REVIEW_FEEDBACK = "Fix this same active build so every success criter
 const RETRYABLE_ACTION_TYPES = new Set([
   "place_blueprint", "build_machine", "build_structure", "build_plan",
   "dimension_travel", "world_control", "potion_rain", "give_items",
-  "show_recipe", "command_lesson",
+  "run_commands", "place_area_torches", "show_recipe", "command_lesson",
 ]);
 
 const isAutomaticGoalQuestion = (question) => /^(?:The last attempt failed:|Review the completed in-world attempt|Fix this same active build)/i
@@ -3143,6 +3207,24 @@ export function createWizard({
         return { ...result, message: "Thanks for the grade! I saved it with this request." };
       }
 
+      const correctiveAction = classifyAction(note, sessions.get(player, "wizard"));
+      const immediateCorrection = correctiveAction && !BUILD_ACTION_TYPES.has(correctiveAction.type);
+      if (binding.goalId && immediateCorrection) {
+        const followUp = await api.ask({
+          player,
+          mode: "wizard",
+          question: note,
+          requestId: randomUUID(),
+          context,
+          goalRetry: { goalId: binding.goalId },
+        });
+        return {
+          ...result,
+          message: "Thanks—that correction asks me to act, so I’m doing it now.",
+          followUp,
+        };
+      }
+
       if (binding.goalId) {
         const projectKind = String(binding.action?.plan?.kind || "project")
           .replace(/[^a-zA-Z0-9 _-]/g, " ").replace(/\s+/g, " ").trim().slice(0, 64)
@@ -3165,7 +3247,7 @@ export function createWizard({
 
       const originalQuestion = String(binding.question || "the earlier question")
         .replace(/\s+/g, " ").trim().slice(0, 800);
-      if (classifyAction(note, sessions.get(player, "wizard"))) {
+      if (correctiveAction) {
         const followUp = await api.ask({
           player,
           mode: "wizard",

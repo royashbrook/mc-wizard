@@ -68,6 +68,16 @@ export const WIZARD_SKILLS = [
     action: { type: "give_items", version: 1, items: [{ itemId: "minecraft:iron_pickaxe", amount: 1 }] },
   },
   {
+    name: "light_area_with_torches",
+    description: "Light the nearby area with visible torches placed by MC Wizard as a player. Use this by default for requests to light up or brighten the area; use night vision only when the child explicitly asks for that effect.",
+    action: { type: "place_area_torches", version: 1 },
+  },
+  {
+    name: "execute_minecraft_commands",
+    description: "Execute ordinary Bedrock commands to produce an immediate in-world result when no narrower skill covers it. Commands omit the leading slash and use @s for the requesting player. Never merely explain a command when the child asked for the result.",
+    action: { type: "run_commands", version: 1, commands: ["effect @s night_vision 999999 0 true"] },
+  },
+  {
     name: "build_complete_structure",
     description: buildStructureSchemaPrompt(),
     action: { type: "build_structure", version: 1 },
@@ -88,6 +98,25 @@ export const WIZARD_SKILLS = [
     action: { type: "command_lesson", id: lesson.id, version: 1 },
   })),
 ];
+
+const FORBIDDEN_COMMAND_ROOTS = new Set([
+  "allowlist", "ban", "ban-ip", "banlist", "changesetting", "deop", "kick", "op",
+  "pardon", "pardon-ip", "permissions", "reload", "reloadconfig",
+  "reloadpacketlimitconfig", "save", "script", "sendshowstoreoffer", "setmaxplayers",
+  "stop", "whitelist",
+]);
+
+function allowedCommand(value) {
+  if (typeof value !== "string") return null;
+  const command = value.trim();
+  if (!command || command.length > 240 || command.startsWith("/")
+    || /[\u0000-\u001f\u007f]/.test(command)) return null;
+  const root = command.split(/\s+/, 1)[0].toLowerCase();
+  if (FORBIDDEN_COMMAND_ROOTS.has(root)) return null;
+  // Every player selector must stay requester-scoped. World-coordinate commands need no selector.
+  if (/@(?:a|e|p|r)(?:\b|\[)/i.test(command)) return null;
+  return command;
+}
 
 export function allowedWizardAction(value) {
   if (value?.type === "place_blueprint" && value.id === "item_sorter" && value.version === 1) {
@@ -123,6 +152,11 @@ export function allowedWizardAction(value) {
       return { type: "give_items", version: 1, items };
     }
     return null;
+  }
+  if (value?.type === "run_commands" && value.version === 1 && Array.isArray(value.commands)
+    && value.commands.length >= 1 && value.commands.length <= 8) {
+    const commands = value.commands.map(allowedCommand);
+    return commands.every(Boolean) ? { type: "run_commands", version: 1, commands } : null;
   }
   if (value?.type === "build_structure" && value.version === 1) {
     try {
@@ -191,5 +225,5 @@ export function wizardSkillPrompt() {
   }]
     .map(({ name, description, action }) => `- ${name}: ${description}\n  action=${JSON.stringify(action)}`)
     .join("\n")
-    + `\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
+    + `\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_minecraft_commands for a concrete in-world result not covered by a narrower action. Use @s for the requesting child, never a nearest-player or broad selector. Do not expose the command in chat unless explicitly asked.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
 }

@@ -218,6 +218,43 @@ test("actionable feedback after an informational miss performs the requested wor
   assert.equal(result.followUp.action.plan.interactions[0].itemId, "minecraft:flint_and_steel");
 });
 
+test("actionable feedback can replace a failed goal attempt with a command-backed solution", async () => {
+  const sessions = createMemorySessionStore();
+  const wizard = createWizard({ corpus, sessions, env: {}, logger: quiet });
+  const initial = await wizard.ask({
+    player: "DarkKid", question: "light up this area", requestId: "lighting-request",
+  });
+  assert.equal(initial.action.type, "place_area_torches");
+  await sessions.updateAction("DarkKid", "wizard", {
+    requestId: initial.requestId, status: "failed", detail: "the first lighting spell failed",
+  });
+
+  const result = await wizard.recordFeedback({
+    player: "DarkKid",
+    requestId: initial.requestId,
+    grade: 1,
+    feedback: "give me night vision",
+  });
+  assert.match(result.message, /doing it now/i);
+  assert.equal(result.followUp.goalId, initial.goalId);
+  assert.deepEqual(result.followUp.action.commands, ["effect @s night_vision 999999 0 true"]);
+});
+
+test("a command request executes even while an earlier command goal is still active", async () => {
+  const sessions = createMemorySessionStore();
+  const wizard = createWizard({ corpus, sessions, env: {}, logger: quiet });
+  const first = await wizard.ask({
+    player: "CommandKid", question: "give me night vision", requestId: "effect-request",
+  });
+  await sessions.updateAction("CommandKid", "wizard", {
+    requestId: first.requestId, status: "completed", detail: "effect applied",
+  });
+  const second = await wizard.ask({
+    player: "CommandKid", question: "light up this area", requestId: "light-request",
+  });
+  assert.deepEqual(second.action, { type: "place_area_torches", version: 1 });
+});
+
 test("feedback endpoint is private, exact, terminal, idempotent, and logged without gamertags", async () => {
   const directory = await mkdtemp(join(tmpdir(), "mc-wizard-feedback-server-"));
   const filePath = join(directory, "interactions.jsonl");
