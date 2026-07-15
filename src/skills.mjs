@@ -3,6 +3,10 @@ import { buildStructureSchemaPrompt, validateBuildStructurePlan } from "../bedro
 import { machinePlanSchemaPrompt, validateMachinePlan } from "../bedrock/behavior_packs/mc_wizard/scripts/machine-plan.js";
 import { COMMAND_LESSONS, commandLessonPrompt } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import { recipeItemIds } from "../bedrock/behavior_packs/mc_wizard/scripts/recipe-display.js";
+import {
+  capabilityProgramPrompt,
+  validateCapabilityProgram,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/capability-program.js";
 
 const RECIPE_ITEM_IDS = new Set(recipeItemIds());
 
@@ -119,6 +123,13 @@ function allowedCommand(value) {
 }
 
 export function allowedWizardAction(value) {
+  if (value?.type === "execute_program" && value.version === 1) {
+    try {
+      return { type: "execute_program", version: 1, program: validateCapabilityProgram(value.program) };
+    } catch {
+      return null;
+    }
+  }
   if (value?.type === "place_blueprint" && value.id === "item_sorter" && value.version === 1) {
     const filterItem = value.filterItem || "minecraft:iron_ingot";
     const supported = new Set([
@@ -194,6 +205,7 @@ export function wizardActionRejection(value) {
     if (value.type === "build_structure") validateBuildStructurePlan(value.plan);
     else if (value.type === "build_machine") validateMachinePlan(value.plan);
     else if (value.type === "build_plan") validateBuildPlan(value.plan);
+    else if (value.type === "execute_program") validateCapabilityProgram(value.program);
     else return allowedWizardAction(value) ? null : "action is not registered or its arguments are invalid";
     return null;
   } catch (error) {
@@ -225,5 +237,5 @@ export function wizardSkillPrompt() {
   }]
     .map(({ name, description, action }) => `- ${name}: ${description}\n  action=${JSON.stringify(action)}`)
     .join("\n")
-    + `\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_minecraft_commands for a concrete in-world result not covered by a narrower action. Use @s for the requesting child, never a nearest-player or broad selector. Do not expose the command in chat unless explicitly asked.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
+    + `\n\n${capabilityProgramPrompt()}\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_minecraft_commands for a concrete in-world result not covered by a narrower action. Use @s for the requesting child, never a nearest-player or broad selector. Do not expose the command in chat unless explicitly asked.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
 }

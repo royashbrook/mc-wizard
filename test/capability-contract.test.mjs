@@ -3,11 +3,71 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  capabilityProgramRequiredAuthority,
+  validateCapabilityProgram,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/capability-program.js";
+import {
   allowedWizardAction,
   allowedWizardGoal,
   wizardSkillPrompt,
 } from "../src/skills.mjs";
 import { classifyAction } from "../src/wizard.mjs";
+
+test("capability programs compose novel actions without extending the response union", () => {
+  const program = {
+    title: "Cake horse staircase",
+    steps: [
+      {
+        id: "research_cake",
+        capability: "knowledge.research",
+        arguments: { query: "Bedrock cake collision and horse movement" },
+        expect: "The plan cites current Bedrock behavior.",
+      },
+      {
+        id: "build_stairs",
+        capability: "player.place-blocks",
+        arguments: { itemId: "minecraft:cake", targets: [[1, 0, 2], [1, 1, 3]] },
+        expect: "The requested cake staircase exists nearby.",
+      },
+      {
+        id: "test_horse",
+        capability: "verify.entity-path",
+        arguments: { typeId: "minecraft:horse", path: "up the staircase", speed: "maximum" },
+        expect: "A horse reaches the top at maximum speed.",
+      },
+    ],
+  };
+  assert.deepEqual(validateCapabilityProgram(program), {
+    ...program,
+    steps: program.steps.map((step) => ({ ...step, onFailure: "replan" })),
+  });
+  assert.deepEqual(allowedWizardAction({ type: "execute_program", version: 1, program }), {
+    type: "execute_program",
+    version: 1,
+    program: validateCapabilityProgram(program),
+  });
+});
+
+test("capability programs derive admin authority and reject unsafe or ambiguous data", () => {
+  const ownerProgram = validateCapabilityProgram({
+    title: "Private family server",
+    steps: [{
+      id: "allow_owner",
+      capability: "server.console",
+      arguments: { command: "allowlist add alt3rname" },
+      expect: "The owner remains allowed to join.",
+    }],
+  });
+  assert.equal(capabilityProgramRequiredAuthority(ownerProgram), "owner");
+  assert.throws(() => validateCapabilityProgram({
+    title: "Duplicate",
+    steps: [ownerProgram.steps[0], ownerProgram.steps[0]],
+  }), /unique and safe/);
+  assert.throws(() => validateCapabilityProgram({
+    title: "Unsafe",
+    steps: [{ ...ownerProgram.steps[0], id: "unsafe", arguments: JSON.parse('{"__proto__":{"oops":true}}') }],
+  }), /unsafe field/);
+});
 
 test("dimension travel is a validated in-world capability", () => {
   const action = { type: "dimension_travel", version: 1, destination: "nether" };
@@ -57,6 +117,9 @@ test("JSON response schema exposes goal, travel, and command contracts", async (
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "dimension_travel"));
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "run_commands"));
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "place_area_torches"));
+  const program = actions.find((entry) => entry.properties?.type?.const === "execute_program");
+  assert.equal(program.properties.program.properties.steps.maxItems, 48);
+  assert.equal(program.properties.program.properties.steps.items.properties.arguments.type, "object");
 });
 
 test("capability prompt distinguishes projects and revisions", () => {
@@ -65,4 +128,6 @@ test("capability prompt distinguishes projects and revisions", () => {
   assert.match(prompt, /build_bounded_machine for a working farm/i);
   assert.match(prompt, /revision of the active project/i);
   assert.match(prompt, /status="complete" only after the live-world observation proves/i);
+  assert.match(prompt, /novel or multi-step in-world goal, use execute_program/i);
+  assert.match(prompt, /failed expectation is an observation/i);
 });
