@@ -59,6 +59,15 @@ test("capability programs derive admin authority and reject unsafe or ambiguous 
     }],
   });
   assert.equal(capabilityProgramRequiredAuthority(ownerProgram), "owner");
+  assert.equal(capabilityProgramRequiredAuthority(validateCapabilityProgram({
+    title: "Operator action",
+    steps: [{
+      id: "moderate",
+      capability: "world.admin",
+      arguments: {},
+      expect: "The operator action succeeds.",
+    }],
+  })), "operator");
   assert.throws(() => validateCapabilityProgram({
     title: "Duplicate",
     steps: [ownerProgram.steps[0], ownerProgram.steps[0]],
@@ -67,6 +76,16 @@ test("capability programs derive admin authority and reject unsafe or ambiguous 
     title: "Unsafe",
     steps: [{ ...ownerProgram.steps[0], id: "unsafe", arguments: JSON.parse('{"__proto__":{"oops":true}}') }],
   }), /unsafe field/);
+  for (const argumentsValue of [undefined, true, 1, "command"]) {
+    assert.throws(() => validateCapabilityProgram({
+      title: "Arguments are objects",
+      steps: [{ ...ownerProgram.steps[0], id: "bad_args", arguments: argumentsValue }],
+    }), /JSON values only|must be an object/);
+  }
+  assert.throws(() => validateCapabilityProgram({
+    title: "   ",
+    steps: [ownerProgram.steps[0]],
+  }), /must contain/);
 });
 
 test("dimension travel is a validated in-world capability", () => {
@@ -120,6 +139,8 @@ test("JSON response schema exposes goal, travel, and command contracts", async (
   const program = actions.find((entry) => entry.properties?.type?.const === "execute_program");
   assert.equal(program.properties.program.properties.steps.maxItems, 48);
   assert.equal(program.properties.program.properties.steps.items.properties.arguments.type, "object");
+  assert.equal(program.properties.program.properties.steps.items.properties.arguments.maxProperties, 64);
+  assert.equal(program.properties.program.properties.title.pattern, "\\S");
 });
 
 test("capability prompt distinguishes projects and revisions", () => {

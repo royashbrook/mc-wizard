@@ -59,8 +59,10 @@ export function validateCapabilityProgram(value) {
     if (!STEP_ID.test(step.id || "") || ids.has(step.id)) throw new Error(`${name}.id must be unique and safe`);
     if (!CAPABILITY.test(step.capability || "")) throw new Error(`${name}.capability is invalid`);
     ids.add(step.id);
-    const args = cleanJson(step.arguments ?? {}, `${name}.arguments`);
-    if (Array.isArray(args) || !args) throw new Error(`${name}.arguments must be an object`);
+    const args = cleanJson(step.arguments, `${name}.arguments`);
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      throw new Error(`${name}.arguments must be an object`);
+    }
     if (JSON.stringify(args).length > CAPABILITY_PROGRAM_LIMITS.argumentBytes) {
       throw new Error(`${name}.arguments is too large`);
     }
@@ -76,7 +78,7 @@ export function validateCapabilityProgram(value) {
 export function capabilityProgramRequiredAuthority(program) {
   return program.steps.some(({ capability }) => capability.startsWith("server."))
     ? "owner"
-    : program.steps.some(({ capability }) => capability.startsWith("world.admin."))
+    : program.steps.some(({ capability }) => capability === "world.admin" || capability.startsWith("world.admin."))
       ? "operator"
       : "player";
 }
