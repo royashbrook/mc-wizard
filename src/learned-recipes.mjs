@@ -16,6 +16,12 @@ const LEARNED_PROGRAM_CAPABILITIES = new Set([
 
 export function reusableLearnedAction(action) {
   if (!action || !LEARNED_ACTION_TYPES.has(action.type)) return false;
+  if (["build_machine", "build_structure"].includes(action.type)
+    && /^(?:First pass|Progress \d+)\b/i.test(action.plan?.title || "")) return false;
+  if (action.type === "build_machine") {
+    const work = (action.plan?.placements?.length || 0) + (action.plan?.interactions?.length || 0);
+    if (work < 2) return false;
+  }
   if (action.type !== "execute_program") return true;
   return Array.isArray(action.program?.steps) && action.program.steps.length > 0
     && action.program.steps.every(({ capability }) => LEARNED_PROGRAM_CAPABILITIES.has(capability));
@@ -37,14 +43,15 @@ export function createMemoryLearnedRecipeStore({ maxRecipes = 100 } = {}) {
       entry.uses += 1;
       return clone(entry);
     },
-    async promote({ question, action, grade }) {
+    async promote({ question, action, grade, verified }) {
       const key = recipeKey(question);
-      if (!key || !reusableLearnedAction(action) || !Number.isFinite(grade) || grade < 4 || grade > 5) return null;
+      if (!key || verified !== true || !reusableLearnedAction(action)
+        || !Number.isFinite(grade) || grade < 4 || grade > 5) return null;
       const entry = {
         key,
-        question: String(question).replace(/\s+/g, " ").trim().slice(0, 500),
         action: clone(action),
         grade,
+        verified: true,
         uses: entries.get(key)?.uses || 0,
         updatedAt: new Date().toISOString(),
       };
@@ -67,17 +74,26 @@ export async function createFileLearnedRecipeStore({ filePath, maxRecipes = 100 
   const memory = createMemoryLearnedRecipeStore({ maxRecipes });
   try {
     const parsed = JSON.parse(await readFile(filePath, "utf8"));
-    for (const entry of Array.isArray(parsed?.recipes) ? parsed.recipes : []) {
-      await memory.promote(entry);
+    const entries = Array.isArray(parsed?.recipes) && [1, 2].includes(parsed?.version)
+      ? parsed.recipes : [];
+    for (const entry of entries) {
+      // Version 1 predates executor/world verification. Keep only interim v1 records
+      // that already carry the new proof bit; unverified legacy recipes must be relearned.
+      if (parsed.version === 1 && entry?.verified !== true) continue;
+      await memory.promote({ ...entry, question: entry.question || entry.key });
     }
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
-  const persist = async () => {
-    await mkdir(dirname(filePath), { recursive: true });
-    const temporary = `${filePath}.${process.pid}.tmp`;
-    await writeFile(temporary, `${JSON.stringify({ version: 1, recipes: await memory.list() })}\n`, { mode: 0o600 });
-    await rename(temporary, filePath);
+  let pendingWrite = Promise.resolve();
+  const persist = () => {
+    pendingWrite = pendingWrite.catch(() => {}).then(async () => {
+      await mkdir(dirname(filePath), { recursive: true });
+      const temporary = `${filePath}.${process.pid}.tmp`;
+      await writeFile(temporary, `${JSON.stringify({ version: 2, recipes: await memory.list() })}\n`, { mode: 0o600 });
+      await rename(temporary, filePath);
+    });
+    return pendingWrite;
   };
   return {
     find: (question) => memory.find(question),

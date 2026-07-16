@@ -139,7 +139,7 @@ export function createInteractionLog({
         ...(goal && { goalId: goal }),
         ...(label && { actionLabel: label }),
       });
-      if (["completed", "failed"].includes(status) && timingKey) timings.delete(timingKey);
+      if (["completed", "failed", "partial"].includes(status) && timingKey) timings.delete(timingKey);
       return entry;
     },
     recordFeedback({ player, requestId: suppliedRequestId, grade, feedback, result }) {
@@ -148,7 +148,7 @@ export function createInteractionLog({
       const label = privateText(result?.actionLabel, 120, player) || actionLabel(result?.action, player);
       const note = privateText(feedback || result?.note, 500, player);
       const responseMode = privateText(result?.responseMode, 64, player);
-      const status = ["completed", "failed"].includes(result?.status) ? result.status
+      const status = ["completed", "failed", "partial"].includes(result?.status) ? result.status
         : result?.action ? "unknown" : "answered";
       const detail = privateText(result?.detail, 500, player);
       const followUpId = requestId(result?.followUp?.requestId, player);

@@ -3,10 +3,11 @@ import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
 const REQUEST_ID = /^[a-zA-Z0-9_-]{1,64}$/;
-const ACTION_STATUSES = new Set(["pending", "started", "completed", "failed", "unknown"]);
+const ACTION_STATUSES = new Set(["pending", "started", "completed", "failed", "partial", "unknown"]);
 // Bump this when persisted dialogue from an older agent contract would teach the
 // current planner false capabilities or revive invalid projects.
 const BEHAVIOR_REVISION = 3;
+const MAX_TERMINAL_RESULTS = 32;
 const safeSequence = (value) => Number.isSafeInteger(value) && value >= 1 ? value : undefined;
 
 function safeDetail(value) {
@@ -23,6 +24,40 @@ function safeFeedback(value) {
     || !Number.isInteger(value.grade) || value.grade < 1 || value.grade > 5) return undefined;
   const note = safeDetail(value.note);
   return { grade: value.grade, ...(note && { note }) };
+}
+
+function safeTerminalResult(requestId, value) {
+  if (!REQUEST_ID.test(requestId) || !value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized.length > 150_000) return undefined;
+    const parsed = JSON.parse(serialized);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizedTerminalResults(value) {
+  const normalized = Object.create(null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return normalized;
+  for (const [requestId, result] of Object.entries(value).slice(-MAX_TERMINAL_RESULTS)) {
+    const safe = safeTerminalResult(requestId, result);
+    if (safe) normalized[requestId] = safe;
+  }
+  return normalized;
+}
+
+function saveTerminalResult(session, requestId, result) {
+  const safe = safeTerminalResult(requestId, result);
+  if (!safe) return false;
+  session.terminalResults = normalizedTerminalResults(session.terminalResults);
+  delete session.terminalResults[requestId];
+  session.terminalResults[requestId] = safe;
+  while (Object.keys(session.terminalResults).length > MAX_TERMINAL_RESULTS) {
+    delete session.terminalResults[Object.keys(session.terminalResults)[0]];
+  }
+  return true;
 }
 
 function persistedTurn(turn) {
@@ -44,6 +79,8 @@ function persistedTurn(turn) {
     ? turn.requestId : undefined;
   const goalId = typeof turn?.goalId === "string" && REQUEST_ID.test(turn.goalId)
     ? turn.goalId : undefined;
+  const retryOfRequestId = typeof turn?.retryOfRequestId === "string" && REQUEST_ID.test(turn.retryOfRequestId)
+    ? turn.retryOfRequestId : undefined;
   const status = action && ACTION_STATUSES.has(turn?.status) ? turn.status : action ? "unknown" : undefined;
   const detail = action ? safeDetail(turn?.detail) : undefined;
   const responseMode = safeResponseMode(turn?.responseMode);
@@ -56,6 +93,7 @@ function persistedTurn(turn) {
     ...(goal && { goal }),
     ...(requestId && { requestId }),
     ...(goalId && { goalId }),
+    ...(retryOfRequestId && { retryOfRequestId }),
     ...(status && { status }),
     ...(detail && { detail }),
     ...(responseMode && { responseMode }),
@@ -102,14 +140,14 @@ function appendTurn(session, turn, maxTurns) {
 }
 
 function updateAction(turns, requestId, status, detail) {
-  if (!REQUEST_ID.test(requestId) || !["started", "completed", "failed"].includes(status)) {
+  if (!REQUEST_ID.test(requestId) || !["started", "completed", "failed", "partial"].includes(status)) {
     return { matched: false, updated: false };
   }
   const index = turns.findLastIndex((turn) => turn.action && turn.requestId === requestId);
   if (index < 0) return { matched: false, updated: false };
   const current = turns[index].status || "unknown";
   if (current === status) return { matched: true, updated: false, status: current };
-  if (["completed", "failed"].includes(current)) {
+  if (["completed", "failed", "partial"].includes(current)) {
     return { matched: true, updated: false, status: current };
   }
   turns[index] = persistedTurn({ ...turns[index], status, detail });
@@ -174,6 +212,7 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
       const normalized = trimTurns(normalizedTurns(turns), maxTurns);
       sessions.set(key, {
         turns: normalized,
+        terminalResults: sessions.get(key)?.terminalResults || {},
         updatedAt: Date.now(),
       });
       sequences.set(key, Math.max(sequences.get(key) || 0, latestSequence(normalized)));
@@ -181,6 +220,12 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
     reserve(player, mode) {
       const key = `${mode}:${player}`;
       return reserveSequence(sequences, key, sessions.get(key)?.turns);
+    },
+    release(player, mode, requestSequence) {
+      const key = `${mode}:${player}`;
+      if (safeSequence(requestSequence) !== sequences.get(key)) return false;
+      sequences.set(key, latestSequence(sessions.get(key)?.turns));
+      return true;
     },
     isCurrent(player, mode, requestSequence) {
       return safeSequence(requestSequence) === sequences.get(`${mode}:${player}`);
@@ -211,6 +256,18 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
       const outcome = updateAction(session.turns, result.requestId, result.status, result.detail);
       if (outcome.updated) session.updatedAt = Date.now();
       return outcome;
+    },
+    getActionResult(player, mode, requestId) {
+      const terminalResults = sessions.get(`${mode}:${player}`)?.terminalResults;
+      const result = terminalResults && Object.hasOwn(terminalResults, requestId)
+        ? terminalResults[requestId] : undefined;
+      return result ? structuredClone(result) : undefined;
+    },
+    async setActionResult(player, mode, requestId, result) {
+      const session = sessions.get(`${mode}:${player}`);
+      if (!session || !saveTerminalResult(session, requestId, result)) return false;
+      session.updatedAt = Date.now();
+      return true;
     },
     async recordFeedback(player, mode, { requestId, grade, note }) {
       const session = sessions.get(`${mode}:${player}`);
@@ -247,6 +304,7 @@ export async function createFileSessionStore({
       data = parsed;
       for (const session of Object.values(data.sessions)) {
         session.turns = Array.isArray(session?.turns) ? normalizedTurns(session.turns) : [];
+        session.terminalResults = normalizedTerminalResults(session?.terminalResults);
       }
     }
   } catch (error) {
@@ -270,7 +328,7 @@ export async function createFileSessionStore({
   let pendingWrite = Promise.resolve();
   const persist = () => {
     prune();
-    pendingWrite = pendingWrite.then(async () => {
+    pendingWrite = pendingWrite.catch(() => {}).then(async () => {
       await mkdir(dirname(filePath), { recursive: true });
       const temporary = `${filePath}.tmp`;
       await writeFile(temporary, `${JSON.stringify(data)}\n`, { mode: 0o600 });
@@ -291,6 +349,7 @@ export async function createFileSessionStore({
       data.sessions[key] = {
         updatedAt: now(),
         turns: normalized,
+        terminalResults: data.sessions[key]?.terminalResults || {},
       };
       sequences.set(key, Math.max(sequences.get(key) || 0, latestSequence(normalized)));
       await persist();
@@ -298,6 +357,12 @@ export async function createFileSessionStore({
     reserve(player, mode) {
       const key = keyFor(player, mode);
       return reserveSequence(sequences, key, data.sessions[key]?.turns);
+    },
+    release(player, mode, requestSequence) {
+      const key = keyFor(player, mode);
+      if (safeSequence(requestSequence) !== sequences.get(key)) return false;
+      sequences.set(key, latestSequence(data.sessions[key]?.turns));
+      return true;
     },
     isCurrent(player, mode, requestSequence) {
       return safeSequence(requestSequence) === sequences.get(keyFor(player, mode));
@@ -337,6 +402,19 @@ export async function createFileSessionStore({
         await persist();
       }
       return outcome;
+    },
+    getActionResult(player, mode, requestId) {
+      const terminalResults = data.sessions[keyFor(player, mode)]?.terminalResults;
+      const result = terminalResults && Object.hasOwn(terminalResults, requestId)
+        ? terminalResults[requestId] : undefined;
+      return result ? structuredClone(result) : undefined;
+    },
+    async setActionResult(player, mode, requestId, result) {
+      const session = data.sessions[keyFor(player, mode)];
+      if (!session || !saveTerminalResult(session, requestId, result)) return false;
+      session.updatedAt = now();
+      await persist();
+      return true;
     },
     async recordFeedback(player, mode, { requestId, grade, note }) {
       const session = data.sessions[keyFor(player, mode)];

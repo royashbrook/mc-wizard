@@ -131,6 +131,14 @@ test("logs successful action paths and measured acknowledgement-to-completion ti
       status: "completed", matched: true, updated: true, success: true,
       totalMs: 600, actionMs: 500,
     });
+    await log.recordFeedback({
+      player: "SuccessKid",
+      requestId: "partial-build",
+      grade: 2,
+      feedback: "finish the missing wall",
+      result: { requestId: "partial-build", status: "partial" },
+    });
+    assert.equal((await readRecentInteractions(filePath)).at(-1).outcome.status, "partial");
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

@@ -735,6 +735,11 @@ test("validates bounded action outcomes", () => {
     status: "failed",
     detail: "blocked by lava",
   });
+  assert.deepEqual(validateActionResultBody({
+    player: "Action Kid", requestId: "torch-partial", status: "partial", detail: "placed 5 of 8",
+  }), {
+    player: "Action Kid", requestId: "torch-partial", status: "partial", detail: "placed 5 of 8",
+  });
   for (const value of [
     null,
     { player: "", requestId: "castle-123", status: "started" },
@@ -2419,11 +2424,16 @@ test("binds model-authored furniture revisions to the existing project", async (
   await sessions.updateAction("FurnitureKid", "wizard", {
     requestId: mansion.requestId, status: "completed", detail: "mansion verified",
   });
+  const house = await wizard.ask({ player: "FurnitureKid", question: "Build a separate house" });
+  await sessions.updateAction("FurnitureKid", "wizard", {
+    requestId: house.requestId, status: "completed", detail: "house verified",
+  });
   const furnished = await wizard.ask({
     player: "FurnitureKid", question: "build couches and beds in my mansion",
   });
   assert.equal(furnished.action.type, "execute_program");
   assert.equal(furnished.action.program.site, "active_project");
+  assert.equal(furnished.action.program.targetKind, "mansion");
   assert.equal(request.max_tokens, 3000);
 
   await sessions.updateAction("FurnitureKid", "wizard", {

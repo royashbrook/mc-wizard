@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import {
+  legacyPropertySuffix,
+  stablePropertySuffix,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/project-memory-key.js";
 
 const packScript = await readFile(new URL(
   "../bedrock/behavior_packs/mc_wizard/scripts/main.js",
@@ -14,6 +18,8 @@ test("Bedrock reports real action outcomes instead of treating a plan as execute
   assert.match(packScript, /endBuildAction\(token, "completed", `verified/);
   assert.match(packScript, /endBuildAction\(token, "failed", `verification left/);
   assert.match(packScript, /registerActionRequest\(player, payload\)/);
+  assert.match(packScript, /changedWorld \? "partial" : "failed"/);
+  assert.match(packScript, /\["completed", "partial"\]\.includes\(status\) && report\.projectRecord/);
 });
 
 test("every build executor binds its request to the allocated build token", () => {
@@ -35,6 +41,46 @@ test("a structure becomes the modification target only after verified completion
   const outcome = packScript.slice(outcomeStart, outcomeEnd);
   assert.match(outcome, /status === "completed" && report\.structureRecord/);
   assert.match(outcome, /rememberLastStructure/);
+});
+
+test("named structure refinements reuse the matching completed structure, not merely the latest kind", () => {
+  assert.match(packScript, /const structuresByKind = new Map\(\)/);
+  assert.match(packScript, /structureKindPropertyId\(player, saved\.plan\.kind\)/);
+  assert.match(packScript, /function structureFor\(player, kind\)/);
+  const finder = packScript.slice(
+    packScript.indexOf("function findModificationSite"),
+    packScript.indexOf("function runRawFill"),
+  );
+  assert.match(finder, /structureFor\(player, plan\.kind\)/);
+  assert.doesNotMatch(finder, /const previous = lastStructureFor\(player\)/);
+  assert.ok(
+    packScript.indexOf("world.setDynamicProperty(structureKindPropertyId(player, saved.plan.kind)")
+      < packScript.indexOf("world.setDynamicProperty(lastStructurePropertyId(player)"),
+  );
+});
+
+test("project persistence keys resist known FNV collisions and migrate legacy records", () => {
+  const first = "collisionkid\u0000green house annex sky village";
+  const second = "collisionkid\u0000crystal monument park cedar statue";
+  assert.equal(legacyPropertySuffix(first), legacyPropertySuffix(second));
+  assert.notEqual(stablePropertySuffix(first), stablePropertySuffix(second));
+  assert.match(packScript, /readMigratingDynamicProperty/);
+  assert.match(packScript, /legacyStructureKindPropertyId/);
+  assert.match(packScript, /legacyProjectKindPropertyId/);
+  assert.match(packScript, /lastStructureIndexPropertyId/);
+  assert.match(packScript, /lastProjectIndexPropertyId/);
+  assert.match(packScript, /could not migrate .* saved (?:project|structure) index/);
+});
+
+test("named machine refinements reuse the matching completed project, not merely the latest project", () => {
+  assert.match(packScript, /const projectsByKind = new Map\(\)/);
+  assert.match(packScript, /function projectFor\(player, kind\)/);
+  assert.match(packScript, /blueprint\.mode === "modify" \? projectFor\(player, blueprint\.kind\) : undefined/);
+  assert.match(packScript, /world\.setDynamicProperty\(projectKindPropertyId\(player, saved\.kind\), JSON\.stringify\(saved\)\)/);
+  assert.ok(
+    packScript.indexOf("world.setDynamicProperty(projectKindPropertyId(player, saved.kind)")
+      < packScript.indexOf("world.setDynamicProperty(lastProjectPropertyId(player)"),
+  );
 });
 
 test("immediate world actions also report their observed result", () => {
@@ -128,6 +174,16 @@ test("failed immediate typed actions use the same no-action recovery boundary", 
   assert.match(packScript, /endImmediateAction\(report, "failed", `dimension travel failed/);
   assert.match(packScript, /endImmediateAction\(report, "failed", "player left before world control completed"\)/);
   assert.match(packScript, /endImmediateAction\(activeReport, "failed", "item delivery was interrupted before completion"\)/);
+});
+
+test("partial action results cross HTTP and remain terminal for replan and feedback", () => {
+  const start = packScript.indexOf("async function postActionResult");
+  const end = packScript.indexOf("function registerActionRequest", start);
+  const lifecycle = packScript.slice(start, end);
+  assert.match(lifecycle, /\["completed", "failed", "partial"\]\.includes\(status\)/);
+  assert.match(lifecycle, /result\.updated === false && !result\.replayed/);
+  assert.ok(lifecycle.indexOf("const terminal") < lifecycle.indexOf("const executableReplan"));
+  assert.ok(lifecycle.indexOf("const terminal") < lifecycle.indexOf("queueFeedback(report)"));
 });
 
 test("superseded and abandoned actions cannot remain pending forever", () => {

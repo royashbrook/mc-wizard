@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 
 import {
+  newestProjectRecord,
   normalizeRuntimeStep,
   RUNTIME_CAPABILITIES,
   runtimeProgramHasEvidence,
@@ -111,12 +112,44 @@ test("runtime evidence covers every physical mutation instead of trusting prose 
   assert.equal(runtimeProgramHasEvidence([spawn, spawnCheck]), true);
 });
 
+test("runtime evidence verifies block states and item-use outcomes", () => {
+  assert.throws(() => normalizeRuntimeStep(step("player.use-item", {
+    itemId: "minecraft:lever", block: [0, 0, 0], faceTarget: [0, 1, 0],
+  })), /observable expected outcome/);
+  assert.equal(normalizeRuntimeStep(step("player.use-item", {
+    itemId: "minecraft:lever", block: [0, 0, 0], faceTarget: [0, 1, 0],
+    expectedState: { state: "open_bit", value: true },
+  })).arguments.expectedState.value, true);
+  const placement = normalizeRuntimeStep(step("player.place-blocks", { blocks: [{
+    itemId: "minecraft:hopper", target: [0, 0, 1], support: [0, -1, 1],
+    expectedType: "minecraft:hopper", expectedStates: { facing_direction: 2 },
+  }] }));
+  const wrongState = normalizeRuntimeStep(step("verify.blocks", { blocks: [{
+    target: [0, 0, 1], typeId: "minecraft:hopper", expectedStates: { facing_direction: 3 },
+  }] }));
+  const matchingState = normalizeRuntimeStep(step("verify.blocks", { blocks: [{
+    target: [0, 0, 1], typeId: "minecraft:hopper", expectedStates: { facing_direction: 2 },
+  }] }));
+  assert.equal(runtimeProgramHasEvidence([placement, wrongState]), false);
+  assert.equal(runtimeProgramHasEvidence([placement, matchingState]), true);
+});
+
+test("active-project targeting selects the most recently completed record", () => {
+  const farm = { kind: "farm", updatedAt: 100 };
+  const mansion = { kind: "mansion", updatedAt: 200 };
+  assert.equal(newestProjectRecord(farm, mansion), mansion);
+  assert.equal(newestProjectRecord(mansion, farm), mansion);
+  assert.equal(newestProjectRecord(undefined, farm), farm);
+});
+
 test("Bedrock executes programs sequentially and reports failed steps with a fresh snapshot", () => {
-  assert.match(packScript, /import \{ normalizeRuntimeStep, runtimeProgramHasEvidence \} from "\.\/capability-runtime\.js"/);
+  assert.match(packScript, /import \{ newestProjectRecord, normalizeRuntimeStep, runtimeProgramHasEvidence \} from "\.\/capability-runtime\.js"/);
   assert.match(packScript, /async function executeCapabilityProgram\(player, program\)/);
   assert.match(packScript, /function capabilityProgramFrame\(player, program\)/);
   assert.match(packScript, /program\.site === "active_project"/);
-  assert.match(packScript, /lastProjectFor\(player\) \|\| lastStructureFor\(player\)/);
+  assert.match(packScript, /projectFor\(player, program\.targetKind\)/);
+  assert.match(packScript, /structureFor\(player, program\.targetKind\)/);
+  assert.match(packScript, /newestProjectRecord\(lastProjectFor\(player\), lastStructureFor\(player\)\)/);
   assert.match(packScript, /program\.steps\.map\(normalizeRuntimeStep\)/);
   assert.match(packScript, /if \(!runtimeProgramHasEvidence\(steps\)\) throw/);
   assert.match(packScript, /await executeCapabilityStep\(player, step, frame\)/);
@@ -128,7 +161,7 @@ test("Bedrock executes programs sequentially and reports failed steps with a fre
   assert.match(packScript, /executeRequesterCommands\(/);
   assert.match(packScript, /dropCapabilityBook\(/);
   assert.match(packScript, /\["completed", "failed", "partial"\]\.includes\(status\)/);
-  assert.match(packScript, /endBuildAction\(token, "failed", `program/);
+  assert.match(packScript, /endBuildAction\(token, changedWorld \? "partial" : "failed", `program/);
   assert.ok(
     packScript.indexOf("/.test(step.capability)) changedWorld = true")
       < packScript.indexOf("await executeCapabilityStep(player, step, frame)"),

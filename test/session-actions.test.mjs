@@ -167,6 +167,18 @@ test("action results persist, bound details, and stay idempotent after completio
     const reloaded = await createFileSessionStore({ filePath, salt });
     assert.equal(reloaded.get("ActionKid", "wizard")[0].status, "completed");
     assert.equal(reloaded.get("ActionKid", "wizard")[0].detail, "all blocks verified");
+    const terminalResult = {
+      matched: true,
+      updated: true,
+      replan: { requestId: "castle-replan", answer: "I’ll repair it.", action: null },
+    };
+    assert.equal(await reloaded.setActionResult("ActionKid", "wizard", "castle-1", terminalResult), true);
+    const restarted = await createFileSessionStore({ filePath, salt });
+    assert.deepEqual(restarted.getActionResult("ActionKid", "wizard", "castle-1"), terminalResult);
+    assert.equal(restarted.getActionResult("ActionKid", "wizard", "toString"), undefined);
+    assert.equal(await restarted.setActionResult("ActionKid", "wizard", "__proto__", terminalResult), true);
+    assert.deepEqual(restarted.getActionResult("ActionKid", "wizard", "__proto__"), terminalResult);
+    assert.equal({}.matched, undefined);
     assert.deepEqual(await reloaded.updateAction("ActionKid", "wizard", {
       requestId: "missing", status: "started",
     }), { matched: false, updated: false });

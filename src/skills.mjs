@@ -123,7 +123,11 @@ function compileBlockEvidence(program, steps) {
   for (const step of steps) {
     if (step.capability === "player.place-blocks") {
       for (const block of step.arguments.blocks) {
-        expected.set(block.target.join(","), { target: block.target, typeId: block.expectedType });
+        expected.set(block.target.join(","), {
+          target: block.target,
+          typeId: block.expectedType,
+          expectedStates: block.expectedStates,
+        });
       }
     } else if (step.capability === "player.break-blocks") {
       for (const target of step.arguments.targets) {

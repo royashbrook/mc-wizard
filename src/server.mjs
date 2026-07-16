@@ -319,8 +319,8 @@ export function validateActionResultBody(body) {
     error.status = 400;
     throw error;
   }
-  if (!["started", "completed", "failed"].includes(body.status)) {
-    const error = new Error("status must be started, completed, or failed");
+  if (!["started", "completed", "failed", "partial"].includes(body.status)) {
+    const error = new Error("status must be started, completed, failed, or partial");
     error.status = 400;
     throw error;
   }

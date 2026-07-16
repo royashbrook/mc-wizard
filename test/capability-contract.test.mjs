@@ -46,6 +46,7 @@ test("capability programs compose novel actions without extending the response u
   const executable = {
     title: "Cake step",
     site: "active_project",
+    targetKind: "castle",
     steps: [{
       id: "build_step",
       capability: "player.place-blocks",
@@ -232,6 +233,7 @@ test("JSON response schema exposes goal, travel, and command contracts", async (
   const program = actions.find((entry) => entry.properties?.type?.const === "execute_program");
   assert.equal(program.properties.program.properties.steps.maxItems, 48);
   assert.deepEqual(program.properties.program.properties.site.enum, ["nearby", "active_project"]);
+  assert.equal(program.properties.program.properties.targetKind.maxLength, 80);
   assert.equal(program.properties.program.properties.steps.items.properties.arguments.type, "object");
   assert.equal(program.properties.program.properties.steps.items.properties.arguments.maxProperties, 64);
   assert.equal(program.properties.program.properties.title.pattern, "\\S");

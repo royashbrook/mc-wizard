@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -71,8 +71,21 @@ test("unfamiliar furniture is researched, graded, and reused without another mod
   assert.match(researchPrompt, /video descriptions or transcripts/);
   assert.match(researchPrompt, /furniture and other compact decorative assemblies/);
   assert.equal(first.action.plan.kind, "furniture");
-  await sessions.updateAction("FirstKid", "wizard", {
-    requestId: first.requestId, status: "completed", detail: "verified in world",
+  await wizard.recordActionResult({
+    player: "FirstKid", requestId: first.requestId, status: "completed", detail: "verified in world",
+    context: {
+      dimension: "minecraft:overworld",
+      buildState: "idle",
+      lastStructure: {
+        kind: first.action.plan.kind,
+        title: first.action.plan.title,
+        dimensions: first.action.plan.dimensions,
+        materials: first.action.plan.materials,
+        features: first.action.plan.features,
+        primitives: first.action.plan.primitives,
+        relativeOrigin: { x: 3, y: 0, z: 3 },
+      },
+    },
   });
   const feedback = await wizard.recordFeedback({
     player: "FirstKid", requestId: first.requestId, grade: 5,
@@ -93,11 +106,101 @@ test("a rejected learned recipe is removed and durable recipes survive reload", 
   const filePath = join(directory, "recipes.json");
   try {
     const recipes = await createFileLearnedRecipeStore({ filePath });
-    await recipes.promote({ question: "build furniture", action: furnitureAction, grade: 4 });
+    await recipes.promote({ question: "build furniture", action: furnitureAction, grade: 4, verified: true });
+    assert.equal(JSON.parse(await readFile(filePath, "utf8")).version, 2);
+    assert.equal(Object.hasOwn((await recipes.list())[0], "question"), false);
     const reloaded = await createFileLearnedRecipeStore({ filePath });
     assert.deepEqual((await reloaded.find("make me furniture")).action, furnitureAction);
     assert.equal(await reloaded.remove("create furniture"), true);
     assert.equal(await reloaded.find("build furniture"), null);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("legacy recipe files retain proved entries but invalidate recipes without verification", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-legacy-recipes-"));
+  const filePath = join(directory, "recipes.json");
+  try {
+    await writeFile(filePath, JSON.stringify({ version: 1, recipes: [{
+      key: "unsafe old furniture", action: furnitureAction, grade: 5,
+    }, {
+      key: "proved old furniture", action: furnitureAction, grade: 5, verified: true,
+    }] }));
+    const recipes = await createFileLearnedRecipeStore({ filePath });
+    assert.equal(await recipes.find("unsafe old furniture"), null);
+    assert.deepEqual((await recipes.find("proved old furniture")).action, furnitureAction);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("staged progress is never advertised or stored as a tested recipe", async () => {
+  const sessions = createMemorySessionStore();
+  const recipes = createMemoryLearnedRecipeStore();
+  const wizard = createWizard({ corpus: { search: () => [] }, sessions, recipes, logger: quiet, env: {} });
+  const first = await wizard.ask({ player: "StagedKid", question: "build furniture" });
+  assert.match(first.action.plan.title, /^First pass\b/);
+  await sessions.updateAction("StagedKid", "wizard", {
+    requestId: first.requestId, status: "completed", detail: "first pass placed",
+  });
+  const feedback = await wizard.recordFeedback({
+    player: "StagedKid", requestId: first.requestId, grade: 5,
+  });
+  assert.equal(feedback.learned, undefined);
+  assert.doesNotMatch(feedback.message, /tested recipe/i);
+  assert.deepEqual(await recipes.list(), []);
+  const stagedMachine = { type: "build_machine", version: 1, plan: {
+    title: "First pass furniture", kind: "furniture",
+    placements: [{ itemId: "minecraft:stone", target: [0, 0, 0], support: [0, -1, 0], orientationTarget: null }],
+    interactions: [],
+  } };
+  assert.equal(reusableLearnedAction(stagedMachine), false);
+  assert.equal(await recipes.promote({ question: "build furniture", action: stagedMachine, grade: 5, verified: true }), null);
+  const trivialMachine = { ...stagedMachine, plan: { ...stagedMachine.plan, title: "Furniture" } };
+  assert.equal(reusableLearnedAction(trivialMachine), false);
+  assert.equal(await recipes.promote({ question: "build working furniture", action: trivialMachine, grade: 5, verified: true }), null);
+});
+
+test("a grade cannot borrow an older completion from the same goal lineage", async () => {
+  const sessions = createMemorySessionStore();
+  const recipes = createMemoryLearnedRecipeStore();
+  const player = "LineageKid";
+  await sessions.set(player, "wizard", [{
+    question: "Review the old furniture attempt",
+    answer: "The old attempt passed.",
+    action: null,
+    goal: { objective: "Build furniture", successCriteria: "Furniture exists", status: "complete" },
+    goalId: "furniture-goal",
+    requestId: "old-review",
+    requestSequence: 1,
+  }, {
+    question: "replace it with better furniture",
+    answer: "I built a new attempt.",
+    action: furnitureAction,
+    goal: { objective: "Improve furniture", successCriteria: "Better furniture exists", status: "active" },
+    goalId: "furniture-goal",
+    requestId: "new-attempt",
+    requestSequence: 2,
+    status: "completed",
+  }]);
+  const wizard = createWizard({ corpus: { search: () => [] }, sessions, recipes, logger: quiet, env: {} });
+
+  const feedback = await wizard.recordFeedback({ player, requestId: "new-attempt", grade: 5 });
+  assert.equal(feedback.learned, undefined);
+  assert.deepEqual(await recipes.list(), []);
+});
+
+test("durable recipe writes serialize concurrent promotions without losing entries", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-recipe-writes-"));
+  try {
+    const recipes = await createFileLearnedRecipeStore({ filePath: join(directory, "recipes.json") });
+    await Promise.all([
+      recipes.promote({ question: "build red furniture", action: furnitureAction, grade: 4, verified: true }),
+      recipes.promote({ question: "build blue furniture", action: furnitureAction, grade: 5, verified: true }),
+    ]);
+    const reloaded = await createFileLearnedRecipeStore({ filePath: join(directory, "recipes.json") });
+    assert.equal((await reloaded.list()).length, 2);
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -111,8 +214,8 @@ test("learned recipes require a real grade and never persist privileged programs
   } };
   assert.equal(reusableLearnedAction(furnitureAction), true);
   assert.equal(reusableLearnedAction(privileged), false);
-  assert.equal(await recipes.promote({ question: "build furniture", action: furnitureAction }), null);
-  assert.equal(await recipes.promote({ question: "build furniture", action: privileged, grade: 5 }), null);
+  assert.equal(await recipes.promote({ question: "build furniture", action: furnitureAction, verified: true }), null);
+  assert.equal(await recipes.promote({ question: "build furniture", action: privileged, grade: 5, verified: true }), null);
   assert.deepEqual(await recipes.list(), []);
 });
 
@@ -178,7 +281,7 @@ test("web-researched build plans cannot smuggle server administration", async ()
   const result = await wizard.ask({ player: "ResearchSafetyKid", question: "research and build furniture" });
   assert.equal(calls, 2);
   assert.ok(result.action, "the rejected research plan must still make safe build progress");
-  assert.equal(reusableLearnedAction(result.action), true);
+  assert.equal(reusableLearnedAction(result.action), false);
   assert.doesNotMatch(JSON.stringify(result.action), /server\.console|server\.configure|world\.command|op \{\{requester\}\}/);
 });
 
@@ -189,6 +292,7 @@ test("the provider compiler repairs mechanical placement support and evidence", 
     target: [x, 0, 0],
     support: [9, 9, 9],
     expectedType: "minecraft:oak_planks",
+    expectedStates: { "minecraft:cardinal_direction": "north" },
   }));
   const wizard = createWizard({
     corpus: { search: () => [] }, logger: quiet,
@@ -215,4 +319,7 @@ test("the provider compiler repairs mechanical placement support and evidence", 
     [0, -1, 0], [1, -1, 0],
   ]);
   assert.equal(result.action.program.steps.at(-1).capability, "verify.blocks");
+  assert.deepEqual(result.action.program.steps.at(-1).arguments.blocks[0].expectedStates, {
+    "minecraft:cardinal_direction": "north",
+  });
 });

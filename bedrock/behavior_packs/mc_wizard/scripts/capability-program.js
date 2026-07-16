@@ -32,7 +32,7 @@ function cleanJson(value, name, depth = 0) {
   if (entries.length > 64) throw new Error(`${name} contains too many fields`);
   const clean = {};
   for (const [key, entry] of entries) {
-    if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(key) || FORBIDDEN_KEYS.has(key)) {
+    if (!/^[a-zA-Z][a-zA-Z0-9_.:-]{0,127}$/.test(key) || FORBIDDEN_KEYS.has(key)) {
       throw new Error(`${name} contains an unsafe field`);
     }
     clean[key] = cleanJson(entry, `${name}.${key}`, depth + 1);
@@ -42,12 +42,15 @@ function cleanJson(value, name, depth = 0) {
 
 export function validateCapabilityProgram(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("program must be an object");
-  if (Object.keys(value).some((key) => !["title", "site", "steps"].includes(key))) {
+  if (Object.keys(value).some((key) => !["title", "site", "targetKind", "steps"].includes(key))) {
     throw new Error("program has an unsupported field");
   }
   const title = cleanText(value.title, "program.title", 80);
   const site = value.site === undefined ? undefined : cleanText(value.site, "program.site", 32);
   if (site && !["nearby", "active_project"].includes(site)) throw new Error("program.site is invalid");
+  const targetKind = value.targetKind === undefined
+    ? undefined : cleanText(value.targetKind, "program.targetKind", 80).toLowerCase();
+  if (targetKind && site !== "active_project") throw new Error("program.targetKind requires active_project");
   if (!Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > CAPABILITY_PROGRAM_LIMITS.steps) {
     throw new Error(`program.steps must contain 1-${CAPABILITY_PROGRAM_LIMITS.steps} steps`);
   }
@@ -72,7 +75,7 @@ export function validateCapabilityProgram(value) {
     const onFailure = step.onFailure === "continue" ? "continue" : "replan";
     return { id: step.id, capability: step.capability, arguments: args, expect, onFailure };
   });
-  const program = { title, ...(site && { site }), steps };
+  const program = { title, ...(site && { site }), ...(targetKind && { targetKind }), steps };
   if (JSON.stringify(program).length > CAPABILITY_PROGRAM_LIMITS.totalBytes) throw new Error("program is too large");
   return program;
 }
@@ -88,6 +91,6 @@ export function capabilityProgramRequiredAuthority(program) {
 export function capabilityProgramPrompt() {
   return `For a novel or multi-step in-world goal, use execute_program with program={"title":"short plan name","site":"nearby|active_project","steps":[{"id":"unique_step","capability":"registered.capability","arguments":{},"expect":"observable result","onFailure":"replan"}]}. `
     + `Programs may contain 1-${CAPABILITY_PROGRAM_LIMITS.steps} ordered steps. Capability arguments are bounded JSON. Use only capabilities from the runtime manifest. `
-    + `Use site="active_project" for every requested revision, decoration, addition, or repair so relative vectors modify the existing project instead of creating another one. `
+    + `Use site="active_project" for every requested revision, decoration, addition, or repair so relative vectors modify the existing project instead of creating another one; trusted server code binds a named targetKind when the child names an older project. `
     + `A failed expectation is an observation: research or revise the remaining program and keep pursuing the active goal instead of abandoning it.`;
 }

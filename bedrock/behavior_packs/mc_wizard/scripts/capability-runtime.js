@@ -96,8 +96,18 @@ function placement(value, name) {
 }
 
 function blockExpectation(value, name) {
-  exactKeys(value, ["target", "typeId"], name);
-  return { target: vector(value.target, `${name}.target`), typeId: itemId(value.typeId, `${name}.typeId`) };
+  exactKeys(value, ["target", "typeId", "expectedStates"], name);
+  const expectedStates = value.expectedStates || {};
+  if (typeof expectedStates !== "object" || Array.isArray(expectedStates)
+    || Object.keys(expectedStates).length > 12
+    || Object.values(expectedStates).some((entry) => !["boolean", "number", "string"].includes(typeof entry))) {
+    throw new Error(`${name}.expectedStates is invalid`);
+  }
+  return {
+    target: vector(value.target, `${name}.target`),
+    typeId: itemId(value.typeId, `${name}.typeId`),
+    ...(Object.keys(expectedStates).length && { expectedStates: { ...expectedStates } }),
+  };
 }
 
 function normalizeArguments(capability, value) {
@@ -133,6 +143,12 @@ function normalizeArguments(capability, value) {
     if (expectedState !== undefined) {
       exactKeys(expectedState, ["state", "value"], `${name}.expectedState`);
       text(expectedState.state, `${name}.expectedState.state`, 80);
+    }
+    if (!value.expectedFaceType && !value.expectedEntity && !expectedState) {
+      throw new Error(`${name} needs an observable expected outcome`);
+    }
+    if (value.expectedEntityCount !== undefined && !value.expectedEntity) {
+      throw new Error(`${name}.expectedEntityCount needs expectedEntity`);
     }
     return {
       itemId: itemId(value.itemId, `${name}.itemId`),
@@ -252,18 +268,24 @@ export function normalizeRuntimeStep(step) {
 export function runtimeProgramHasEvidence(steps) {
   const verifiers = steps.filter(({ capability }) => capability === "verify.blocks");
   const expectedBlocks = new Map(verifiers.flatMap(({ arguments: args }) => (
-    args.blocks.map(({ target, typeId }) => [target.join(","), typeId])
+    args.blocks.map(({ target, typeId, expectedStates = {} }) => [target.join(","), { typeId, expectedStates }])
   )));
   const blockChanges = steps.flatMap(({ capability, arguments: args }) => {
     if (capability === "player.place-blocks") {
-      return args.blocks.map(({ target, expectedType }) => [target.join(","), expectedType]);
+      return args.blocks.map(({ target, expectedType, expectedStates }) => (
+        [target.join(","), { typeId: expectedType, expectedStates }]
+      ));
     }
     if (capability === "player.break-blocks") {
-      return args.targets.map((target) => [target.join(","), "minecraft:air"]);
+      return args.targets.map((target) => [target.join(","), { typeId: "minecraft:air", expectedStates: {} }]);
     }
     return [];
   });
-  if (blockChanges.length && blockChanges.some(([target, typeId]) => expectedBlocks.get(target) !== typeId)) return false;
+  if (blockChanges.length && blockChanges.some(([target, expected]) => {
+    const observed = expectedBlocks.get(target);
+    return observed?.typeId !== expected.typeId
+      || Object.entries(expected.expectedStates).some(([state, value]) => observed.expectedStates?.[state] !== value);
+  })) return false;
   const spawned = steps.filter(({ capability }) => capability === "script.spawn-entity");
   const entityChecks = steps.filter(({ capability }) => capability === "verify.entities");
   if (spawned.some(({ arguments: spawn }) => !entityChecks.some(({ arguments: check }) => (
@@ -278,12 +300,18 @@ export function runtimeProgramHasEvidence(steps) {
   return mutatesWorld && (hasExplicitVerifier || selfCheckingMutation);
 }
 
+export function newestProjectRecord(...records) {
+  return records.filter(Boolean).reduce((newest, candidate) => (
+    !newest || Number(candidate.updatedAt || 0) >= Number(newest.updatedAt || 0) ? candidate : newest
+  ), undefined);
+}
+
 export function capabilityRuntimePrompt() {
   return `Runtime capability manifest (relative vectors are [right, up, forward] from a nearby origin):\n`
     + `- player.move arguments={"target":[x,y,z],"mode":"walk|fly"}\n`
     + `- player.place-blocks arguments={"blocks":[{"itemId":"minecraft:stone","target":[x,y,z],"support":[x,y,z],"expectedType":"minecraft:stone","orientationTarget":[x,y,z]}]}\n`
     + `- player.break-blocks arguments={"targets":[[x,y,z]]}\n`
-    + `- player.use-item arguments={"itemId":"minecraft:lever","block":[x,y,z],"faceTarget":[x,y,z]}\n`
+    + `- player.use-item arguments={"itemId":"minecraft:lever","block":[x,y,z],"faceTarget":[x,y,z],"expectedState":{"state":"open_bit","value":true}}\n`
     + `- world.command arguments={"commands":["any Bedrock command run as and at the requesting player"]}\n`
     + `- server.console arguments={"commands":["any Bedrock dedicated-server console command; use {{requester}} for the player's exact name"]}\n`
     + `- server.configure arguments={"properties":{"default-player-permission-level":"operator"},"experiments":{"gametest":true},"worldOptions":{"educationFeaturesEnabled":true,"eduOffer":1}} (queues a clean restart)\n`
@@ -291,7 +319,7 @@ export function capabilityRuntimePrompt() {
     + `- script.teleport arguments={"subject":"requester|wizard","target":[x,y,z]}\n`
     + `- script.effect arguments={"subject":"requester|wizard","effectId":"night_vision","duration":1200,"amplifier":0,"showParticles":false}\n`
     + `- artifact.book arguments={"title":"short title","text":"complete book text","author":"MC Wizard"}\n`
-    + `- observe.snapshot arguments={}\n- verify.blocks arguments={"blocks":[{"target":[x,y,z],"typeId":"minecraft:stone"}]}\n`
+    + `- observe.snapshot arguments={}\n- verify.blocks arguments={"blocks":[{"target":[x,y,z],"typeId":"minecraft:stone","expectedStates":{}}]}\n`
     + `- verify.entities arguments={"typeId":"minecraft:horse","location":[2,0,1],"minimum":1,"maxDistance":4}\n`
     + `- control.wait arguments={"ticks":20}`;
 }

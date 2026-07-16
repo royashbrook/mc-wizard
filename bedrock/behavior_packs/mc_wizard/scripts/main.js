@@ -37,7 +37,8 @@ import { createTwoByTwoPistonDoorBlueprint } from "./piston-door.js";
 import { createRecipeDisplay } from "./recipe-display.js";
 import { createAutomaticWoolFarmBlueprint } from "./wool-farm.js";
 import { splitMessage } from "./chat.js";
-import { normalizeRuntimeStep, runtimeProgramHasEvidence } from "./capability-runtime.js";
+import { newestProjectRecord, normalizeRuntimeStep, runtimeProgramHasEvidence } from "./capability-runtime.js";
+import { legacyPropertySuffix, stablePropertySuffix } from "./project-memory-key.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
 const WIZARD_NAME = "MC Wizard";
@@ -94,7 +95,9 @@ const queuedFeedback = new Map();
 const promptedFeedbackRequests = new Set();
 const lastUndo = new Map();
 const lastStructures = new Map();
+const structuresByKind = new Map();
 const lastProjects = new Map();
+const projectsByKind = new Map();
 const placementRetries = new Map();
 const buildRetryNotices = new Set();
 const preparedPlacements = new Set();
@@ -289,10 +292,10 @@ async function postActionResult(report, status, detail) {
       }
       const result = JSON.parse(response.body || "{}");
       console.warn(`[MC Wizard] action ${report.requestId} ${status}`);
-      const terminal = status === "completed" || status === "failed";
+      const terminal = ["completed", "failed", "partial"].includes(status);
       const abandoned = /\b(?:superseded|player left|all players left|server stopp)/i.test(detail || "");
       if (!terminal || abandoned || result.superseded || result.replan?.superseded) return;
-      if (result.updated === false) {
+      if (result.updated === false && !result.replayed) {
         if (result.matched) queueFeedback(report);
         return;
       }
@@ -449,7 +452,7 @@ function endBuildAction(token, status, detail) {
   if (status === "completed" && report.structureRecord) {
     rememberLastStructure({ name: report.playerName }, report.structureRecord);
   }
-  if (status === "completed" && report.projectRecord) {
+  if (["completed", "partial"].includes(status) && report.projectRecord) {
     rememberLastProject({ name: report.playerName }, report.projectRecord);
   }
   void postActionResult(report, status, detail);
@@ -467,13 +470,35 @@ function validStructureInhabitantTag(value) {
   return typeof value === "string" && /^mcwizard_inhabitant_[a-z0-9_]{1,64}$/.test(value);
 }
 
+function readMigratingDynamicProperty(currentId, legacyId) {
+  const current = world.getDynamicProperty(currentId);
+  if (typeof current === "string" && current) return current;
+  const legacy = world.getDynamicProperty(legacyId);
+  return typeof legacy === "string" && legacy ? legacy : undefined;
+}
+
 function lastStructurePropertyId(player) {
-  let hash = 2166136261;
-  for (const character of structurePlayerKey(player)) {
-    hash ^= character.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `${LAST_STRUCTURES}:${(hash >>> 0).toString(36)}`;
+  return `${LAST_STRUCTURES}:${stablePropertySuffix(structurePlayerKey(player))}`;
+}
+
+function legacyLastStructurePropertyId(player) {
+  return `${LAST_STRUCTURES}:${legacyPropertySuffix(structurePlayerKey(player))}`;
+}
+
+function lastStructureIndexPropertyId(player) {
+  return `${LAST_STRUCTURES}:latest:${stablePropertySuffix(structurePlayerKey(player))}`;
+}
+
+function structureKindKey(player, kind) {
+  return `${structurePlayerKey(player)}\u0000${String(kind || "structure").toLowerCase()}`;
+}
+
+function structureKindPropertyId(player, kind) {
+  return `${LAST_STRUCTURES}:kind:${stablePropertySuffix(structureKindKey(player, kind))}`;
+}
+
+function legacyStructureKindPropertyId(player, kind) {
+  return `${LAST_STRUCTURES}:kind:${legacyPropertySuffix(structureKindKey(player, kind))}`;
 }
 
 function validStructureVector(value, vertical = false) {
@@ -482,13 +507,36 @@ function validStructureVector(value, vertical = false) {
   return vertical || (Math.abs(value.x) + Math.abs(value.z) === 1);
 }
 
+function validatedStoredStructure(stored) {
+  if (!stored || typeof stored.dimensionId !== "string"
+    || !validStructureVector(stored.origin, true)
+    || !validStructureVector(stored.forward)
+    || !validStructureVector(stored.right)) return undefined;
+  return { ...stored, plan: validateBuildStructurePlan(stored.plan) };
+}
+
 function lastProjectPropertyId(player) {
-  let hash = 2166136261;
-  for (const character of structurePlayerKey(player)) {
-    hash ^= character.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `${LAST_PROJECTS}:${(hash >>> 0).toString(36)}`;
+  return `${LAST_PROJECTS}:${stablePropertySuffix(structurePlayerKey(player))}`;
+}
+
+function legacyLastProjectPropertyId(player) {
+  return `${LAST_PROJECTS}:${legacyPropertySuffix(structurePlayerKey(player))}`;
+}
+
+function lastProjectIndexPropertyId(player) {
+  return `${LAST_PROJECTS}:latest:${stablePropertySuffix(structurePlayerKey(player))}`;
+}
+
+function projectKindKey(player, kind) {
+  return `${structurePlayerKey(player)}\u0000${String(kind || "project").toLowerCase()}`;
+}
+
+function projectKindPropertyId(player, kind) {
+  return `${LAST_PROJECTS}:kind:${stablePropertySuffix(projectKindKey(player, kind))}`;
+}
+
+function legacyProjectKindPropertyId(player, kind) {
+  return `${LAST_PROJECTS}:kind:${legacyPropertySuffix(projectKindKey(player, kind))}`;
 }
 
 function projectVector(value) {
@@ -565,6 +613,27 @@ function projectBlueprintSummary(blueprint) {
   };
 }
 
+function validatedStoredProject(stored) {
+  if (!stored || typeof stored.dimensionId !== "string"
+    || !validStructureVector(stored.origin, true)
+    || !validStructureVector(stored.forward)
+    || !validStructureVector(stored.right)) return undefined;
+  return {
+    ...projectBlueprintSummary(stored),
+    dimensionId: stored.dimensionId,
+    origin: { ...stored.origin },
+    forward: { ...stored.forward },
+    right: { ...stored.right },
+    updatedAt: Number(stored.updatedAt) || 0,
+  };
+}
+
+function newerStoredRecord(first, second) {
+  if (!first) return second;
+  if (!second) return first;
+  return (second.updatedAt || 0) >= (first.updatedAt || 0) ? second : first;
+}
+
 function obsoleteProjectPlacements(previous, next) {
   const retained = new Set(next.placements.map(({ target }) => target.join(",")));
   return previous.placements.filter(({ target }) => !retained.has(target.join(",")));
@@ -591,25 +660,60 @@ function lastProjectFor(player) {
   const key = structurePlayerKey(player);
   if (lastProjects.has(key)) return lastProjects.get(key);
   try {
-    const raw = world.getDynamicProperty(lastProjectPropertyId(player));
+    const indexRaw = world.getDynamicProperty(lastProjectIndexPropertyId(player));
+    if (typeof indexRaw === "string" && indexRaw) {
+      const index = JSON.parse(indexRaw);
+      const indexedKind = projectText(index?.kind, "", 64).toLowerCase();
+      const indexedRaw = indexedKind
+        ? world.getDynamicProperty(projectKindPropertyId(player, indexedKind)) : undefined;
+      const indexed = typeof indexedRaw === "string" && indexedRaw
+        ? validatedStoredProject(JSON.parse(indexedRaw)) : undefined;
+      if (indexed?.kind === indexedKind && indexed.updatedAt === Number(index.updatedAt)) {
+        lastProjects.set(key, indexed);
+        projectsByKind.set(projectKindKey(player, indexed.kind), indexed);
+        return indexed;
+      }
+    }
+    const raw = readMigratingDynamicProperty(
+      lastProjectPropertyId(player), legacyLastProjectPropertyId(player),
+    );
     if (typeof raw !== "string" || !raw) return undefined;
-    const stored = JSON.parse(raw);
-    if (typeof stored.dimensionId !== "string"
-      || !validStructureVector(stored.origin, true)
-      || !validStructureVector(stored.forward)
-      || !validStructureVector(stored.right)) return undefined;
-    const record = {
-      ...projectBlueprintSummary(stored),
-      dimensionId: stored.dimensionId,
-      origin: { ...stored.origin },
-      forward: { ...stored.forward },
-      right: { ...stored.right },
-      updatedAt: Number(stored.updatedAt) || 0,
-    };
+    const record = validatedStoredProject(JSON.parse(raw));
+    if (!record) return undefined;
     lastProjects.set(key, record);
+    projectsByKind.set(projectKindKey(player, record.kind), record);
+    try {
+      world.setDynamicProperty(projectKindPropertyId(player, record.kind), JSON.stringify(record));
+      world.setDynamicProperty(lastProjectIndexPropertyId(player), JSON.stringify({
+        kind: record.kind, updatedAt: record.updatedAt,
+      }));
+    } catch (error) {
+      console.warn(`[MC Wizard] could not migrate ${player.name}'s saved project index: ${error}`);
+    }
     return record;
   } catch (error) {
     console.warn(`[MC Wizard] ignored invalid saved project for ${player.name}: ${error}`);
+    return undefined;
+  }
+}
+
+function projectFor(player, kind) {
+  const requestedKind = String(kind || "").toLowerCase();
+  const latest = lastProjectFor(player);
+  const latestForKind = latest?.kind === requestedKind ? latest : undefined;
+  const key = projectKindKey(player, requestedKind);
+  if (projectsByKind.has(key)) return newerStoredRecord(latestForKind, projectsByKind.get(key));
+  try {
+    const raw = readMigratingDynamicProperty(
+      projectKindPropertyId(player, requestedKind), legacyProjectKindPropertyId(player, requestedKind),
+    );
+    if (typeof raw !== "string" || !raw) return latestForKind;
+    const record = validatedStoredProject(JSON.parse(raw));
+    if (!record || record.kind !== requestedKind) return latestForKind;
+    projectsByKind.set(key, record);
+    return newerStoredRecord(latestForKind, record);
+  } catch (error) {
+    console.warn(`[MC Wizard] ignored invalid saved ${requestedKind} project for ${player.name}: ${error}`);
     return undefined;
   }
 }
@@ -624,7 +728,12 @@ function rememberLastProject(player, record) {
     updatedAt: Date.now(),
   };
   lastProjects.set(structurePlayerKey(player), saved);
+  projectsByKind.set(projectKindKey(player, saved.kind), saved);
   try {
+    world.setDynamicProperty(projectKindPropertyId(player, saved.kind), JSON.stringify(saved));
+    world.setDynamicProperty(lastProjectIndexPropertyId(player), JSON.stringify({
+      kind: saved.kind, updatedAt: saved.updatedAt,
+    }));
     world.setDynamicProperty(lastProjectPropertyId(player), JSON.stringify(saved));
   } catch (error) {
     console.warn(`[MC Wizard] could not persist ${player.name}'s last project: ${error}`);
@@ -635,18 +744,60 @@ function lastStructureFor(player) {
   const key = structurePlayerKey(player);
   if (lastStructures.has(key)) return lastStructures.get(key);
   try {
-    const raw = world.getDynamicProperty(lastStructurePropertyId(player));
+    const indexRaw = world.getDynamicProperty(lastStructureIndexPropertyId(player));
+    if (typeof indexRaw === "string" && indexRaw) {
+      const index = JSON.parse(indexRaw);
+      const indexedKind = String(index?.kind || "").toLowerCase();
+      const indexedRaw = indexedKind
+        ? world.getDynamicProperty(structureKindPropertyId(player, indexedKind)) : undefined;
+      const indexed = typeof indexedRaw === "string" && indexedRaw
+        ? validatedStoredStructure(JSON.parse(indexedRaw)) : undefined;
+      if (indexed?.plan.kind === indexedKind && indexed.updatedAt === Number(index.updatedAt)) {
+        lastStructures.set(key, indexed);
+        structuresByKind.set(structureKindKey(player, indexedKind), indexed);
+        return indexed;
+      }
+    }
+    const raw = readMigratingDynamicProperty(
+      lastStructurePropertyId(player), legacyLastStructurePropertyId(player),
+    );
     if (typeof raw !== "string" || !raw) return undefined;
-    const stored = JSON.parse(raw);
-    if (typeof stored.dimensionId !== "string"
-      || !validStructureVector(stored.origin, true)
-      || !validStructureVector(stored.forward)
-      || !validStructureVector(stored.right)) return undefined;
-    const record = { ...stored, plan: validateBuildStructurePlan(stored.plan) };
+    const record = validatedStoredStructure(JSON.parse(raw));
+    if (!record) return undefined;
     lastStructures.set(key, record);
+    structuresByKind.set(structureKindKey(player, record.plan.kind), record);
+    try {
+      world.setDynamicProperty(structureKindPropertyId(player, record.plan.kind), JSON.stringify(record));
+      world.setDynamicProperty(lastStructureIndexPropertyId(player), JSON.stringify({
+        kind: record.plan.kind, updatedAt: Number(record.updatedAt) || 0,
+      }));
+    } catch (error) {
+      console.warn(`[MC Wizard] could not migrate ${player.name}'s saved structure index: ${error}`);
+    }
     return record;
   } catch (error) {
     console.warn(`[MC Wizard] ignored invalid saved structure for ${player.name}: ${error}`);
+    return undefined;
+  }
+}
+
+function structureFor(player, kind) {
+  const requestedKind = String(kind || "").toLowerCase();
+  const latest = lastStructureFor(player);
+  const latestForKind = latest?.plan.kind === requestedKind ? latest : undefined;
+  const key = structureKindKey(player, requestedKind);
+  if (structuresByKind.has(key)) return newerStoredRecord(latestForKind, structuresByKind.get(key));
+  try {
+    const raw = readMigratingDynamicProperty(
+      structureKindPropertyId(player, requestedKind), legacyStructureKindPropertyId(player, requestedKind),
+    );
+    if (typeof raw !== "string" || !raw) return latestForKind;
+    const record = validatedStoredStructure(JSON.parse(raw));
+    if (!record || record.plan.kind !== requestedKind) return latestForKind;
+    structuresByKind.set(key, record);
+    return newerStoredRecord(latestForKind, record);
+  } catch (error) {
+    console.warn(`[MC Wizard] ignored invalid saved ${requestedKind} for ${player.name}: ${error}`);
     return undefined;
   }
 }
@@ -663,7 +814,12 @@ function rememberLastStructure(player, record) {
     updatedAt: Date.now(),
   };
   lastStructures.set(structurePlayerKey(player), saved);
+  structuresByKind.set(structureKindKey(player, saved.plan.kind), saved);
   try {
+    world.setDynamicProperty(structureKindPropertyId(player, saved.plan.kind), JSON.stringify(saved));
+    world.setDynamicProperty(lastStructureIndexPropertyId(player), JSON.stringify({
+      kind: saved.plan.kind, updatedAt: saved.updatedAt,
+    }));
     world.setDynamicProperty(lastStructurePropertyId(player), JSON.stringify(saved));
   } catch (error) {
     console.warn(`[MC Wizard] could not persist ${player.name}'s last structure: ${error}`);
@@ -2734,7 +2890,7 @@ function findStructureSite(player, plan, forward, right) {
 }
 
 function findModificationSite(player, plan) {
-  const previous = lastStructureFor(player);
+  const previous = structureFor(player, plan.kind);
   if (!previous || previous.dimensionId !== player.dimension.id) return undefined;
   const oldDimensions = previous.plan.dimensions;
   const shiftX = Math.round((oldDimensions.width - plan.dimensions.width) / 2);
@@ -3905,7 +4061,7 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     return;
   }
   let dimension = player.dimension;
-  const previousProject = blueprint.mode === "modify" ? lastProjectFor(player) : undefined;
+  const previousProject = blueprint.mode === "modify" ? projectFor(player, blueprint.kind) : undefined;
   const reuseProject = previousProject?.dimensionId === dimension.id ? previousProject : undefined;
   let forward = reuseProject ? { ...reuseProject.forward } : cardinalDirection(player);
   let right = reuseProject ? { ...reuseProject.right } : { x: -forward.z, z: forward.x };
@@ -5147,7 +5303,9 @@ async function giveItemsAsWizard(player, items, report, recipient) {
 
 function capabilityProgramFrame(player, program) {
   if (program.site === "active_project") {
-    const project = lastProjectFor(player) || lastStructureFor(player);
+    const project = program.targetKind
+      ? newestProjectRecord(projectFor(player, program.targetKind), structureFor(player, program.targetKind))
+      : newestProjectRecord(lastProjectFor(player), lastStructureFor(player));
     if (!project) throw new Error("the active project location is unavailable");
     if (project.dimensionId !== player.dimension.id) throw new Error("the active project is in another dimension");
     return {
@@ -5282,9 +5440,15 @@ async function executeCapabilityStep(player, step, frame) {
     return `captured ${snapshot.nearbyBlocks.length} block types and ${snapshot.nearbyEntities.length} nearby entities`;
   }
   if (step.capability === "verify.blocks") {
-    const misses = args.blocks.filter(({ target, typeId }) => (
-      player.dimension.getBlock(capabilityLocation(frame, target))?.typeId !== typeId
-    ));
+    const misses = args.blocks.filter(({ target, typeId, expectedStates = {} }) => {
+      const block = player.dimension.getBlock(capabilityLocation(frame, target));
+      if (block?.typeId !== typeId) return true;
+      const states = block.permutation.getAllStates();
+      return Object.entries(expectedStates).some(([state, expected]) => {
+        const stateName = Object.keys(states).find((name) => name === state || name.endsWith(`:${state}`));
+        return !stateName || states[stateName] !== expected;
+      });
+    });
     if (misses.length) throw new Error(`${misses.length} expected block${misses.length === 1 ? " was" : "s were"} missing`);
     return `verified ${args.blocks.length} block${args.blocks.length === 1 ? "" : "s"}`;
   }
@@ -5341,7 +5505,7 @@ function capabilityProjectSummary(program, steps) {
   if (!placements.length && !interactions.length) return undefined;
   return projectBlueprintSummary({
     title: program.title,
-    kind: program.title,
+    kind: program.targetKind || program.title,
     placements,
     interactions,
   });
@@ -5418,7 +5582,7 @@ async function executeCapabilityProgram(player, program) {
     if (failures.length) {
       const first = failures[0];
       speak(player, `I completed ${results.length} step${results.length === 1 ? "" : "s"}, but “${first.id}” needs another approach. I’m checking the world and replanning it now.`);
-      endBuildAction(token, "failed", `program ${program.title}: ${results.length}/${steps.length} steps; ${first.id}: ${first.detail}`);
+      endBuildAction(token, changedWorld ? "partial" : "failed", `program ${program.title}: ${results.length}/${steps.length} steps; ${first.id}: ${first.detail}`);
     } else {
       const explicitChecks = steps.filter(({ capability }) => capability.startsWith("verify.")).length;
       speak(player, explicitChecks
@@ -5434,7 +5598,7 @@ async function executeCapabilityProgram(player, program) {
     clearBuild(token);
     console.warn(`[MC Wizard] capability program failed: ${error}`);
     speak(player, "One part of that plan did not fit this world. I kept every useful result and I’m replanning the failed part now.");
-    endBuildAction(token, "failed", `capability program failed: ${String(error?.message || error).slice(0, 180)}`);
+    endBuildAction(token, changedWorld ? "partial" : "failed", `capability program failed: ${String(error?.message || error).slice(0, 180)}`);
   }
 }
 
