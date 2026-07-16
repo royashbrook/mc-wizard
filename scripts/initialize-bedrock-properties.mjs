@@ -7,7 +7,12 @@ const markerFile = "runtime/bedrock/.mc-wizard-properties-initialized";
 try {
   await access(markerFile);
 } catch {
-  const source = await readFile(propertiesFile, "utf8");
+  let source = "";
+  try {
+    source = await readFile(propertiesFile, "utf8");
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
   await writeFile(propertiesFile, updateServerProperties(source, {
     "server-name": "MC Wizard",
     gamemode: "creative",

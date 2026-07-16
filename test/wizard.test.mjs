@@ -51,9 +51,10 @@ let resourceManifest;
 let syncDocsScript;
 let supervisorScript;
 let adminServiceScript;
+let initialPropertiesScript;
 
 before(async () => {
-  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText, adminServiceText] = await Promise.all([
+  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText, adminServiceText, initialPropertiesText] = await Promise.all([
     loadCorpus(),
     readFile(new URL("../bedrock/behavior_packs/mc_wizard/manifest.json", import.meta.url), "utf8"),
     readFile(new URL("../bedrock/config/4e8790fe-18dc-46d1-aa31-ec78a924b717/permissions.json", import.meta.url), "utf8"),
@@ -67,6 +68,7 @@ before(async () => {
     readFile(new URL("../scripts/sync-docs.mjs", import.meta.url), "utf8"),
     readFile(new URL("../scripts/supervisor.mjs", import.meta.url), "utf8"),
     readFile(new URL("../scripts/admin-service.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/initialize-bedrock-properties.mjs", import.meta.url), "utf8"),
   ]);
   corpus = loadedCorpus;
   packManifest = JSON.parse(manifestText);
@@ -81,6 +83,7 @@ before(async () => {
   syncDocsScript = syncDocsText;
   supervisorScript = supervisorText;
   adminServiceScript = adminServiceText;
+  initialPropertiesScript = initialPropertiesText;
   wizard = createWizard({ corpus, env: {} });
 });
 
@@ -638,6 +641,7 @@ test("pins the Apple container launch to trusted open-LAN operator mode", () => 
   assert.match(containerScript, /trusted open-LAN mode/);
   assert.match(containerScript, /RFC1918 private address/);
   assert.match(containerScript, /initialize-bedrock-properties/);
+  assert.match(initialPropertiesScript, /error\.code !== "ENOENT"/);
   assert.match(containerScript, /LEVEL_NAME=mc-wizard/);
   assert.match(containerScript, /--publish "\$\{LAN_IP\}:19132:19132\/udp"/);
   assert.doesNotMatch(containerScript, /VERSION=LATEST/);
@@ -2763,6 +2767,7 @@ test("serves a loopback admin desk and sends console text without a shell", asyn
   const adminScript = await readFile(new URL("../src/admin.mjs", import.meta.url), "utf8");
   const consoleScript = await readFile(new URL("../src/bedrock-console.mjs", import.meta.url), "utf8");
   assert.match(adminScript, /MC Wizard Operator Desk/);
+  assert.match(adminScript, /import \{ runProcess as run, sendBedrockCommand, validateMinecraftCommand \} from "\.\/bedrock-console\.mjs"/);
   assert.match(consoleScript, /\["exec", "mc-wizard-bedrock", "send-command", command\]/);
   assert.match(consoleScript, /ROSETTA_SEND_SCRIPT/);
   assert.match(adminScript, /Admin panel is loopback-only/);

@@ -6,6 +6,21 @@ const STOP_WORDS = new Set([
   "please", "research", "the", "up", "wiz", "wizard", "would", "you",
 ]);
 
+const LEARNED_ACTION_TYPES = new Set([
+  "build_machine", "build_plan", "build_structure", "execute_program", "place_blueprint",
+]);
+const LEARNED_PROGRAM_CAPABILITIES = new Set([
+  "control.wait", "observe.snapshot", "player.break-blocks", "player.move", "player.place-blocks",
+  "player.use-item", "script.spawn-entity", "verify.blocks", "verify.entities",
+]);
+
+export function reusableLearnedAction(action) {
+  if (!action || !LEARNED_ACTION_TYPES.has(action.type)) return false;
+  if (action.type !== "execute_program") return true;
+  return Array.isArray(action.program?.steps) && action.program.steps.length > 0
+    && action.program.steps.every(({ capability }) => LEARNED_PROGRAM_CAPABILITIES.has(capability));
+}
+
 export function recipeKey(question) {
   return String(question || "").toLowerCase().match(/[a-z0-9]+/g)
     ?.filter((word) => !STOP_WORDS.has(word)).join(" ").slice(0, 300) || "";
@@ -24,7 +39,7 @@ export function createMemoryLearnedRecipeStore({ maxRecipes = 100 } = {}) {
     },
     async promote({ question, action, grade }) {
       const key = recipeKey(question);
-      if (!key || !action || grade < 4) return null;
+      if (!key || !reusableLearnedAction(action) || !Number.isFinite(grade) || grade < 4 || grade > 5) return null;
       const entry = {
         key,
         question: String(question).replace(/\s+/g, " ").trim().slice(0, 500),

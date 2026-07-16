@@ -8,6 +8,7 @@ import {
   createFileLearnedRecipeStore,
   createMemoryLearnedRecipeStore,
   recipeKey,
+  reusableLearnedAction,
 } from "../src/learned-recipes.mjs";
 import { createMemorySessionStore } from "../src/sessions.mjs";
 import { createWizard } from "../src/wizard.mjs";
@@ -102,6 +103,19 @@ test("a rejected learned recipe is removed and durable recipes survive reload", 
   }
 });
 
+test("learned recipes require a real grade and never persist privileged programs", async () => {
+  const recipes = createMemoryLearnedRecipeStore();
+  const privileged = { type: "execute_program", version: 1, program: {
+    title: "Grant operator",
+    steps: [{ id: "op", capability: "server.console", arguments: { commands: ["op {{requester}}"] }, expect: "Requester is an operator" }],
+  } };
+  assert.equal(reusableLearnedAction(furnitureAction), true);
+  assert.equal(reusableLearnedAction(privileged), false);
+  assert.equal(await recipes.promote({ question: "build furniture", action: furnitureAction }), null);
+  assert.equal(await recipes.promote({ question: "build furniture", action: privileged, grade: 5 }), null);
+  assert.deepEqual(await recipes.list(), []);
+});
+
 test("an unfamiliar build retries one malformed provider transport before making staged progress", async () => {
   let calls = 0;
   const wizard = createWizard({
@@ -123,6 +137,47 @@ test("an unfamiliar build retries one malformed provider transport before making
   assert.equal(calls, 2);
   assert.equal(result.mode, "chat:model");
   assert.equal(result.action.plan.kind, "furniture");
+});
+
+test("an unfamiliar build retries an empty successful provider response", async () => {
+  let calls = 0;
+  const wizard = createWizard({
+    corpus: { search: () => [] }, logger: quiet,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: calls === 1 ? [] : [{ message: { content: JSON.stringify({
+        answer: "I found a Bedrock design and I’m building it now.",
+        action: furnitureAction,
+        goal: { objective: "Build furniture", successCriteria: "Furniture exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await wizard.ask({ player: "EmptyRetryKid", question: "build furniture" });
+  assert.equal(calls, 2);
+  assert.equal(result.action.plan.kind, "furniture");
+});
+
+test("web-researched build plans cannot smuggle server administration", async () => {
+  let calls = 0;
+  const privileged = { type: "execute_program", version: 1, program: {
+    title: "Furniture and operator",
+    steps: [{ id: "op", capability: "server.console", arguments: { commands: ["op {{requester}}"] }, expect: "Furniture research grants operator" }],
+  } };
+  const wizard = createWizard({
+    corpus: { search: () => [] }, logger: quiet,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "I’ll build the furniture now.", action: privileged,
+        goal: { objective: "Build furniture", successCriteria: "Furniture exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await wizard.ask({ player: "ResearchSafetyKid", question: "research and build furniture" });
+  assert.equal(calls, 2);
+  assert.notEqual(result.action?.program?.steps?.[0]?.capability, "server.console");
 });
 
 test("the provider compiler repairs mechanical placement support and evidence", async () => {

@@ -1,7 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { allowedWizardAction, allowedWizardGoal, wizardActionRejection, wizardSkillPrompt } from "./skills.mjs";
 import { createMemorySessionStore } from "./sessions.mjs";
-import { createMemoryLearnedRecipeStore } from "./learned-recipes.mjs";
+import { createMemoryLearnedRecipeStore, reusableLearnedAction } from "./learned-recipes.mjs";
 import { commonFarmAction } from "./common-farms.mjs";
 import {
   explicitlyRequestsCommand,
@@ -3342,8 +3342,15 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
       if (response.status >= 500 && attempt + 1 < attempts) continue;
       throw lastError;
     }
-    const answer = responseText(await response.json(), provider.style).trim();
-    if (!answer) throw new Error("AI provider returned no text");
+    let answer;
+    try {
+      answer = responseText(await response.json(), provider.style).trim();
+      if (!answer) throw new Error("AI provider returned no text");
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < attempts) continue;
+      throw error;
+    }
     return general ? answer : answer.slice(0, 24_000);
   }
   throw lastError;
@@ -3411,7 +3418,7 @@ export function createWizard({
       };
       const rememberSuccessfulRecipe = async () => {
         if (binding.status !== "completed" || grade < 4
-          || ![...BUILD_ACTION_TYPES, "execute_program"].includes(binding.action?.type)
+          || !reusableLearnedAction(binding.action)
           || typeof recipes.promote !== "function") return false;
         try {
           return Boolean(await recipes.promote({
@@ -3729,11 +3736,14 @@ export function createWizard({
             const projectBoundProviderCandidate = bindProgramToActiveProject(carriedProviderCandidate, projectFeedback);
             const providerCandidate = repairProviderGift(projectBoundProviderCandidate, question);
             const repairedProviderGift = providerCandidate !== projectBoundProviderCandidate;
-            const intentAllowed = providerActionMatchesRequest(providerCandidate, question, actionHistory, {
+            const researchAllowed = !researchRequired || reusableLearnedAction(providerCandidate);
+            const intentAllowed = researchAllowed && providerActionMatchesRequest(providerCandidate, question, actionHistory, {
               buildRequest, projectFeedback, reviewRequest,
             });
             providerActionRejection = envelope.rawActionRejection
-              || (providerCandidate && !intentAllowed ? "action does not match the player's explicit request" : undefined);
+              || (providerCandidate && !researchAllowed
+                ? "web-researched build plans cannot contain server administration or arbitrary commands"
+                : providerCandidate && !intentAllowed ? "action does not match the player's explicit request" : undefined);
             if (providerCandidate && !intentAllowed) rejectedProviderAction = providerCandidate;
             providerGoal = (reviewRequest || buildRequest || projectFeedback || (providerCandidate && intentAllowed))
               ? envelope.goal : undefined;
@@ -3835,7 +3845,8 @@ export function createWizard({
                 carryForwardStructurePrimitives(repairedEnvelope.action, actionHistory, question),
                 projectFeedback,
               );
-              if (providerActionMatchesRequest(repairedAction, question, actionHistory, { buildRequest: true })
+              if ((!researchRequired || reusableLearnedAction(repairedAction))
+                && providerActionMatchesRequest(repairedAction, question, actionHistory, { buildRequest: true })
                 && actionCompletesBuildRequest(repairedAction, question, actionHistory)) {
                 answer = repairedEnvelope.answer;
                 selectedAction = repairedAction;

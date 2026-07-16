@@ -254,8 +254,9 @@ export function wizardActionRejection(value) {
     else if (value.type === "build_machine") validateMachinePlan(value.plan);
     else if (value.type === "build_plan") validateBuildPlan(value.plan);
     else if (value.type === "execute_program") {
-      const program = validateCapabilityProgram(value.program);
-      const steps = program.steps.map(normalizeRuntimeStep);
+      let program = validateCapabilityProgram(value.program);
+      let steps = program.steps.map(normalizeRuntimeStep);
+      ({ program, steps } = compileBlockEvidence(program, steps));
       if (!runtimeProgramHasEvidence(steps)) throw new Error("program lacks executable evidence for its mutations");
     }
     else return allowedWizardAction(value) ? null : "action is not registered or its arguments are invalid";
