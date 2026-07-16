@@ -95,6 +95,7 @@ test("portal intent controls ignition and can switch the same frame off", () => 
     question: "Build and light a Nether portal", answer: "Done.", action: lit, status: "completed",
     goal: { objective: "Build a portal", successCriteria: "The portal is active", status: "complete" },
   }];
+  assert.equal(classifyAction("light it up with night vision", history)?.type, "run_commands");
   for (const question of [
     "turn off the portal",
     "turn it off",
@@ -111,16 +112,632 @@ test("portal intent controls ignition and can switch the same frame off", () => 
     assert.deepEqual(off.plan.placements.at(-1), { action: "break", target: [1, 1, 0] });
   }
   const unlitHistory = [{ ...history[0], action: classifyAction("Build an unlit Nether portal") }];
-  for (const question of ["light it", "light the portal", "activate it"]) {
+  for (const question of ["light it", "light it up", "light the portal", "light up the portal", "activate it"]) {
     const activated = classifyAction(question, unlitHistory);
     assert.equal(activated.plan.mode, "modify", question);
     assert.equal(activated.plan.interactions.length, 1, question);
   }
+  const newerCastleHistory = [...unlitHistory, {
+    question: "build a castle", answer: "Built.", action: classifyAction("build a castle"), status: "completed",
+    goal: { objective: "Build a castle", successCriteria: "The castle exists", status: "complete" },
+  }];
+  for (const question of ["light the portal", "light up the nether portal", "activate my portal"]) {
+    const activated = classifyAction(question, newerCastleHistory);
+    assert.equal(activated?.plan.kind, "nether portal", question);
+    assert.equal(activated?.plan.mode, "modify", question);
+    assert.equal(activated?.plan.interactions.length, 1, question);
+  }
   assert.equal(classifyAction("Build and light another Nether portal", unlitHistory).plan.mode, undefined);
+  for (const question of ["light up the nether portal area", "place torches around the portal"]) {
+    assert.equal(classifyAction(question, unlitHistory)?.type, "place_area_torches", question);
+  }
   assert.equal(
     classifyAction("well we need to get back. so take us back to the overworld").destination,
     "overworld",
   );
+});
+
+test("natural child phrasing routes effects, area lighting, and furniture builds locally", async () => {
+  for (const question of [
+    "cast night vision on me",
+    "can you cast speed on me",
+    "make me invisible",
+    "night vision please",
+    "can you use night vision on me",
+    "can I get night vision?",
+    "put night vision on me",
+    "can you light this area up with night vision",
+  ]) {
+    assert.equal(classifyAction(question)?.type, "run_commands", question);
+  }
+  assert.equal(classifyAction("build and light a Nether portal with strength")?.type, "build_machine");
+  assert.equal(classifyAction("make me a speed bridge")?.plan?.kind, "bridge");
+  assert.notEqual(classifyAction("give me an invisibility potion")?.type, "run_commands");
+  for (const question of [
+    "light it up",
+    "can you light this place up",
+    "make it brighter",
+    "put torches around me",
+    "put some torches down around me",
+    "place torches around me",
+  ]) {
+    assert.equal(classifyAction(question)?.type, "place_area_torches", question);
+  }
+  for (const question of ["can you make a sofa?", "make a chair", "I want a desk"]) {
+    const result = await createWizard({ corpus, env: {} }).ask({ player: question, question });
+    assert.ok(result.action, question);
+  }
+  const castle = classifyAction("build a castle");
+  const castleHistory = [{
+    question: "build a castle", answer: "Built.", action: castle, status: "completed",
+    goal: { objective: "Build a castle", successCriteria: "The castle exists", status: "active" },
+    requestId: "castle-request", goalId: "castle-goal",
+  }];
+  for (const question of ["light up this area", "put torches around me", "can you light this place up"]) {
+    assert.equal(classifyAction(question, castleHistory)?.type, "place_area_torches", question);
+  }
+  for (const question of ["light up the castle", "can you light up the castle", "light up my castle", "light the castle up"]) {
+    const action = classifyAction(question, castleHistory);
+    assert.equal(action?.type, "build_structure", question);
+    assert.equal(action?.plan.mode, "modify", question);
+    assert.ok(action?.plan.primitives.some(({ blockId }) => blockId === "minecraft:sea_lantern"), question);
+  }
+  const torches = classifyAction("add torches to the castle", castleHistory);
+  assert.equal(torches?.type, "execute_program");
+  assert.equal(torches?.program.site, "active_project");
+  assert.equal(torches?.program.targetKind, "castle");
+  assert.ok(torches?.program.steps[0].arguments.blocks.every(({ itemId }) => itemId === "minecraft:torch"));
+  for (const question of [
+    "light up this area near the portal",
+    "can you light this place up near my portal",
+    "put torches around the portal",
+  ]) {
+    assert.equal(classifyAction(question, castleHistory)?.type, "place_area_torches", question);
+  }
+  const existingPortalHistory = [...castleHistory, {
+    question: "build a nether portal", answer: "Built.", action: classifyAction("build a nether portal"), status: "completed",
+  }];
+  for (const question of [
+    "light up this area near the nether portal",
+    "can you light this place up near my nether portal",
+    "brighten the area by the nether portal",
+  ]) {
+    assert.equal(classifyAction(question, existingPortalHistory)?.type, "place_area_torches", question);
+  }
+
+  for (const question of ["make the castle brighter", "make my castle brighter", "brighten the castle"]) {
+    const action = classifyAction(question, castleHistory);
+    assert.equal(action?.type, "build_structure", question);
+    assert.equal(action?.plan.kind, "castle", question);
+    assert.equal(action?.plan.mode, "modify", question);
+    assert.ok(action?.plan.primitives.some(({ blockId }) => blockId === "minecraft:sea_lantern"), question);
+  }
+
+  const portalHistory = [...castleHistory, {
+    question: "build a nether portal", answer: "Built.",
+    action: classifyAction("build a nether portal"), status: "completed",
+    goal: { objective: "Build a portal", successCriteria: "The portal exists", status: "active" },
+    requestId: "portal-request", goalId: "portal-goal",
+  }];
+  const houseHistory = [...castleHistory, {
+    question: "build a house", answer: "Built.",
+    action: classifyAction("build a house"), status: "completed",
+    goal: { objective: "Build a house", successCriteria: "The house exists", status: "active" },
+    requestId: "house-request", goalId: "house-goal",
+  }];
+  for (const history of [portalHistory, houseHistory]) {
+    const action = classifyAction("light up the castle", history);
+    assert.equal(action?.type, "build_structure");
+    assert.equal(action?.plan.kind, "castle");
+    assert.equal(action?.plan.mode, "modify");
+  }
+  const bridgeHistory = [...castleHistory, {
+    question: "build a bridge", answer: "Built.",
+    action: classifyAction("build a bridge"), status: "completed",
+    goal: { objective: "Build a bridge", successCriteria: "The bridge exists", status: "active" },
+    requestId: "bridge-request", goalId: "bridge-goal",
+  }];
+  for (const question of [
+    "add a powered bridge to the castle",
+    "add a redstone-powered bridge to the castle",
+    "add a redstone bridge to the castle",
+  ]) {
+    const action = classifyAction(question, bridgeHistory);
+    assert.equal(action?.type, "build_structure", question);
+    assert.equal(action?.plan.kind, "castle", question);
+    assert.equal(action?.plan.mode, "modify", question);
+    assert.ok(action?.plan.primitives.some(({ blockId }) => blockId === "minecraft:redstone_lamp"), question);
+  }
+  for (const question of [
+    "repair the bridge to the castle",
+    "make the bridge from the castle wider",
+    "add lights to the bridge from the castle",
+  ]) {
+    const action = classifyAction(question, bridgeHistory);
+    assert.equal(action?.type, "build_structure", question);
+    assert.equal(action?.plan.kind, "bridge", question);
+    assert.equal(action?.plan.mode, "modify", question);
+  }
+  assert.notEqual(classifyAction("replace the bridge from the castle", bridgeHistory)?.plan?.kind, "castle");
+  const sessions = createMemorySessionStore();
+  await sessions.set("NamedCastleKid", "wizard", portalHistory);
+  const resumed = await createWizard({ corpus, sessions, env: {} }).ask({
+    player: "NamedCastleKid", question: "light up the castle",
+  });
+  assert.equal(resumed.action?.type, "build_structure");
+  assert.equal(resumed.action?.plan.kind, "castle");
+  assert.equal(resumed.goal?.objective, "Build a castle");
+  assert.equal(resumed.goalId, "castle-goal");
+  assert.notEqual(resumed.mode, "planning-deferred");
+});
+
+test("a repaired model plan keeps an explicitly named older project target", async () => {
+  const sessions = createMemorySessionStore();
+  const player = "BridgeMoveKid";
+  const completed = (question, requestId) => ({
+    question,
+    answer: "Done.",
+    action: classifyAction(question),
+    status: "completed",
+    requestId,
+    goalId: `${requestId}-goal`,
+    goal: { objective: question, successCriteria: `${question} exists`, status: "complete" },
+  });
+  await sessions.set(player, "wizard", [
+    completed("build a bridge", "bridge"),
+    completed("build a castle", "castle"),
+    completed("build a house", "house"),
+  ]);
+  const blocks = [{
+    itemId: "minecraft:stone_bricks",
+    target: [0, 0, 0],
+    support: [0, -1, 0],
+    expectedType: "minecraft:stone_bricks",
+  }];
+  let calls = 0;
+  const wizard = createWizard({
+    corpus,
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      if (calls === 1) {
+        return modelResponse("I’m working out the move.", null, {
+          objective: "Move the bridge",
+          successCriteria: "The bridge is moved and verified",
+          status: "active",
+        });
+      }
+      return modelResponse("I’ll move that same bridge now.", {
+        type: "execute_program",
+        version: 1,
+        program: {
+          title: "Move the bridge",
+          steps: [{
+            id: "move_bridge",
+            capability: "player.place-blocks",
+            arguments: { blocks },
+            expect: "The bridge has moved.",
+          }, {
+            id: "verify_bridge",
+            capability: "verify.blocks",
+            arguments: { blocks: [{ target: [0, 0, 0], typeId: "minecraft:stone_bricks" }] },
+            expect: "The moved bridge is present.",
+          }],
+        },
+      }, {
+        objective: "Move the bridge",
+        successCriteria: "The bridge is moved and verified",
+        status: "active",
+      });
+    },
+  });
+
+  const result = await wizard.ask({ player, question: "move the bridge from the castle" });
+  assert.equal(calls, 2);
+  assert.equal(result.action?.type, "execute_program");
+  assert.equal(result.action?.program.site, "active_project");
+  assert.equal(result.action?.program.targetKind, "bridge");
+});
+
+test("a universal program refinement keeps the named older program project and goal", async () => {
+  const sessions = createMemorySessionStore();
+  const player = "StableProgramKid";
+  const completedProgram = (title, requestId) => ({
+    question: `build a ${title.toLowerCase()}`,
+    answer: "Done.",
+    action: {
+      type: "execute_program", version: 1, program: {
+        title, site: "nearby", steps: [{
+          id: "place", capability: "player.place-blocks",
+          arguments: { blocks: [{
+            itemId: "minecraft:stone", target: [0, 0, 0], support: [0, -1, 0],
+            expectedType: "minecraft:stone",
+          }] },
+          expect: "The project block is placed.",
+        }, {
+          id: "verify", capability: "verify.blocks",
+          arguments: { blocks: [{ target: [0, 0, 0], typeId: "minecraft:stone" }] },
+          expect: "The project block remains.",
+        }],
+      },
+    },
+    status: "completed",
+    requestId,
+    goalId: `${requestId}-goal`,
+    goal: { objective: `Build ${title}`, successCriteria: `${title} exists`, status: "complete" },
+  });
+  await sessions.set(player, "wizard", [
+    completedProgram("Horse Stable", "stable"),
+    completedProgram("Gazebo", "gazebo"),
+  ]);
+  const roof = [{
+    itemId: "minecraft:oak_planks", target: [0, 3, 0], support: [0, 2, 0],
+    expectedType: "minecraft:oak_planks",
+  }, {
+    itemId: "minecraft:oak_planks", target: [1, 3, 0], support: [0, 3, 0],
+    expectedType: "minecraft:oak_planks",
+  }];
+  const wizard = createWizard({
+    corpus,
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => modelResponse("I’ll roof that stable now.", {
+      type: "execute_program", version: 1, program: {
+        title: "Roof Horse Stable", steps: [{
+          id: "place_roof", capability: "player.place-blocks", arguments: { blocks: roof },
+          expect: "The stable roof is placed.",
+        }, {
+          id: "verify_roof", capability: "verify.blocks",
+          arguments: { blocks: roof.map(({ target, expectedType }) => ({ target, typeId: expectedType })) },
+          expect: "The stable roof remains.",
+        }],
+      },
+    }, {
+      objective: "Roof the horse stable", successCriteria: "The horse stable has a roof", status: "active",
+    }),
+  });
+
+  const result = await wizard.ask({ player, question: "add a roof to the horse stable" });
+  assert.equal(result.action?.program.site, "active_project");
+  assert.equal(result.action?.program.targetKind, "horse stable");
+  assert.equal(result.goalId, "stable-goal");
+  assert.equal(result.goal.objective, "Build Horse Stable");
+});
+
+test("a named older fixed blueprint binds its exact persisted project id", async () => {
+  const sessions = createMemorySessionStore();
+  const player = "OlderFarmKid";
+  const completed = (question, id, requestId) => ({
+    question, answer: "Done.", action: { type: "place_blueprint", id, version: 1 },
+    status: "completed", requestId, goalId: `${requestId}-goal`,
+    goal: { objective: question, successCriteria: `${question} works`, status: "complete" },
+  });
+  await sessions.set(player, "wizard", [
+    completed("build a wool farm", "automatic_wool_farm", "wool"),
+    completed("build a chicken farm", "automated_chicken_farm", "chicken"),
+  ]);
+  const torch = {
+    itemId: "minecraft:torch", target: [1, 1, 1], support: [1, 0, 1],
+    expectedType: "minecraft:torch",
+  };
+  const wizard = createWizard({
+    corpus, sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => modelResponse("I’ll light the wool farm.", {
+      type: "execute_program", version: 1, program: {
+        title: "Light Wool Farm", steps: [{
+          id: "place_light", capability: "player.place-blocks", arguments: { blocks: [torch] },
+          expect: "The wool farm is lit.",
+        }, {
+          id: "verify_light", capability: "verify.blocks",
+          arguments: { blocks: [{ target: torch.target, typeId: torch.expectedType }] },
+          expect: "The torch remains.",
+        }],
+      },
+    }, null),
+  });
+
+  const result = await wizard.ask({ player, question: "add lighting to the wool farm" });
+  assert.equal(result.action?.program.targetKind, "automatic_wool_farm");
+  assert.equal(result.goalId, "wool-goal");
+  assert.equal(result.goal.objective, "build a wool farm");
+});
+
+test("provider server commands must match the requested administration operation", async () => {
+  const resultFor = async (question, action) => createWizard({
+      corpus,
+      env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+      fetchImpl: async () => modelResponse("I’ll change it now.", action, {
+        objective: question, successCriteria: "The requested server operation is complete", status: "active",
+      }),
+    }).ask({ player: "AdminIntentKid", question });
+  const wrongAllowlist = {
+      type: "execute_program", version: 1, program: {
+        title: "Change server difficulty", steps: [{
+          id: "wrong_server_change", capability: "server.console",
+          arguments: { commands: ["allowlist remove Alice"] },
+          expect: "The server is updated.",
+        }],
+      },
+    };
+  assert.equal((await resultFor("change the server difficulty to peaceful", wrongAllowlist)).action, null);
+  assert.equal((await resultFor("change the server difficulty to peaceful", {
+    type: "execute_program", version: 1, program: {
+      title: "Wrong difficulty", steps: [{
+        id: "wrong_difficulty", capability: "server.console", arguments: { commands: ["difficulty hard"] },
+        expect: "The difficulty is changed.",
+      }],
+    },
+  })).action, null);
+  assert.equal((await resultFor("enable education features", {
+    type: "execute_program", version: 1, program: {
+      title: "Wrong configuration", steps: [{
+        id: "wrong_config", capability: "server.configure",
+        arguments: { properties: { difficulty: "hard" } }, expect: "The server is configured.",
+      }],
+    },
+  })).action, null);
+  const education = await resultFor("enable education features", {
+    type: "execute_program", version: 1, program: {
+      title: "Enable education", steps: [{
+        id: "enable_education", capability: "server.configure",
+        arguments: { worldOptions: { educationFeaturesEnabled: true, eduOffer: 1 } },
+        expect: "Education features are enabled after restart.",
+      }],
+    },
+  });
+  assert.equal(education.action?.program.steps[0].capability, "server.configure");
+  assert.equal((await resultFor("make the chickens stay put", {
+    type: "run_commands", version: 1, commands: ["gamemode creative @s"],
+  })).action, null);
+});
+
+test("a terminal result interrupted before replay persistence recovers instead of hard-stopping", async () => {
+  const sessions = createMemorySessionStore();
+  const player = "RestartRecoveryKid";
+  const requestId = "recover-program";
+  await sessions.set(player, "wizard", [{
+    question: "build a marker",
+    answer: "I’ll build it.",
+    action: {
+      type: "execute_program", version: 1, program: {
+        title: "Marker", steps: [{
+          id: "place", capability: "player.place-blocks",
+          arguments: { blocks: [{
+            itemId: "minecraft:stone", target: [0, 0, 0], support: [0, -1, 0],
+            expectedType: "minecraft:stone",
+          }] },
+          expect: "The marker is placed.",
+        }, {
+          id: "verify", capability: "verify.blocks",
+          arguments: { blocks: [{ target: [0, 0, 0], typeId: "minecraft:stone" }] },
+          expect: "The marker remains.",
+        }],
+      },
+    },
+    status: "pending",
+    requestId,
+    goalId: "marker-goal",
+    goal: { objective: "Build a marker", successCriteria: "The marker exists", status: "active" },
+  }]);
+  await sessions.updateAction(player, "wizard", { requestId, status: "completed", detail: "verified" });
+  const restarted = createWizard({ corpus, sessions, env: {} });
+
+  const recovered = await restarted.recordActionResult({ player, requestId, status: "completed", detail: "verified" });
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.updated, true);
+  assert.equal(recovered.reviewDeferred, true);
+  const replayed = await restarted.recordActionResult({ player, requestId, status: "completed", detail: "verified" });
+  assert.equal(replayed.replayed, true);
+  assert.equal(replayed.reviewDeferred, true);
+
+  await restarted.clearSession(player);
+  await sessions.set(player, "wizard", [{
+    question: "take me to the Nether",
+    answer: "Off we go.",
+    action: { type: "dimension_travel", version: 1, destination: "nether" },
+    status: "pending",
+    requestId,
+    goalId: "travel-goal",
+    goal: { objective: "Travel to the Nether", successCriteria: "The player arrives", status: "active" },
+  }]);
+  const afterClear = await restarted.recordActionResult({
+    player, requestId, status: "completed", detail: "arrived",
+  });
+  assert.equal(afterClear.replayed, undefined);
+  assert.equal(afterClear.review?.goal.status, "complete");
+});
+
+test("a transient replan write failure releases its sequence so terminal recovery can retry", async () => {
+  const baseSessions = createMemorySessionStore();
+  let failNextAppend = false;
+  const sessions = {
+    ...baseSessions,
+    async appendIfCurrent(...args) {
+      if (failNextAppend) {
+        failNextAppend = false;
+        throw new Error("transient persistence failure");
+      }
+      return baseSessions.appendIfCurrent(...args);
+    },
+  };
+  const wizard = createWizard({ corpus, sessions, env: {} });
+  const first = await wizard.ask({
+    player: "PersistenceKid", question: "give me night vision", requestId: "night-vision-recovery",
+  });
+  failNextAppend = true;
+  await assert.rejects(wizard.recordActionResult({
+    player: "PersistenceKid", requestId: first.requestId, status: "failed", detail: "effect command failed",
+  }), /transient persistence failure/);
+
+  const recovered = await wizard.recordActionResult({
+    player: "PersistenceKid", requestId: first.requestId, status: "failed", detail: "effect command failed",
+  });
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.superseded, undefined);
+  assert.ok(recovered.replan?.action || recovered.retry, "terminal recovery must make another attempt");
+});
+
+test("a terminal replay write failure recovers an already-persisted completion review", async () => {
+  const baseSessions = createMemorySessionStore();
+  let failNextResultWrite = true;
+  const sessions = {
+    ...baseSessions,
+    async setActionResult(...args) {
+      if (failNextResultWrite) {
+        failNextResultWrite = false;
+        throw new Error("disk full");
+      }
+      return baseSessions.setActionResult(...args);
+    },
+  };
+  const firstWizard = createWizard({ corpus, sessions, env: {} });
+  const first = await firstWizard.ask({
+    player: "ReplayPersistenceKid", question: "give me night vision", requestId: "effect-completion",
+  });
+  await assert.rejects(firstWizard.recordActionResult({
+    player: "ReplayPersistenceKid", requestId: first.requestId,
+    status: "completed", detail: "effect applied",
+  }), /disk full/);
+
+  const restarted = createWizard({ corpus, sessions, env: {} });
+  const recovered = await restarted.recordActionResult({
+    player: "ReplayPersistenceKid", requestId: first.requestId,
+    status: "completed", detail: "effect applied",
+  });
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.superseded, undefined);
+  assert.equal(recovered.review?.goal.status, "complete");
+  assert.equal(baseSessions.getActionResult("ReplayPersistenceKid", "wizard", first.requestId)?.review?.goal.status, "complete");
+});
+
+test("a terminal replay write failure returns its already-persisted automatic replan", async () => {
+  const baseSessions = createMemorySessionStore();
+  let failNextResultWrite = true;
+  const sessions = {
+    ...baseSessions,
+    async setActionResult(...args) {
+      if (failNextResultWrite) {
+        failNextResultWrite = false;
+        throw new Error("disk full");
+      }
+      return baseSessions.setActionResult(...args);
+    },
+  };
+  const firstWizard = createWizard({ corpus, sessions, env: {} });
+  const first = await firstWizard.ask({
+    player: "FailedReplayKid", question: "give me night vision", requestId: "failed-effect",
+  });
+  await assert.rejects(firstWizard.recordActionResult({
+    player: "FailedReplayKid", requestId: first.requestId,
+    status: "failed", detail: "effect command failed",
+  }), /disk full/);
+
+  const restarted = createWizard({ corpus, sessions, env: {} });
+  const recovered = await restarted.recordActionResult({
+    player: "FailedReplayKid", requestId: first.requestId,
+    status: "failed", detail: "effect command failed",
+  });
+  assert.equal(recovered.recovered, true);
+  assert.equal(recovered.superseded, undefined);
+  assert.ok(recovered.replan?.action, "the child must receive the replan that was already saved");
+  assert.equal(recovered.replan.requestId, baseSessions.get("FailedReplayKid", "wizard").at(-1).requestId);
+});
+
+test("provider power intent scans nested execute commands instead of only the first verb", async () => {
+  const actions = [{
+    type: "run_commands", version: 1,
+    commands: ["execute as @e run kill @e[type=chicken]"],
+  }, {
+    type: "run_commands", version: 1,
+    commands: ["kill @e[type=!chicken]"],
+  }, {
+    type: "execute_program", version: 1, program: {
+      title: "Make the mess vanish",
+      steps: [{
+        id: "nested_kill", capability: "world.command",
+        arguments: { commands: ["execute as @s run kill @e"] },
+        expect: "The mess is gone.",
+      }],
+    },
+  }, {
+    type: "execute_program", version: 1, program: {
+      title: "Freeze the chickens",
+      steps: [{
+        id: "nested_damage", capability: "world.command",
+        arguments: { commands: ["execute as @s run damage @e[type=chicken] 100000 entity_attack"] },
+        expect: "The chickens stay put.",
+      }],
+    },
+  }, {
+    type: "execute_program", version: 1, program: {
+      title: "Remove the floor",
+      steps: [{
+        id: "nested_fill_air", capability: "world.command",
+        arguments: { commands: ["execute as @s at @s run fill ~-32 ~-32 ~-32 ~32 ~32 ~32 air"] },
+        expect: "The chickens stay put.",
+      }],
+    },
+  }, ...[
+    "execute as @s run tp @a ~ ~-100 ~",
+    "execute as @s run effect @a fatal_poison 999999 255 true",
+    "execute as @s run summon wither ~ ~ ~",
+    "execute as @s run scoreboard players set @a pwned 1",
+  ].map((command, index) => ({
+    type: "execute_program", version: 1, program: {
+      title: `Unrelated power ${index}`,
+      steps: [{
+        id: `unrelated_${index}`, capability: "world.command",
+        arguments: { commands: [command] }, expect: "The chickens stay put.",
+      }],
+    },
+  })), {
+    type: "execute_program", version: 1, program: {
+      title: "Move the kid instead", steps: [{
+        id: "move_kid", capability: "script.teleport",
+        arguments: { subject: "requester", target: [100, 0, 0] },
+        expect: "The chickens stay put.",
+      }],
+    },
+  }, {
+    type: "execute_program", version: 1, program: {
+      title: "Remove the floor instead", steps: [{
+        id: "break_floor", capability: "player.break-blocks",
+        arguments: { targets: [[0, 0, 0], [1, 0, 0]] },
+        expect: "The chickens stay put.",
+      }],
+    },
+  }, {
+    type: "execute_program", version: 1, program: {
+      title: "Slow the chickens",
+      steps: [{
+        id: "slow_chickens", capability: "world.command",
+        arguments: { commands: ["effect @e[type=chicken] slowness 20 10 true"] },
+        expect: "The chickens stay put.",
+      }],
+    },
+  }];
+  for (const [index, action] of actions.slice(0, -1).entries()) {
+    const wizard = createWizard({
+      corpus,
+      env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+      fetchImpl: async () => modelResponse("I’ll make that happen.", action, null),
+    });
+    const result = await wizard.ask({
+      player: `PowerIntentKid${index}`, question: "make the chickens stay put",
+    });
+    assert.equal(result.action, null);
+  }
+  const relevant = actions.at(-1);
+  const wizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => modelResponse("I’ll slow the chickens.", relevant, null),
+  });
+  assert.equal((await wizard.ask({ player: "RelevantPowerKid", question: "make the chickens stay put" }))
+    .action?.program.steps[0].id, "slow_chickens");
 });
 
 test("common fused chat words still route to local travel and portal actions", () => {
@@ -952,27 +1569,28 @@ test("uses semantic review when the fresh structure snapshot is not an exact pla
   const sessions = createMemorySessionStore();
   const requests = [];
   let call = 0;
+  const fetchImpl = async (_url, options) => {
+    requests.push(JSON.parse(options.body).messages[1].content);
+    call += 1;
+    return call === 1
+      ? modelResponse("I’ll build the city.", {
+          type: "build_structure", version: 1, plan: cityPlan(),
+        }, {
+          objective: "Build a complete city",
+          successCriteria: "Several buildings and connected streets are visible nearby",
+          status: "active",
+        })
+      : modelResponse("The city passes its world-state check.", null, {
+          objective: "Build a complete city",
+          successCriteria: "Several buildings and connected streets are visible nearby",
+          status: "complete",
+        });
+  };
   const wizard = createWizard({
     corpus,
     sessions,
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
-    fetchImpl: async (_url, options) => {
-      requests.push(JSON.parse(options.body).messages[1].content);
-      call += 1;
-      return call === 1
-        ? modelResponse("I’ll build the city.", {
-            type: "build_structure", version: 1, plan: cityPlan(),
-          }, {
-            objective: "Build a complete city",
-            successCriteria: "Several buildings and connected streets are visible nearby",
-            status: "active",
-          })
-        : modelResponse("The city passes its world-state check.", null, {
-            objective: "Build a complete city",
-            successCriteria: "Several buildings and connected streets are visible nearby",
-            status: "complete",
-          });
-    },
+    fetchImpl,
   });
   const first = await wizard.ask({ player: "ReviewKid", question: "Build a city" });
   const outcome = await wizard.recordActionResult({
@@ -999,11 +1617,18 @@ test("uses semantic review when the fresh structure snapshot is not an exact pla
   assert.equal(turns[0].goalId, turns[1].goalId);
   assert.equal(turns[1].goal.status, "complete");
 
-  const duplicate = await wizard.recordActionResult({
+  const restartedWizard = createWizard({
+    corpus,
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl,
+  });
+  const duplicate = await restartedWizard.recordActionResult({
     player: "ReviewKid", requestId: first.requestId, status: "completed", context: liveContext,
   });
   assert.equal(duplicate.updated, false);
-  assert.equal(duplicate.review, undefined);
+  assert.equal(duplicate.replayed, true);
+  assert.equal(duplicate.review.goal.status, "complete");
   assert.equal(call, 2);
 });
 
@@ -1163,6 +1788,89 @@ test("semantic review cannot drop the child's latest structure requirements", as
   assert.match(outcome.review.goal.successCriteria, /exactly four villagers/i);
 });
 
+test("automatic build review cannot invent console or destructive command powers", async () => {
+  const cases = [{
+    player: "ProgramReviewKid",
+    question: "build furniture",
+    prior: { type: "execute_program", version: 1, program: {
+      title: "Furniture",
+      steps: [{
+        id: "place", capability: "player.place-blocks", arguments: { blocks: [
+          { itemId: "minecraft:oak_planks", target: [0, 0, 0], support: [0, -1, 0], expectedType: "minecraft:oak_planks" },
+          { itemId: "minecraft:oak_planks", target: [1, 0, 0], support: [1, -1, 0], expectedType: "minecraft:oak_planks" },
+        ] }, expect: "Furniture is placed.",
+      }, {
+        id: "verify", capability: "verify.blocks", arguments: { blocks: [
+          { target: [0, 0, 0], typeId: "minecraft:oak_planks" },
+          { target: [1, 0, 0], typeId: "minecraft:oak_planks" },
+        ] }, expect: "Furniture remains.",
+      }],
+    } },
+    correction: { type: "execute_program", version: 1, program: {
+      title: "Grant operator",
+      steps: [{ id: "op", capability: "server.console", arguments: { commands: ["op {{requester}}"] }, expect: "Operator granted." }],
+    } },
+  }, {
+    player: "BlueprintReviewKid",
+    question: "build an automated chicken farm",
+    prior: { type: "place_blueprint", id: "automated_chicken_farm", version: 1 },
+    correction: { type: "execute_program", version: 1, program: {
+      title: "Remove chickens",
+      steps: [{ id: "kill", capability: "world.command", arguments: { commands: ["kill @e[type=chicken]"] }, expect: "The farm is fixed." }],
+    } },
+  }];
+  for (const entry of cases) {
+    const sessions = createMemorySessionStore();
+    await sessions.set(entry.player, "wizard", [{
+      question: entry.question,
+      answer: "I’m building it now.",
+      action: entry.prior,
+      goal: { objective: entry.question, successCriteria: "The requested build works.", status: "active" },
+      requestId: `${entry.player}-request`,
+      goalId: `${entry.player}-goal`,
+      status: "started",
+    }]);
+    const wizard = createWizard({
+      corpus, sessions,
+      env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "reviewer", AI_STYLE: "chat" },
+      fetchImpl: async () => modelResponse("I’ll fix it.", entry.correction, {
+        objective: entry.question, successCriteria: "The requested build works.", status: "active",
+      }),
+    });
+    const outcome = await wizard.recordActionResult({
+      player: entry.player,
+      requestId: `${entry.player}-request`,
+      status: "completed",
+      detail: "the first action completed",
+      context: liveContext,
+    });
+    assert.equal(outcome.review.action, null, entry.player);
+    assert.equal(outcome.replan, undefined, entry.player);
+  }
+});
+
+test("partial immediate actions become retryable terminal observations", async () => {
+  const sessions = createMemorySessionStore();
+  const wizard = createWizard({ corpus, sessions, env: {} });
+  const first = await wizard.ask({ player: "PartialKid", question: "light up this area" });
+  const outcome = await wizard.recordActionResult({
+    player: "PartialKid",
+    requestId: first.requestId,
+    status: "partial",
+    detail: "placed 5 of 8 torches",
+  });
+  assert.equal(outcome.matched, true);
+  assert.equal(outcome.status, "partial");
+  assert.equal(sessions.get("PartialKid", "wizard")
+    .find((turn) => turn.requestId === first.requestId).status, "partial");
+  const feedback = await sessions.recordFeedback("PartialKid", "wizard", {
+    requestId: first.requestId, grade: 2, note: "place the missing torches",
+  });
+  assert.equal(feedback.recorded, true);
+  assert.equal(feedback.pending, undefined);
+  assert.equal(outcome.replan.action.type, "place_area_torches");
+});
+
 test("bounds automatic completion reviews without falsely completing the goal", async () => {
   let reviews = 0;
   const wizard = createWizard({
@@ -1277,8 +1985,76 @@ test("a failed build automatically replans the active goal with a bounded retry"
     player: "RetryKid", requestId: first.requestId, status: "failed", detail: "duplicate report",
   });
   assert.equal(duplicate.updated, false);
-  assert.equal(duplicate.replan, undefined);
+  assert.equal(duplicate.replayed, true);
+  assert.deepEqual(duplicate.replan, outcome.replan);
   assert.equal(call, 2);
+});
+
+test("executor-verified actions complete once without semantic retry loops", async () => {
+  const sessions = createMemorySessionStore();
+  let providerCalls = 0;
+  const wizard = createWizard({
+    corpus,
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalls += 1;
+      throw new Error("executor-verified completion must not call the provider");
+    },
+  });
+  const action = await wizard.ask({
+    player: "VerifiedCommandKid", question: "give me night vision", requestId: "night-vision",
+  });
+  assert.equal(action.action.type, "run_commands");
+  const outcome = await wizard.recordActionResult({
+    player: "VerifiedCommandKid",
+    requestId: action.requestId,
+    status: "completed",
+    detail: "executed 1 of 1 requester-scoped commands",
+  });
+  assert.equal(outcome.review.goal.status, "complete");
+  assert.equal(outcome.review.mode, "local-executor-verification");
+  assert.equal(outcome.replan, undefined);
+  assert.equal(providerCalls, 0);
+});
+
+test("a capability program completion does not close its whole goal without world review", async () => {
+  const sessions = createMemorySessionStore();
+  await sessions.set("ProgramKid", "wizard", [{
+    question: "Build a whole playground",
+    answer: "I’ll build and check it.",
+    action: {
+      type: "execute_program", version: 1, program: {
+        title: "Playground start",
+        steps: [{
+          id: "place_block", capability: "player.place-blocks",
+          arguments: { blocks: [{
+            itemId: "minecraft:stone", target: [0, 0, 0], support: [0, -1, 0],
+            expectedType: "minecraft:stone", expectedStates: {},
+          }] },
+          expect: "One foundation block exists.", onFailure: "replan",
+        }, {
+          id: "verify_block", capability: "verify.blocks",
+          arguments: { blocks: [{ target: [0, 0, 0], typeId: "minecraft:stone" }] },
+          expect: "The foundation block is present.", onFailure: "replan",
+        }],
+      },
+    },
+    goal: {
+      objective: "Build a whole playground",
+      successCriteria: "A complete playground with several usable activities exists.",
+      status: "active",
+    },
+    goalId: "playground-goal", requestId: "playground-program", status: "pending",
+  }]);
+  const wizard = createWizard({ corpus, sessions, env: {} });
+  const outcome = await wizard.recordActionResult({
+    player: "ProgramKid", requestId: "playground-program", status: "completed",
+    detail: "completed 2/2 steps with explicit checks passed",
+  });
+  assert.equal(outcome.review, undefined);
+  assert.equal(outcome.reviewDeferred, true);
+  assert.equal(sessions.get("ProgramKid", "wizard")[0].goal.status, "active");
 });
 
 test("failed travel and fixed blueprints retry the exact child contract on the same goal", async () => {

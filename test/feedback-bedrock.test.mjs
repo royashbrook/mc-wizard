@@ -152,7 +152,7 @@ test("blank low grades ask for detail and blank high grades end with thanks", ()
 test("feedback prompts queue and only matched terminal actions become gradable", () => {
   assert.match(pack, /const queuedFeedback = new Map\(\)/);
   const lifecycle = section("async function postActionResult", "function registerActionRequest");
-  assert.match(lifecycle, /if \(result\.updated === false\) \{\n\s+if \(result\.matched\) queueFeedback\(report\)/);
+  assert.match(lifecycle, /if \(result\.updated === false && !result\.replayed\) \{\n\s+if \(result\.matched\) queueFeedback\(report\)/);
   const exhausted = lifecycle.slice(lifecycle.indexOf("if (attempt === 2)"));
   assert.doesNotMatch(exhausted, /queueFeedback\(report\)/);
   assert.match(pack, /queuedFeedback\.delete\(event\.playerId\)/);

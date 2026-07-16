@@ -24,7 +24,7 @@ function requestId(value, player) {
 }
 
 function actionLabel(action, player) {
-  return privateText(action?.id || action?.plan?.title || action?.title || action?.type, 120, player);
+  return privateText(action?.id || action?.plan?.title || action?.program?.title || action?.title || action?.type, 120, player);
 }
 
 function goalId(result, player) {
@@ -43,6 +43,7 @@ export function createInteractionLog({
     throw new Error("interaction log maxBytes must be at least 65536");
   }
   let pending = Promise.resolve();
+  const timings = new Map();
   const playerHash = (player) => createHmac("sha256", salt).update(String(player)).digest("hex");
   const append = (entry) => {
     pending = pending.catch(() => {}).then(async () => {
@@ -82,21 +83,34 @@ export function createInteractionLog({
   return {
     recordAsk({ player, question, mode, requestId: suppliedRequestId, result }) {
       const id = requestId(result?.requestId, player) || requestId(suppliedRequestId, player);
+      const timestamp = now();
+      const hash = playerHash(player);
       const goal = goalId(result, player);
       const label = privateText(result?.actionLabel, 120, player) || actionLabel(result?.action, player);
+      const responseMode = privateText(result?.mode, 64, player);
+      const actionType = privateText(result?.action?.type, 64, player);
+      if (id) timings.set(`${hash}:${id}`, { askedAt: timestamp });
       return append({
-        timestamp: new Date(now()).toISOString(),
+        timestamp: new Date(timestamp).toISOString(),
         event: "ask",
         mode: mode === "general" ? "general" : "wizard",
-        playerHash: playerHash(player),
+        playerHash: hash,
         input: privateText(question, 800, player),
         answer: privateText(result?.answer, 12_000, player),
         ...(id && { requestId: id }),
         ...(goal && { goalId: goal }),
         ...(label && { actionLabel: label }),
+        ...(responseMode && { responseMode }),
+        ...(actionType && { actionType }),
       });
     },
     recordActionResult({ player, requestId: suppliedRequestId, status, detail, result }) {
+      const timestamp = now();
+      const hash = playerHash(player);
+      const id = requestId(suppliedRequestId, player);
+      const timingKey = id ? `${hash}:${id}` : undefined;
+      const timing = timingKey ? timings.get(timingKey) : undefined;
+      if (status === "started" && timing && !timing.startedAt) timing.startedAt = timestamp;
       const followUp = result?.replan || result?.review;
       const goal = goalId(result, player) || goalId(followUp, player);
       const label = actionLabel(followUp?.action, player);
@@ -106,22 +120,27 @@ export function createInteractionLog({
         status,
         matched: Boolean(result?.matched),
         updated: Boolean(result?.updated),
+        ...(status === "completed" && result?.matched && !result?.superseded && { success: true }),
+        ...(timing?.askedAt !== undefined && { totalMs: Math.max(0, timestamp - timing.askedAt) }),
+        ...(timing?.startedAt !== undefined && { actionMs: Math.max(0, timestamp - timing.startedAt) }),
         ...(result?.superseded && { superseded: true }),
         ...(result?.reviewDeferred && { reviewDeferred: true }),
         ...(result?.reviewLimitReached && { reviewLimitReached: true }),
         ...(result?.retryLimitReached && { retryLimitReached: true }),
       };
-      return append({
-        timestamp: new Date(now()).toISOString(),
+      const entry = append({
+        timestamp: new Date(timestamp).toISOString(),
         event: "action_result",
-        playerHash: playerHash(player),
-        requestId: requestId(suppliedRequestId, player),
+        playerHash: hash,
+        requestId: id,
         outcome,
         ...(safeDetail && { detail: safeDetail }),
         ...(answer && { answer }),
         ...(goal && { goalId: goal }),
         ...(label && { actionLabel: label }),
       });
+      if (["completed", "failed", "partial"].includes(status) && timingKey) timings.delete(timingKey);
+      return entry;
     },
     recordFeedback({ player, requestId: suppliedRequestId, grade, feedback, result }) {
       const id = requestId(result?.requestId, player) || requestId(suppliedRequestId, player);
@@ -129,7 +148,7 @@ export function createInteractionLog({
       const label = privateText(result?.actionLabel, 120, player) || actionLabel(result?.action, player);
       const note = privateText(feedback || result?.note, 500, player);
       const responseMode = privateText(result?.responseMode, 64, player);
-      const status = ["completed", "failed"].includes(result?.status) ? result.status
+      const status = ["completed", "failed", "partial"].includes(result?.status) ? result.status
         : result?.action ? "unknown" : "answered";
       const detail = privateText(result?.detail, 500, player);
       const followUpId = requestId(result?.followUp?.requestId, player);

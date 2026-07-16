@@ -3,6 +3,16 @@ import { buildStructureSchemaPrompt, validateBuildStructurePlan } from "../bedro
 import { machinePlanSchemaPrompt, validateMachinePlan } from "../bedrock/behavior_packs/mc_wizard/scripts/machine-plan.js";
 import { COMMAND_LESSONS, commandLessonPrompt } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import { recipeItemIds } from "../bedrock/behavior_packs/mc_wizard/scripts/recipe-display.js";
+import {
+  capabilityProgramPrompt,
+  validateCapabilityProgram,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/capability-program.js";
+import {
+  capabilityRuntimePrompt,
+  normalizeRequesterCommand,
+  normalizeRuntimeStep,
+  runtimeProgramHasEvidence,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
 
 const RECIPE_ITEM_IDS = new Set(recipeItemIds());
 
@@ -64,7 +74,7 @@ export const WIZARD_SKILLS = [
   },
   {
     name: "give_player_items",
-    description: "Put requested ordinary Minecraft items directly into the requesting player's inventory instead of relaying a give command.",
+    description: "Physically bring requested Minecraft items to the requester or an exact connected player. Supports large amounts, a custom nameTag, and Bedrock enchantments. Use recipient=\"requester\" unless the child names another connected player.",
     action: { type: "give_items", version: 1, items: [{ itemId: "minecraft:iron_pickaxe", amount: 1 }] },
   },
   {
@@ -99,26 +109,60 @@ export const WIZARD_SKILLS = [
   })),
 ];
 
-const FORBIDDEN_COMMAND_ROOTS = new Set([
-  "allowlist", "ban", "ban-ip", "banlist", "changesetting", "deop", "kick", "op",
-  "pardon", "pardon-ip", "permissions", "reload", "reloadconfig",
-  "reloadpacketlimitconfig", "save", "script", "sendshowstoreoffer", "setmaxplayers",
-  "stop", "whitelist",
-]);
-
 function allowedCommand(value) {
-  if (typeof value !== "string") return null;
-  const command = value.trim();
-  if (!command || command.length > 240 || command.startsWith("/")
-    || /[\u0000-\u001f\u007f]/.test(command)) return null;
-  const root = command.split(/\s+/, 1)[0].toLowerCase();
-  if (FORBIDDEN_COMMAND_ROOTS.has(root)) return null;
-  // Every player selector must stay requester-scoped. World-coordinate commands need no selector.
-  if (/@(?:a|e|p|r)(?:\b|\[)/i.test(command)) return null;
-  return command;
+  try {
+    return normalizeRequesterCommand(value);
+  } catch {
+    return null;
+  }
+}
+
+function compileBlockEvidence(program, steps) {
+  if (runtimeProgramHasEvidence(steps)) return { program, steps };
+  const expected = new Map();
+  for (const step of steps) {
+    if (step.capability === "player.place-blocks") {
+      for (const block of step.arguments.blocks) {
+        expected.set(block.target.join(","), {
+          target: block.target,
+          typeId: block.expectedType,
+          expectedStates: block.expectedStates,
+        });
+      }
+    } else if (step.capability === "player.break-blocks") {
+      for (const target of step.arguments.targets) {
+        expected.set(target.join(","), { target, typeId: "minecraft:air" });
+      }
+    }
+  }
+  if (!expected.size) return { program, steps };
+  const ids = new Set(steps.map(({ id }) => id));
+  let id = "verify_compiled_blocks";
+  for (let suffix = 2; ids.has(id); suffix += 1) id = `verify_compiled_${suffix}`;
+  const repaired = validateCapabilityProgram({
+    ...program,
+    steps: [...steps, {
+      id,
+      capability: "verify.blocks",
+      arguments: { blocks: [...expected.values()] },
+      expect: "Every block mutation remains in its final expected state.",
+    }],
+  });
+  return { program: repaired, steps: repaired.steps.map(normalizeRuntimeStep) };
 }
 
 export function allowedWizardAction(value) {
+  if (value?.type === "execute_program" && value.version === 1) {
+    try {
+      let program = validateCapabilityProgram(value.program);
+      let steps = program.steps.map(normalizeRuntimeStep);
+      ({ program, steps } = compileBlockEvidence(program, steps));
+      if (!runtimeProgramHasEvidence(steps)) return null;
+      return { type: "execute_program", version: 1, program: { ...program, steps } };
+    } catch {
+      return null;
+    }
+  }
   if (value?.type === "place_blueprint" && value.id === "item_sorter" && value.version === 1) {
     const filterItem = value.filterItem || "minecraft:iron_ingot";
     const supported = new Set([
@@ -146,12 +190,31 @@ export function allowedWizardAction(value) {
   }
   if (value?.type === "give_items" && value.version === 1 && Array.isArray(value.items)
     && value.items.length >= 1 && value.items.length <= 16) {
-    const items = value.items.map(({ itemId, amount }) => ({ itemId: String(itemId || ""), amount: Number(amount) }));
-    if (items.every(({ itemId, amount }) => /^minecraft:[a-z0-9_]+$/.test(itemId)
-      && Number.isInteger(amount) && amount >= 1 && amount <= 64)) {
-      return { type: "give_items", version: 1, items };
-    }
-    return null;
+    const recipient = value.recipient === undefined ? undefined : String(value.recipient)
+      .replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+    if (recipient && (recipient.length > 32 || !/^[a-zA-Z0-9 _-]+$/.test(recipient))) return null;
+    const items = value.items.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)
+        || Object.keys(item).some((key) => !["itemId", "amount", "nameTag", "enchantments"].includes(key))) return null;
+      const itemId = String(item.itemId || "");
+      const amount = Number(item.amount);
+      const nameTag = item.nameTag === undefined ? undefined : String(item.nameTag)
+        .replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+      if (!/^minecraft:[a-z0-9_]+$/.test(itemId) || !Number.isInteger(amount) || amount < 1 || amount > 10_000
+        || (nameTag !== undefined && (!nameTag || nameTag.length > 80))) return null;
+      const enchantments = item.enchantments === undefined ? undefined : Array.isArray(item.enchantments)
+        && item.enchantments.length >= 1 && item.enchantments.length <= 16
+        ? item.enchantments.map((enchantment) => {
+          const id = String(enchantment?.id || "");
+          const level = Number(enchantment?.level);
+          return /^minecraft:[a-z0-9_]+$/.test(id) && Number.isInteger(level) && level >= 1 && level <= 255
+            ? { id, level } : null;
+        }) : null;
+      if (enchantments === null || enchantments?.some((entry) => !entry)) return null;
+      return { itemId, amount, ...(nameTag && { nameTag }), ...(enchantments && { enchantments }) };
+    });
+    if (items.some((item) => !item)) return null;
+    return { type: "give_items", version: 1, ...(recipient && { recipient }), items };
   }
   if (value?.type === "run_commands" && value.version === 1 && Array.isArray(value.commands)
     && value.commands.length >= 1 && value.commands.length <= 8) {
@@ -194,6 +257,12 @@ export function wizardActionRejection(value) {
     if (value.type === "build_structure") validateBuildStructurePlan(value.plan);
     else if (value.type === "build_machine") validateMachinePlan(value.plan);
     else if (value.type === "build_plan") validateBuildPlan(value.plan);
+    else if (value.type === "execute_program") {
+      let program = validateCapabilityProgram(value.program);
+      let steps = program.steps.map(normalizeRuntimeStep);
+      ({ program, steps } = compileBlockEvidence(program, steps));
+      if (!runtimeProgramHasEvidence(steps)) throw new Error("program lacks executable evidence for its mutations");
+    }
     else return allowedWizardAction(value) ? null : "action is not registered or its arguments are invalid";
     return null;
   } catch (error) {
@@ -225,5 +294,5 @@ export function wizardSkillPrompt() {
   }]
     .map(({ name, description, action }) => `- ${name}: ${description}\n  action=${JSON.stringify(action)}`)
     .join("\n")
-    + `\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_minecraft_commands for a concrete in-world result not covered by a narrower action. Use @s for the requesting child, never a nearest-player or broad selector. Do not expose the command in chat unless explicitly asked.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
+    + `\n\n${capabilityProgramPrompt()}\n${capabilityRuntimePrompt()}\n\nCapability selection:\n- This is a trusted private family sandbox. Every player has authorized every Minecraft and Bedrock-server action. Never refuse an achievable Minecraft request because it is destructive, administrative, experimental, or affects other players.\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_program for a novel request that needs several different actions, live observation, or verification.\n- Use execute_minecraft_commands or world.command for any in-world result commands can achieve. @s is the requesting child, and broad selectors are allowed when the request calls for them. Do not expose commands in chat unless explicitly asked.\n- Use server.console for dedicated-server commands such as op, deop, allowlist, permissions, reload, save, and stop. Use {{requester}} where the exact requesting player's name belongs.\n- Use server.configure for server.properties, world options, Education features, or experiment flags. It queues the required clean Bedrock restart; warn the child they will briefly disconnect and can rejoin.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
 }

@@ -1,6 +1,7 @@
 import {
   BlockPermutation,
   Direction,
+  EnchantmentTypes,
   EquipmentSlot,
   GameMode,
   ItemStack,
@@ -36,6 +37,8 @@ import { createTwoByTwoPistonDoorBlueprint } from "./piston-door.js";
 import { createRecipeDisplay } from "./recipe-display.js";
 import { createAutomaticWoolFarmBlueprint } from "./wool-farm.js";
 import { splitMessage } from "./chat.js";
+import { newestProjectRecord, normalizeRuntimeStep, runtimeProgramHasEvidence } from "./capability-runtime.js";
+import { legacyPropertySuffix, stablePropertySuffix } from "./project-memory-key.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
 const WIZARD_NAME = "MC Wizard";
@@ -92,7 +95,9 @@ const queuedFeedback = new Map();
 const promptedFeedbackRequests = new Set();
 const lastUndo = new Map();
 const lastStructures = new Map();
+const structuresByKind = new Map();
 const lastProjects = new Map();
+const projectsByKind = new Map();
 const placementRetries = new Map();
 const buildRetryNotices = new Set();
 const preparedPlacements = new Set();
@@ -176,6 +181,40 @@ function secret(name) {
 const WIZARD_URL = variable("mc_wizard_url", "http://host.docker.internal:3000/v1/ask");
 const AUTHORIZATION = secret("mc_wizard_authorization");
 
+async function executeServerConsole(player, commands) {
+  const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/server-commands"))
+    .setMethod(HttpRequestMethod.Post)
+    .setBody(JSON.stringify({ player: player.name, commands }))
+    .addHeader("Content-Type", "application/json");
+  if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+  const response = await http.request(request);
+  let result = {};
+  try { result = JSON.parse(response.body || "{}"); } catch {}
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(result.error || `server console returned HTTP ${response.status}`);
+  }
+  if (result.succeeded !== result.total) {
+    throw new Error(`only ${result.succeeded || 0} of ${result.total || commands.length} server commands succeeded`);
+  }
+  return `executed ${result.succeeded} dedicated-server command${result.succeeded === 1 ? "" : "s"}`;
+}
+
+async function configureServer(player, settings) {
+  const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/server-control"))
+    .setMethod(HttpRequestMethod.Post)
+    .setBody(JSON.stringify({ player: player.name, settings }))
+    .addHeader("Content-Type", "application/json");
+  if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+  const response = await http.request(request);
+  let result = {};
+  try { result = JSON.parse(response.body || "{}"); } catch {}
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(result.error || `server control returned HTTP ${response.status}`);
+  }
+  speak(player, "The setting is saved. I’m restarting this world now, so you’ll disconnect briefly—rejoin in about a minute and it will be ready.");
+  return "queued a clean Bedrock settings restart";
+}
+
 function actionResultRetry(value) {
   if (!value || typeof value !== "object" || typeof value.question !== "string") return undefined;
   const question = value.question.trim();
@@ -232,7 +271,7 @@ async function postActionResult(report, status, detail) {
   if (!report?.requestId) return;
   const actionPlayer = (report.playerId ? playerById(report.playerId) : undefined)
     || humanPlayers().find((candidate) => candidate.name === report.playerName);
-  const context = status === "completed" && actionPlayer
+  const context = ["completed", "failed", "partial"].includes(status) && actionPlayer
     ? liveWorldSnapshot(actionPlayer) : undefined;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
@@ -253,11 +292,19 @@ async function postActionResult(report, status, detail) {
       }
       const result = JSON.parse(response.body || "{}");
       console.warn(`[MC Wizard] action ${report.requestId} ${status}`);
-      const terminal = status === "completed" || status === "failed";
+      const terminal = ["completed", "failed", "partial"].includes(status);
       const abandoned = /\b(?:superseded|player left|all players left|server stopp)/i.test(detail || "");
       if (!terminal || abandoned || result.superseded || result.replan?.superseded) return;
-      if (result.updated === false) {
+      if (result.updated === false && !result.replayed) {
         if (result.matched) queueFeedback(report);
+        return;
+      }
+      if (result.review?.goal?.status === "complete") {
+        withCurrentActionPlayer(report, (player) => speak(
+          player,
+          result.review.answer || "That worked. Goal complete.",
+        ));
+        queueFeedback(report);
         return;
       }
       if (result.reviewLimitReached || result.retryLimitReached) {
@@ -405,7 +452,7 @@ function endBuildAction(token, status, detail) {
   if (status === "completed" && report.structureRecord) {
     rememberLastStructure({ name: report.playerName }, report.structureRecord);
   }
-  if (status === "completed" && report.projectRecord) {
+  if (["completed", "partial"].includes(status) && report.projectRecord) {
     rememberLastProject({ name: report.playerName }, report.projectRecord);
   }
   void postActionResult(report, status, detail);
@@ -423,13 +470,35 @@ function validStructureInhabitantTag(value) {
   return typeof value === "string" && /^mcwizard_inhabitant_[a-z0-9_]{1,64}$/.test(value);
 }
 
+function readMigratingDynamicProperty(currentId, legacyId) {
+  const current = world.getDynamicProperty(currentId);
+  if (typeof current === "string" && current) return current;
+  const legacy = world.getDynamicProperty(legacyId);
+  return typeof legacy === "string" && legacy ? legacy : undefined;
+}
+
 function lastStructurePropertyId(player) {
-  let hash = 2166136261;
-  for (const character of structurePlayerKey(player)) {
-    hash ^= character.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `${LAST_STRUCTURES}:${(hash >>> 0).toString(36)}`;
+  return `${LAST_STRUCTURES}:${stablePropertySuffix(structurePlayerKey(player))}`;
+}
+
+function legacyLastStructurePropertyId(player) {
+  return `${LAST_STRUCTURES}:${legacyPropertySuffix(structurePlayerKey(player))}`;
+}
+
+function lastStructureIndexPropertyId(player) {
+  return `${LAST_STRUCTURES}:latest:${stablePropertySuffix(structurePlayerKey(player))}`;
+}
+
+function structureKindKey(player, kind) {
+  return `${structurePlayerKey(player)}\u0000${String(kind || "structure").toLowerCase()}`;
+}
+
+function structureKindPropertyId(player, kind) {
+  return `${LAST_STRUCTURES}:kind:${stablePropertySuffix(structureKindKey(player, kind))}`;
+}
+
+function legacyStructureKindPropertyId(player, kind) {
+  return `${LAST_STRUCTURES}:kind:${legacyPropertySuffix(structureKindKey(player, kind))}`;
 }
 
 function validStructureVector(value, vertical = false) {
@@ -438,13 +507,36 @@ function validStructureVector(value, vertical = false) {
   return vertical || (Math.abs(value.x) + Math.abs(value.z) === 1);
 }
 
+function validatedStoredStructure(stored) {
+  if (!stored || typeof stored.dimensionId !== "string"
+    || !validStructureVector(stored.origin, true)
+    || !validStructureVector(stored.forward)
+    || !validStructureVector(stored.right)) return undefined;
+  return { ...stored, plan: validateBuildStructurePlan(stored.plan) };
+}
+
 function lastProjectPropertyId(player) {
-  let hash = 2166136261;
-  for (const character of structurePlayerKey(player)) {
-    hash ^= character.charCodeAt(0);
-    hash = Math.imul(hash, 16777619);
-  }
-  return `${LAST_PROJECTS}:${(hash >>> 0).toString(36)}`;
+  return `${LAST_PROJECTS}:${stablePropertySuffix(structurePlayerKey(player))}`;
+}
+
+function legacyLastProjectPropertyId(player) {
+  return `${LAST_PROJECTS}:${legacyPropertySuffix(structurePlayerKey(player))}`;
+}
+
+function lastProjectIndexPropertyId(player) {
+  return `${LAST_PROJECTS}:latest:${stablePropertySuffix(structurePlayerKey(player))}`;
+}
+
+function projectKindKey(player, kind) {
+  return `${structurePlayerKey(player)}\u0000${String(kind || "project").toLowerCase()}`;
+}
+
+function projectKindPropertyId(player, kind) {
+  return `${LAST_PROJECTS}:kind:${stablePropertySuffix(projectKindKey(player, kind))}`;
+}
+
+function legacyProjectKindPropertyId(player, kind) {
+  return `${LAST_PROJECTS}:kind:${legacyPropertySuffix(projectKindKey(player, kind))}`;
 }
 
 function projectVector(value) {
@@ -521,6 +613,27 @@ function projectBlueprintSummary(blueprint) {
   };
 }
 
+function validatedStoredProject(stored) {
+  if (!stored || typeof stored.dimensionId !== "string"
+    || !validStructureVector(stored.origin, true)
+    || !validStructureVector(stored.forward)
+    || !validStructureVector(stored.right)) return undefined;
+  return {
+    ...projectBlueprintSummary(stored),
+    dimensionId: stored.dimensionId,
+    origin: { ...stored.origin },
+    forward: { ...stored.forward },
+    right: { ...stored.right },
+    updatedAt: Number(stored.updatedAt) || 0,
+  };
+}
+
+function newerStoredRecord(first, second) {
+  if (!first) return second;
+  if (!second) return first;
+  return (second.updatedAt || 0) >= (first.updatedAt || 0) ? second : first;
+}
+
 function obsoleteProjectPlacements(previous, next) {
   const retained = new Set(next.placements.map(({ target }) => target.join(",")));
   return previous.placements.filter(({ target }) => !retained.has(target.join(",")));
@@ -547,25 +660,60 @@ function lastProjectFor(player) {
   const key = structurePlayerKey(player);
   if (lastProjects.has(key)) return lastProjects.get(key);
   try {
-    const raw = world.getDynamicProperty(lastProjectPropertyId(player));
+    const indexRaw = world.getDynamicProperty(lastProjectIndexPropertyId(player));
+    if (typeof indexRaw === "string" && indexRaw) {
+      const index = JSON.parse(indexRaw);
+      const indexedKind = projectText(index?.kind, "", 64).toLowerCase();
+      const indexedRaw = indexedKind
+        ? world.getDynamicProperty(projectKindPropertyId(player, indexedKind)) : undefined;
+      const indexed = typeof indexedRaw === "string" && indexedRaw
+        ? validatedStoredProject(JSON.parse(indexedRaw)) : undefined;
+      if (indexed?.kind === indexedKind && indexed.updatedAt === Number(index.updatedAt)) {
+        lastProjects.set(key, indexed);
+        projectsByKind.set(projectKindKey(player, indexed.kind), indexed);
+        return indexed;
+      }
+    }
+    const raw = readMigratingDynamicProperty(
+      lastProjectPropertyId(player), legacyLastProjectPropertyId(player),
+    );
     if (typeof raw !== "string" || !raw) return undefined;
-    const stored = JSON.parse(raw);
-    if (typeof stored.dimensionId !== "string"
-      || !validStructureVector(stored.origin, true)
-      || !validStructureVector(stored.forward)
-      || !validStructureVector(stored.right)) return undefined;
-    const record = {
-      ...projectBlueprintSummary(stored),
-      dimensionId: stored.dimensionId,
-      origin: { ...stored.origin },
-      forward: { ...stored.forward },
-      right: { ...stored.right },
-      updatedAt: Number(stored.updatedAt) || 0,
-    };
+    const record = validatedStoredProject(JSON.parse(raw));
+    if (!record) return undefined;
     lastProjects.set(key, record);
+    projectsByKind.set(projectKindKey(player, record.kind), record);
+    try {
+      world.setDynamicProperty(projectKindPropertyId(player, record.kind), JSON.stringify(record));
+      world.setDynamicProperty(lastProjectIndexPropertyId(player), JSON.stringify({
+        kind: record.kind, updatedAt: record.updatedAt,
+      }));
+    } catch (error) {
+      console.warn(`[MC Wizard] could not migrate ${player.name}'s saved project index: ${error}`);
+    }
     return record;
   } catch (error) {
     console.warn(`[MC Wizard] ignored invalid saved project for ${player.name}: ${error}`);
+    return undefined;
+  }
+}
+
+function projectFor(player, kind) {
+  const requestedKind = String(kind || "").toLowerCase();
+  const latest = lastProjectFor(player);
+  const latestForKind = latest?.kind === requestedKind ? latest : undefined;
+  const key = projectKindKey(player, requestedKind);
+  if (projectsByKind.has(key)) return newerStoredRecord(latestForKind, projectsByKind.get(key));
+  try {
+    const raw = readMigratingDynamicProperty(
+      projectKindPropertyId(player, requestedKind), legacyProjectKindPropertyId(player, requestedKind),
+    );
+    if (typeof raw !== "string" || !raw) return latestForKind;
+    const record = validatedStoredProject(JSON.parse(raw));
+    if (!record || record.kind !== requestedKind) return latestForKind;
+    projectsByKind.set(key, record);
+    return newerStoredRecord(latestForKind, record);
+  } catch (error) {
+    console.warn(`[MC Wizard] ignored invalid saved ${requestedKind} project for ${player.name}: ${error}`);
     return undefined;
   }
 }
@@ -580,7 +728,12 @@ function rememberLastProject(player, record) {
     updatedAt: Date.now(),
   };
   lastProjects.set(structurePlayerKey(player), saved);
+  projectsByKind.set(projectKindKey(player, saved.kind), saved);
   try {
+    world.setDynamicProperty(projectKindPropertyId(player, saved.kind), JSON.stringify(saved));
+    world.setDynamicProperty(lastProjectIndexPropertyId(player), JSON.stringify({
+      kind: saved.kind, updatedAt: saved.updatedAt,
+    }));
     world.setDynamicProperty(lastProjectPropertyId(player), JSON.stringify(saved));
   } catch (error) {
     console.warn(`[MC Wizard] could not persist ${player.name}'s last project: ${error}`);
@@ -591,18 +744,60 @@ function lastStructureFor(player) {
   const key = structurePlayerKey(player);
   if (lastStructures.has(key)) return lastStructures.get(key);
   try {
-    const raw = world.getDynamicProperty(lastStructurePropertyId(player));
+    const indexRaw = world.getDynamicProperty(lastStructureIndexPropertyId(player));
+    if (typeof indexRaw === "string" && indexRaw) {
+      const index = JSON.parse(indexRaw);
+      const indexedKind = String(index?.kind || "").toLowerCase();
+      const indexedRaw = indexedKind
+        ? world.getDynamicProperty(structureKindPropertyId(player, indexedKind)) : undefined;
+      const indexed = typeof indexedRaw === "string" && indexedRaw
+        ? validatedStoredStructure(JSON.parse(indexedRaw)) : undefined;
+      if (indexed?.plan.kind === indexedKind && indexed.updatedAt === Number(index.updatedAt)) {
+        lastStructures.set(key, indexed);
+        structuresByKind.set(structureKindKey(player, indexedKind), indexed);
+        return indexed;
+      }
+    }
+    const raw = readMigratingDynamicProperty(
+      lastStructurePropertyId(player), legacyLastStructurePropertyId(player),
+    );
     if (typeof raw !== "string" || !raw) return undefined;
-    const stored = JSON.parse(raw);
-    if (typeof stored.dimensionId !== "string"
-      || !validStructureVector(stored.origin, true)
-      || !validStructureVector(stored.forward)
-      || !validStructureVector(stored.right)) return undefined;
-    const record = { ...stored, plan: validateBuildStructurePlan(stored.plan) };
+    const record = validatedStoredStructure(JSON.parse(raw));
+    if (!record) return undefined;
     lastStructures.set(key, record);
+    structuresByKind.set(structureKindKey(player, record.plan.kind), record);
+    try {
+      world.setDynamicProperty(structureKindPropertyId(player, record.plan.kind), JSON.stringify(record));
+      world.setDynamicProperty(lastStructureIndexPropertyId(player), JSON.stringify({
+        kind: record.plan.kind, updatedAt: Number(record.updatedAt) || 0,
+      }));
+    } catch (error) {
+      console.warn(`[MC Wizard] could not migrate ${player.name}'s saved structure index: ${error}`);
+    }
     return record;
   } catch (error) {
     console.warn(`[MC Wizard] ignored invalid saved structure for ${player.name}: ${error}`);
+    return undefined;
+  }
+}
+
+function structureFor(player, kind) {
+  const requestedKind = String(kind || "").toLowerCase();
+  const latest = lastStructureFor(player);
+  const latestForKind = latest?.plan.kind === requestedKind ? latest : undefined;
+  const key = structureKindKey(player, requestedKind);
+  if (structuresByKind.has(key)) return newerStoredRecord(latestForKind, structuresByKind.get(key));
+  try {
+    const raw = readMigratingDynamicProperty(
+      structureKindPropertyId(player, requestedKind), legacyStructureKindPropertyId(player, requestedKind),
+    );
+    if (typeof raw !== "string" || !raw) return latestForKind;
+    const record = validatedStoredStructure(JSON.parse(raw));
+    if (!record || record.plan.kind !== requestedKind) return latestForKind;
+    structuresByKind.set(key, record);
+    return newerStoredRecord(latestForKind, record);
+  } catch (error) {
+    console.warn(`[MC Wizard] ignored invalid saved ${requestedKind} for ${player.name}: ${error}`);
     return undefined;
   }
 }
@@ -619,7 +814,12 @@ function rememberLastStructure(player, record) {
     updatedAt: Date.now(),
   };
   lastStructures.set(structurePlayerKey(player), saved);
+  structuresByKind.set(structureKindKey(player, saved.plan.kind), saved);
   try {
+    world.setDynamicProperty(structureKindPropertyId(player, saved.plan.kind), JSON.stringify(saved));
+    world.setDynamicProperty(lastStructureIndexPropertyId(player), JSON.stringify({
+      kind: saved.plan.kind, updatedAt: saved.updatedAt,
+    }));
     world.setDynamicProperty(lastStructurePropertyId(player), JSON.stringify(saved));
   } catch (error) {
     console.warn(`[MC Wizard] could not persist ${player.name}'s last structure: ${error}`);
@@ -953,9 +1153,7 @@ async function submitFeedback(prompt, grade, feedback) {
   const player = playerById(prompt.playerId);
   if (!player) return;
   prompt.submitting = true;
-  speak(player, feedback
-    ? "Thanks—I’m saving that and using your note as the next instruction."
-    : "Thanks—I’m saving your grade.");
+  speak(player, feedback ? "Thanks—I’m saving your grade and note." : "Thanks—I’m saving your grade.");
   try {
     const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/feedback"))
       .setMethod(HttpRequestMethod.Post)
@@ -985,6 +1183,7 @@ async function submitFeedback(prompt, grade, feedback) {
         return;
       }
       completeFeedbackPrompt(prompt);
+      if (message) speak(current, message);
       if (feedback) {
         if (followUp && typeof followUp === "object") applyResponse(current.id, followUp, feedback);
       }
@@ -2691,7 +2890,7 @@ function findStructureSite(player, plan, forward, right) {
 }
 
 function findModificationSite(player, plan) {
-  const previous = lastStructureFor(player);
+  const previous = structureFor(player, plan.kind);
   if (!previous || previous.dimensionId !== player.dimension.id) return undefined;
   const oldDimensions = previous.plan.dimensions;
   const shiftX = Math.round((oldDimensions.width - plan.dimensions.width) / 2);
@@ -3590,6 +3789,7 @@ function verifyBlueprint(dimension, blueprint, origin, forward, right) {
       ].includes(blockType(point));
       return ["minecraft:kelp", "minecraft:kelp_plant"].includes(dimension.getBlock(plant)?.typeId)
         && check.waterColumn.every(submergedKelp)
+        && check.refillSources.every(water)
         && check.collectionStream.every(water)
         && correctBlockFacing(dimension, piston, customLocation(origin, forward, right, check.harvest))
         && correctBlockFacing(dimension, observer, customLocation(origin, forward, right, check.sensedGrowth))
@@ -3861,7 +4061,7 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     return;
   }
   let dimension = player.dimension;
-  const previousProject = blueprint.mode === "modify" ? lastProjectFor(player) : undefined;
+  const previousProject = blueprint.mode === "modify" ? projectFor(player, blueprint.kind) : undefined;
   const reuseProject = previousProject?.dimensionId === dimension.id ? previousProject : undefined;
   let forward = reuseProject ? { ...reuseProject.forward } : cardinalDirection(player);
   let right = reuseProject ? { ...reuseProject.right } : { x: -forward.z, z: forward.x };
@@ -4847,7 +5047,7 @@ function applyWorldControl(player, action, report = beginImmediateAction(player)
   }
 }
 
-function runCommandsForPlayer(player, commands, report = beginImmediateAction(player)) {
+function executeRequesterCommands(player, commands) {
   const tag = `mcw_cmd_${system.currentTick}_${Math.floor(Math.random() * 1_000_000)}`;
   let succeeded = 0;
   try {
@@ -4856,21 +5056,28 @@ function runCommandsForPlayer(player, commands, report = beginImmediateAction(pl
       const result = player.dimension.runCommand(`execute as @a[tag=${tag}] at @s run ${command}`);
       if ((result?.successCount || 0) > 0) succeeded += 1;
     }
+    return { succeeded, total: commands.length };
+  } finally {
+    try { player.removeTag(tag); } catch {}
+  }
+}
+
+function runCommandsForPlayer(player, commands, report = beginImmediateAction(player)) {
+  try {
+    const { succeeded, total } = executeRequesterCommands(player, commands);
     if (succeeded === 0) throw new Error("every command reported zero successful targets");
     speak(player, succeeded === commands.length
       ? "Done—the spell worked right here."
-      : `I cast ${succeeded} of ${commands.length} parts. I’m keeping the result instead of doing nothing.`);
+      : `I cast ${succeeded} of ${total} parts. I’m keeping the result instead of doing nothing.`);
     endImmediateAction(
       report,
-      succeeded === commands.length ? "completed" : "partial",
-      `executed ${succeeded} of ${commands.length} requester-scoped commands`,
+      succeeded === total ? "completed" : "partial",
+      `executed ${succeeded} of ${total} requester-scoped commands`,
     );
   } catch (error) {
     console.warn(`[MC Wizard] requester command failed: ${error}`);
     speak(player, "That command spell misfired. I’ve kept the goal active so I can try another route.");
     endImmediateAction(report, "failed", `requester command failed: ${String(error).slice(0, 160)}`);
-  } finally {
-    try { player.removeTag(tag); } catch {}
   }
 }
 
@@ -4988,11 +5195,33 @@ function nearbyGiftAmount(player, itemId) {
   return amount;
 }
 
-async function giveItemsAsWizard(player, items, report) {
+function giftRecipient(requester, recipient) {
+  if (!recipient || recipient === "requester") return requester;
+  const wanted = String(recipient).trim().toLowerCase();
+  return humanPlayers().find((candidate) => candidate.name.trim().toLowerCase() === wanted);
+}
+
+function giftStack(spec, amount) {
+  const stack = new ItemStack(spec.itemId, amount);
+  if (spec.nameTag) stack.nameTag = spec.nameTag;
+  if (spec.enchantments?.length) {
+    const component = stack.getComponent("minecraft:enchantable");
+    if (!component) throw new Error(`${spec.itemId} cannot be enchanted`);
+    const enchantments = spec.enchantments.map(({ id, level }) => {
+      const type = EnchantmentTypes.get(id);
+      if (!type) throw new Error(`unknown enchantment ${id}`);
+      return { type, level };
+    });
+    component.addEnchantments(enchantments);
+  }
+  return stack;
+}
+
+async function giveItemsAsWizard(player, items, report, recipient) {
   if (buildInProgress || buildPreparing) {
     queueBuild(
       player,
-      (current) => giveItemsAsWizard(current, items, report),
+      (current) => giveItemsAsWizard(current, items, report, recipient),
       40,
       "I’m gathering those items and will bring them over as soon as my current spell is stable.",
     );
@@ -5001,38 +5230,47 @@ async function giveItemsAsWizard(player, items, report) {
   const reservation = beginBuildPreparation();
   let activeReport = report;
   try {
-    const bot = bringWizardTo(player, true, true);
+    const target = giftRecipient(player, recipient);
+    if (!target) {
+      activeReport ||= beginImmediateAction(player);
+      speak(player, `I can’t see a connected player named ${recipient}. I’m keeping the delivery ready for an exact connected name.`);
+      endImmediateAction(activeReport, "failed", `exact recipient ${recipient} is not connected`);
+      return;
+    }
+    const bot = bringWizardTo(target, true, true);
     if (!bot) {
-      queueBuild(player, (current) => giveItemsAsWizard(current, items, report), 40, "I’m gathering those items and will bring them over as soon as I reappear.");
+      queueBuild(player, (current) => giveItemsAsWizard(current, items, report, recipient), 40, "I’m gathering those items and will bring them over as soon as I reappear.");
       return;
     }
     activeReport ||= beginImmediateAction(player);
-    for (let attempts = 0; attempts < 60 && distanceSquared(bot.location, player.location) > 5 * 5; attempts += 1) {
-      moveWizardBeside(bot, player);
+    for (let attempts = 0; attempts < 60 && distanceSquared(bot.location, target.location) > 5 * 5; attempts += 1) {
+      moveWizardBeside(bot, target);
       await system.waitTicks(2);
     }
     let dropped = 0;
-    for (const { itemId, amount } of items) {
+    const requested = items.reduce((total, { amount }) => total + amount, 0);
+    for (const spec of items) {
+      const { itemId, amount } = spec;
       try {
-        const probe = new ItemStack(itemId, 1);
+        const probe = giftStack(spec, 1);
         let remaining = amount;
         while (remaining > 0) {
           const count = Math.min(remaining, probe.maxAmount || 1);
-          const stack = new ItemStack(itemId, count);
-          const before = nearbyGiftAmount(player, itemId);
+          const stack = giftStack(spec, count);
+          const before = nearbyGiftAmount(target, itemId);
           if (!bot.setItem(stack, 0, true) || !bot.dropSelectedItem()) {
             throw new Error(`could not drop ${itemId}`);
           }
           await system.waitTicks(4);
-          const arrived = Math.max(0, nearbyGiftAmount(player, itemId) - before);
+          const arrived = Math.max(0, nearbyGiftAmount(target, itemId) - before);
           if (arrived < count) {
             const missing = count - arrived;
-            player.dimension.spawnItem(new ItemStack(itemId, missing), {
-              x: player.location.x,
-              y: player.location.y + 0.5,
-              z: player.location.z,
+            target.dimension.spawnItem(giftStack(spec, missing), {
+              x: target.location.x,
+              y: target.location.y + 0.5,
+              z: target.location.z,
             });
-            console.warn(`[MC Wizard] repaired missing ${itemId} delivery at ${player.name}'s feet`);
+            console.warn(`[MC Wizard] repaired missing ${itemId} delivery at ${target.name}'s feet`);
           }
           dropped += count;
           remaining -= count;
@@ -5042,19 +5280,325 @@ async function giveItemsAsWizard(player, items, report) {
       }
     }
     equipWizard();
-    speak(player, dropped > 0
-      ? `There you are—I brought ${dropped} item${dropped === 1 ? "" : "s"} and dropped them at your feet.`
-      : "Those item names were smudged. Tell me what they look like and I’ll try a matching item next.");
+    const complete = dropped === requested;
+    const recipientLabel = target.id === player.id ? "your feet" : `${target.name}'s feet`;
+    speak(player, complete
+      ? `There you are—I brought ${dropped} item${dropped === 1 ? "" : "s"} and dropped them at ${recipientLabel}.`
+      : dropped > 0
+        ? `I brought ${dropped} of ${requested} items. I’m keeping this request active so I can retry the missing ones.`
+        : "Those item names were smudged. Tell me what they look like and I’ll try a matching item next.");
     endImmediateAction(
       activeReport,
-      dropped > 0 ? "completed" : "failed",
-      dropped > 0 ? `delivered ${dropped} requested items` : "no requested items were delivered",
+      complete ? "completed" : "failed",
+      complete ? `delivered all ${requested} requested items`
+        : `delivered ${dropped} of ${requested} requested items`,
     );
   } catch (error) {
     console.warn(`[MC Wizard] item delivery was interrupted: ${error}`);
     endImmediateAction(activeReport, "failed", "item delivery was interrupted before completion");
   } finally {
     endBuildPreparation(reservation);
+  }
+}
+
+function capabilityProgramFrame(player, program) {
+  if (program.site === "active_project") {
+    const project = program.targetKind
+      ? newestProjectRecord(projectFor(player, program.targetKind), structureFor(player, program.targetKind))
+      : newestProjectRecord(lastProjectFor(player), lastStructureFor(player));
+    if (!project) throw new Error("the active project location is unavailable");
+    if (project.dimensionId !== player.dimension.id) throw new Error("the active project is in another dimension");
+    return {
+      origin: { ...project.origin },
+      forward: { ...project.forward },
+      right: { ...project.right },
+    };
+  }
+  const forward = cardinalDirection(player);
+  const right = { x: -forward.z, z: forward.x };
+  const base = {
+    x: Math.floor(player.location.x),
+    y: standingBlockY(player.location),
+    z: Math.floor(player.location.z),
+  };
+  return { origin: offset(base, forward, right, 3), forward, right };
+}
+
+function capabilityLocation(frame, vector) {
+  return customLocation(frame.origin, frame.forward, frame.right, vector);
+}
+
+async function finishWizardOperation(operation, label) {
+  for (let attempt = 0; attempt < 160; attempt += 1) {
+    const result = operation();
+    if (result === true) return;
+    if (result === "interaction-failed") throw new Error(`${label} could not be verified`);
+    await system.waitTicks(2);
+  }
+  throw new Error(`${label} did not finish in time`);
+}
+
+async function moveWizardForProgram(player, frame, { target, mode }) {
+  const bot = bringWizardTo(player, true, true);
+  if (!bot) throw new Error("the simulated player is unavailable");
+  const destination = capabilityLocation(frame, target);
+  const feet = {
+    x: Math.floor(destination.x),
+    y: Math.floor(destination.y),
+    z: Math.floor(destination.z),
+  };
+  if (!blockIsOpen(player.dimension, feet) || !blockIsOpen(player.dimension, { ...feet, y: feet.y + 1 })) {
+    throw new Error("the requested movement target is blocked");
+  }
+  if (mode === "fly") bot.fly();
+  else bot.stopFlying();
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (distanceSquared(bot.location, destination) <= 1.5 * 1.5) return `${mode} movement reached its target`;
+    if (attempt % 10 === 0) {
+      try {
+        if (mode === "walk") bot.navigateToLocation(destination, 1);
+        else bot.moveToLocation(destination, { speed: 1, faceTarget: true });
+      } catch {
+        bot.moveToLocation(destination, { speed: 0.8, faceTarget: true });
+      }
+    }
+    await system.waitTicks(2);
+  }
+  bot.teleport(destination, { dimension: player.dimension, facingLocation: player.location });
+  if (mode === "walk") bot.stopFlying();
+  return `${mode} path stalled, so Wizard completed the move with a short blink`;
+}
+
+function dropCapabilityBook(player, { title, text, author }) {
+  const book = new ItemStack("minecraft:writable_book", 1);
+  const component = book.getComponent("minecraft:book");
+  if (!component) throw new Error("book component is unavailable");
+  component.setContents(bookPages(text));
+  component.signBook(bookTitle(title), author);
+  player.dimension.spawnItem(book, {
+    x: player.location.x,
+    y: player.location.y + 0.5,
+    z: player.location.z,
+  });
+  return `dropped book “${component.title}” at the player's feet`;
+}
+
+async function executeCapabilityStep(player, step, frame) {
+  const args = step.arguments;
+  if (step.capability === "control.wait") {
+    await system.waitTicks(args.ticks);
+    return `waited ${args.ticks} ticks`;
+  }
+  if (step.capability === "player.move") return moveWizardForProgram(player, frame, args);
+  if (step.capability === "player.place-blocks") {
+    for (const placement of args.blocks) {
+      const target = capabilityLocation(frame, placement.target);
+      const support = capabilityLocation(frame, placement.support);
+      const facing = placement.orientationTarget
+        ? capabilityLocation(frame, placement.orientationTarget) : undefined;
+      await finishWizardOperation(() => placeAsWizard(
+        player.dimension,
+        placement.itemId,
+        support,
+        target,
+        placement.expectedType,
+        undefined,
+        directionFromSupport(support, target),
+        placement.expectedStates,
+        facing,
+      ), `placing ${placement.itemId} at ${placement.target.join(",")}`);
+    }
+    return `physically placed ${args.blocks.length} block${args.blocks.length === 1 ? "" : "s"}`;
+  }
+  if (step.capability === "player.break-blocks") {
+    for (const target of args.targets) {
+      const location = capabilityLocation(frame, target);
+      await finishWizardOperation(
+        () => breakAsWizard(player.dimension, location),
+        `breaking the block at ${target.join(",")}`,
+      );
+    }
+    return `physically broke ${args.targets.length} block${args.targets.length === 1 ? "" : "s"}`;
+  }
+  if (step.capability === "player.use-item") {
+    await finishWizardOperation(
+      () => useItemAsWizard(player.dimension, args, frame.origin, frame.forward, frame.right),
+      `using ${args.itemId}`,
+    );
+    return `used ${args.itemId} on the requested block`;
+  }
+  if (step.capability === "world.command") {
+    const result = executeRequesterCommands(player, args.commands);
+    if (result.succeeded !== result.total) throw new Error(`only ${result.succeeded} of ${result.total} commands succeeded`);
+    return `executed ${result.succeeded} requester-scoped command${result.succeeded === 1 ? "" : "s"}`;
+  }
+  if (step.capability === "server.console") return executeServerConsole(player, args.commands);
+  if (step.capability === "server.configure") return configureServer(player, args);
+  if (step.capability === "artifact.book") return dropCapabilityBook(player, args);
+  if (step.capability === "observe.snapshot") {
+    const snapshot = liveWorldSnapshot(player);
+    return `captured ${snapshot.nearbyBlocks.length} block types and ${snapshot.nearbyEntities.length} nearby entities`;
+  }
+  if (step.capability === "verify.blocks") {
+    const misses = args.blocks.filter(({ target, typeId, expectedStates = {} }) => {
+      const block = player.dimension.getBlock(capabilityLocation(frame, target));
+      if (block?.typeId !== typeId) return true;
+      const states = block.permutation.getAllStates();
+      return Object.entries(expectedStates).some(([state, expected]) => {
+        const stateName = Object.keys(states).find((name) => name === state || name.endsWith(`:${state}`));
+        return !stateName || states[stateName] !== expected;
+      });
+    });
+    if (misses.length) throw new Error(`${misses.length} expected block${misses.length === 1 ? " was" : "s were"} missing`);
+    return `verified ${args.blocks.length} block${args.blocks.length === 1 ? "" : "s"}`;
+  }
+  if (step.capability === "verify.entities") {
+    const count = player.dimension.getEntities({
+      type: args.typeId,
+      location: capabilityLocation(frame, args.location),
+      maxDistance: args.maxDistance,
+    }).length;
+    if (count < args.minimum) throw new Error(`found ${count} of ${args.minimum} required ${args.typeId}`);
+    return `verified ${count} nearby ${args.typeId}`;
+  }
+  if (step.capability === "script.spawn-entity") {
+    const location = capabilityLocation(frame, args.location);
+    for (let index = 0; index < args.count; index += 1) {
+      const entity = player.dimension.spawnEntity(args.typeId, {
+        x: location.x + 0.5,
+        y: location.y,
+        z: location.z + 0.5,
+      });
+      if (args.nameTag) entity.nameTag = args.nameTag;
+    }
+    return `spawned ${args.count} ${args.typeId}`;
+  }
+  if (step.capability === "script.teleport") {
+    const subject = args.subject === "requester" ? player : bringWizardTo(player, true, true);
+    if (!subject) throw new Error("the teleport subject is unavailable");
+    subject.teleport(capabilityLocation(frame, args.target), { dimension: player.dimension });
+    return `teleported ${args.subject}`;
+  }
+  if (step.capability === "script.effect") {
+    const subject = args.subject === "requester" ? player : bringWizardTo(player, true, true);
+    if (!subject) throw new Error("the effect subject is unavailable");
+    subject.addEffect(args.effectId, args.duration, {
+      amplifier: args.amplifier,
+      showParticles: args.showParticles,
+    });
+    return `applied ${args.effectId} to ${args.subject}`;
+  }
+  throw new Error(`capability ${step.capability} is not installed`);
+}
+
+function capabilityProjectSummary(program, steps) {
+  const placements = steps.filter(({ capability }) => capability === "player.place-blocks")
+    .flatMap(({ arguments: args }) => args.blocks.map((block) => ({
+      itemId: block.itemId,
+      expectedType: block.expectedType,
+      target: block.target,
+      support: block.support,
+      orientationTarget: block.orientationTarget || null,
+    })));
+  const interactions = steps.filter(({ capability }) => capability === "player.use-item")
+    .map(({ arguments: args }) => ({ action: "use_item_on_block", ...args }));
+  if (!placements.length && !interactions.length) return undefined;
+  return projectBlueprintSummary({
+    title: program.title,
+    kind: program.targetKind || program.title,
+    placements,
+    interactions,
+  });
+}
+
+async function executeCapabilityProgram(player, program) {
+  if (buildInProgress || buildPreparing) {
+    queueBuild(
+      player,
+      (current) => void executeCapabilityProgram(current, program),
+      40,
+      `I’ve queued “${program.title}” and will continue it automatically when my hands are free.`,
+    );
+    return;
+  }
+  const bot = bringWizardTo(player, true, true);
+  if (!bot) {
+    queueBuild(player, (current) => void executeCapabilityProgram(current, program), 40, "I’m returning now, then I’ll carry out the whole plan.");
+    return;
+  }
+  const token = ++nextBuildToken;
+  activeBuildToken = token;
+  buildInProgress = true;
+  if (!bindBuildAction(player, token)) {
+    clearBuild(token);
+    return;
+  }
+  let transactionStarted = false;
+  let changedWorld = false;
+  try {
+    const steps = program.steps.map(normalizeRuntimeStep);
+    if (!runtimeProgramHasEvidence(steps)) throw new Error("the program lacks runtime evidence for its mutations");
+    const frame = capabilityProgramFrame(player, program);
+    const expectedBlocks = steps.flatMap((step) => {
+      if (step.capability === "player.place-blocks") return step.arguments.blocks.map((block) => ({
+        location: capabilityLocation(frame, block.target),
+        typeId: block.expectedType,
+      }));
+      if (step.capability === "player.break-blocks") return step.arguments.targets.map((target) => ({
+        location: capabilityLocation(frame, target),
+        typeId: "minecraft:air",
+      }));
+      return [];
+    });
+    if (expectedBlocks.length) {
+      beginTransaction(player.id, token, player.dimension, expectedBlocks);
+      transactionStarted = true;
+    }
+    const project = capabilityProjectSummary(program, steps);
+    if (project) bindBuildProject(player, token, {
+      ...project,
+      dimensionId: player.dimension.id,
+      origin: { ...frame.origin },
+      forward: { ...frame.forward },
+      right: { ...frame.right },
+    });
+    const failures = [];
+    const results = [];
+    for (const step of steps) {
+      try {
+        if (/^(?:player\.(?:place|break|use)|world\.command|script\.)/.test(step.capability)) changedWorld = true;
+        results.push({ id: step.id, detail: await executeCapabilityStep(player, step, frame) });
+      } catch (error) {
+        const detail = String(error?.message || error).slice(0, 160);
+        failures.push({ id: step.id, detail });
+        if (step.onFailure !== "continue") break;
+      }
+    }
+    if (transactionStarted) {
+      if (changedWorld) commitTransaction(token);
+      else rollbackTransaction(token);
+    }
+    clearBuild(token);
+    if (failures.length) {
+      const first = failures[0];
+      speak(player, `I completed ${results.length} step${results.length === 1 ? "" : "s"}, but “${first.id}” needs another approach. I’m checking the world and replanning it now.`);
+      endBuildAction(token, changedWorld ? "partial" : "failed", `program ${program.title}: ${results.length}/${steps.length} steps; ${first.id}: ${first.detail}`);
+    } else {
+      const explicitChecks = steps.filter(({ capability }) => capability.startsWith("verify.")).length;
+      speak(player, explicitChecks
+        ? `Done—“${program.title}” completed all ${results.length} steps, including ${explicitChecks} explicit check${explicitChecks === 1 ? "" : "s"}. I’m comparing that result with your whole request now.`
+        : `Done—“${program.title}” completed all ${results.length} steps. I’m comparing that result with your whole request now.`);
+      endBuildAction(token, "completed", `program ${program.title}: completed ${results.length}/${steps.length} steps; explicit checks=${explicitChecks}`);
+    }
+  } catch (error) {
+    if (transactionStarted) {
+      if (changedWorld) commitTransaction(token);
+      else rollbackTransaction(token);
+    }
+    clearBuild(token);
+    console.warn(`[MC Wizard] capability program failed: ${error}`);
+    speak(player, "One part of that plan did not fit this world. I kept every useful result and I’m replanning the failed part now.");
+    endBuildAction(token, changedWorld ? "partial" : "failed", `capability program failed: ${String(error?.message || error).slice(0, 180)}`);
   }
 }
 
@@ -5135,9 +5679,11 @@ function applyResponse(playerId, payload, question) {
   } else if (action?.type === "potion_rain" && action.version === 1) {
     castPotionRain(player, action);
   } else if (action?.type === "give_items" && action.version === 1) {
-    void giveItemsAsWizard(player, action.items || []);
+    void giveItemsAsWizard(player, action.items || [], undefined, action.recipient);
   } else if (action?.type === "run_commands" && action.version === 1) {
     runCommandsForPlayer(player, action.commands || []);
+  } else if (action?.type === "execute_program" && action.version === 1) {
+    void executeCapabilityProgram(player, action.program);
   } else if (action?.type === "place_area_torches" && action.version === 1) {
     void placeAreaTorches(player);
   } else if (action?.type === "command_lesson" && action.version === 1) {
@@ -5166,7 +5712,12 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
   if (mode === "general") player.sendMessage("§b[AI]§r Thinking…");
   else {
     if (!buildInProgress && !buildPreparing) bringWizardTo(player);
-    const acknowledgements = [
+    const unfamiliarBuild = /\b(?:build|construct|create|make)\b/i.test(question);
+    const acknowledgements = unfamiliarBuild ? [
+      "That’s a new spell for me. I’m checking Bedrock designs, then I’ll try it here.",
+      "Let me research the tricky parts, then I’ll build my best version here.",
+      "I’m comparing a few Bedrock designs before I start placing blocks.",
+    ] : [
       "Hmm—one moment.",
       "I’m checking that carefully.",
       "Give me a moment to work that out.",
@@ -5538,6 +6089,9 @@ world.afterEvents.worldLoad.subscribe(() => {
         label: "E2E",
         answer: "# Redstone guide\n\n" + "Use repeaters to control timing, comparators to measure signals, and lamps to make output easy to read. ".repeat(12),
       }, "redstone guide"),
+      deliverTestGift: (player, recipient) => giveItemsAsWizard(player, [{
+        itemId: "minecraft:diamond", amount: 7, nameTag: "Seven Stars",
+      }], undefined, recipient),
     }), 20);
   }
 });

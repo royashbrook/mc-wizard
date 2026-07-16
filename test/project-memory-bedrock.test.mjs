@@ -15,20 +15,20 @@ function sourceBetween(startMarker, endMarker) {
   return packScript.slice(start, end);
 }
 
-test("interactive blueprints become the active project only after verified completion", () => {
+test("interactive blueprints retain completed work and partial progress for refinement", () => {
   const build = sourceBetween("async function buildInteractiveBlueprint", "function buildMachinePlan");
   assert.match(build, /bindBuildProject\(player, token, \{/);
   assert.match(build, /projectBlueprintSummary\(blueprint\)/);
   assert.doesNotMatch(build, /rememberLastProject\(/);
 
   const outcome = sourceBetween("function endBuildAction", "function structurePlayerKey");
-  assert.match(outcome, /status === "completed" && report\.projectRecord/);
+  assert.match(outcome, /\["completed", "partial"\]\.includes\(status\) && report\.projectRecord/);
   assert.match(outcome, /rememberLastProject/);
 });
 
 test("a modify machine plan reuses the active project's origin and orientation", () => {
   const build = sourceBetween("async function buildInteractiveBlueprint", "function buildMachinePlan");
-  assert.match(build, /blueprint\.mode === "modify" \? lastProjectFor\(player\) : undefined/);
+  assert.match(build, /blueprint\.mode === "modify" \? projectFor\(player, blueprint\.kind\) : undefined/);
   assert.match(build, /previousProject\?\.dimensionId === dimension\.id/);
   assert.match(build, /reuseProject \? \{ \.\.\.reuseProject\.forward \} : cardinalDirection\(player\)/);
   assert.match(build, /reuseProject \? \{ \.\.\.reuseProject\.right \}/);

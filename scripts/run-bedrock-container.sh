@@ -37,21 +37,10 @@ if ! ifconfig | awk -v ip="$LAN_IP" '$1 == "inet" && $2 == ip { found = 1 } END 
   echo "MC_WIZARD_LAN_IP is not assigned to this Mac." >&2
   exit 1
 fi
-ALLOW_LIST_USERS=${MC_WIZARD_ALLOW_LIST_USERS:-}
-ALLOW_LIST=true
-if [ "${MC_WIZARD_OPEN_LAN:-}" = "1" ]; then
-  ALLOW_LIST=false
-  ALLOW_LIST_USERS=
-  echo "Starting in explicitly requested open-LAN mode; any authenticated player on this private network can join." >&2
-elif ! printf '%s\n' "$ALLOW_LIST_USERS" \
-  | grep -Eq '^([^,:]+(,[^,:]+)*|[^,:]+:[0-9]{16,}(,[^,:]+:[0-9]{16,})*)$'; then
-  echo "Set MC_WIZARD_ALLOW_LIST_USERS to either exact gamertags or gamertag:numeric-XUID pairs." >&2
-  echo "Do not mix the two forms in one list." >&2
-  echo "Or set MC_WIZARD_OPEN_LAN=1 to deliberately allow anyone on the private LAN." >&2
-  exit 1
-fi
+echo "Starting in trusted open-LAN mode; any authenticated player on this private network can join as an operator." >&2
 
 mkdir -p "$DATA"
+node scripts/initialize-bedrock-properties.mjs
 container run --detach \
   --name mc-wizard-bedrock \
   --platform linux/amd64 \
@@ -62,19 +51,7 @@ container run --detach \
   --volume "$ROOT/bedrock:/packs/mc-wizard:ro" \
   --env EULA=TRUE \
   --env VERSION=1.26.33.2 \
-  --env SERVER_NAME="MC Wizard" \
   --env LEVEL_NAME=mc-wizard \
-  --env GAMEMODE=creative \
-  --env FORCE_GAMEMODE=true \
-  --env DIFFICULTY=peaceful \
-  --env ALLOW_CHEATS=true \
-  --env ONLINE_MODE=true \
-  --env "ALLOW_LIST=$ALLOW_LIST" \
-  --env "ALLOW_LIST_USERS=$ALLOW_LIST_USERS" \
-  --env ENABLE_LAN_VISIBILITY=true \
-  --env SERVER_PORT=19132 \
-  --env CONTENT_LOG_FILE_ENABLED=true \
-  --env CONTENT_LOG_CONSOLE_OUTPUT_ENABLED=true \
   --env MC_PACK=/packs/mc-wizard \
   --env FORCE_PACK_COPY=true \
   --env FORCE_WORLD_COPY=false \

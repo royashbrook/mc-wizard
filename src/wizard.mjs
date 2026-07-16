@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { allowedWizardAction, allowedWizardGoal, wizardActionRejection, wizardSkillPrompt } from "./skills.mjs";
 import { createMemorySessionStore } from "./sessions.mjs";
+import { createMemoryLearnedRecipeStore, reusableLearnedAction } from "./learned-recipes.mjs";
 import { commonFarmAction } from "./common-farms.mjs";
 import {
   explicitlyRequestsCommand,
@@ -66,7 +67,7 @@ function requestClauses(question) {
 function isPotionRainRequest(question) {
   const describesPotionRain = (clause) => /\b(?:splash\s+)?po(?:ti|sti)ons?\b/i.test(clause)
     && /\b(?:rain|raining|shower|falling|fall|drop|sky)\b/i.test(clause);
-  const requestsIt = (clause) => /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:make|create|start|cast|drop|shower)\b/i.test(clause)
+  const requestsIt = (clause) => /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:make|create|start|cast|drop|shower)\b/i.test(clause)
     || /\b(?:i|we)\s+(?:want|need)\b/i.test(clause);
   return requestClauses(question).some((clause) => describesPotionRain(clause) && requestsIt(clause));
 }
@@ -83,14 +84,25 @@ function answerPromisesAction(answer = "") {
       .test(answer);
 }
 
+function answerOffersAction(answer = "") {
+  return /\b(?:i\s+can|shall\s+i|should\s+i|would\s+you\s+like\s+me\s+to|want\s+me\s+to)\b.{0,180}\b(?:build|place|make|create|construct|set\s*up|start|add|decorate|change|put|give|bring|spawn|summon|show|rebuild|expand|upgrade|improve|finish|fix|repair|furnish|wire|assemble|install|craft|modify|update)\b/i
+    .test(answer);
+}
+
+function offeredActionQuestion(turn) {
+  const clause = String(turn?.answer || "").match(/\b(?:build|place|make|create|construct|set\s*up|start|add|decorate|change|put|give|bring|spawn|summon|show|rebuild|expand|upgrade|improve|finish|fix|repair|furnish|wire|assemble|install|craft|modify|update)\b[^.!?]{0,240}/i)?.[0];
+  return clause ? `Please ${clause}.` : `${turn?.question || ""} ${turn?.answer || ""}`.trim();
+}
+
 function isActionConfirmation(question) {
-  return /^(?:(?:ok(?:ay)?|yes|sure)(?:,?\s+(?:do it|go(?:\s+ahead)?(?:\s+and)?(?:\s+do it)?|start|build it))?|do it|go(?:\s+ahead)?(?:\s+and)?(?:\s+do it)?|start)(?:\s+please)?[.!]*$/i
+  return /^(?:(?:ok(?:ay)?|yes|yeah|yep|sure)(?:,?\s+(?:do it|go(?:\s+ahead)?(?:\s+and)?(?:\s+do it)?|start|build it))?|do it|go(?:\s+ahead)?(?:\s+and)?(?:\s+do it)?|start)(?:\s+please)?[,!.?]*$/i
     .test(question.trim());
 }
 
 function pendingActionTurn(history = []) {
   const turn = history.at(-1);
-  return turn && !allowedWizardAction(turn.action) && answerPromisesAction(turn.answer) ? turn : undefined;
+  return turn && !allowedWizardAction(turn.action)
+    && (answerPromisesAction(turn.answer) || answerOffersAction(turn.answer)) ? turn : undefined;
 }
 
 const STRUCTURE_TYPES = [
@@ -188,8 +200,37 @@ export function parseRequestedDimensions(question) {
   };
 }
 
-function directStructureKind(question) {
+function mentionedStructureKind(question) {
   for (const [kind, pattern] of STRUCTURE_TYPES) if (pattern.test(question)) return kind;
+  return undefined;
+}
+
+function targetedStructureKind(question) {
+  const types = [...STRUCTURE_TYPES, ...REPRESENTATIONAL_TYPES];
+  const earliest = (patternFor) => {
+    let winner;
+    for (const [kind, pattern] of types) {
+      const match = question.match(patternFor(`(?:${pattern.source})`));
+      if (match && (!winner || match.index < winner.index)) winner = { kind, index: match.index };
+    }
+    return winner?.kind;
+  };
+  const explicit = earliest((noun) => new RegExp(
+    `\\b(?:add|light(?:\\s+up)?|brighten|modify|change|fix|repair|finish|improve|move|put|place|remove|replace|upgrade|expand|enlarge|decorate|furnish|rebuild)\\s+(?:(?:the|my|our|this|that)\\s+)?${noun}`,
+    "i",
+  )) || earliest((noun) => new RegExp(
+    `\\bmake\\s+(?:(?:the|my|our|this|that)\\s+)?${noun}\\b(?=.{0,60}\\b(?:brighter|bigger|larger|taller|wider|prettier|fancier|better)\\b)`,
+    "i",
+  ));
+  return explicit || earliest((noun) => new RegExp(
+    `\\b(?:to|in|inside|for|from)\\s+(?:(?:the|my|our|this|that)\\s+)?${noun}`,
+    "i",
+  ));
+}
+
+function directStructureKind(question) {
+  const mentioned = mentionedStructureKind(question);
+  if (mentioned) return mentioned;
   const phrase = question.match(/\b(?:build|construct|create|make)\s+(?:me\s+)?(?:an?\s+)?(.+?)(?:\s+(?:that|with|using|made|sized)\b|[?.!,]|$)/i)?.[1]
     ?.replace(/\b\d+\s*(?:x|×|by)\s*\d+(?:\s*(?:x|×|by)\s*\d+)?\b/gi, "")
     .replace(/\b(?:working|complete|entire|whole|big|small|large|tiny|automated|automatic)\b/gi, "")
@@ -199,27 +240,43 @@ function directStructureKind(question) {
   return undefined;
 }
 
-function priorStructureContext(history = []) {
+function priorStructureContext(history = [], question = "") {
+  const explicitlyNamedKind = targetedStructureKind(question);
+  let fallback;
   for (let index = history.length - 1; index >= 0; index -= 1) {
     const turn = history[index];
     const stored = allowedWizardAction(turn?.action);
     if (stored) {
       if (stored.type === "build_structure" && turn.status !== "failed") {
-        return { action: stored, index, status: turn.status || "unknown" };
+        const context = { action: stored, index, status: turn.status || "unknown" };
+        fallback ||= context;
+        if (explicitlyNamedKind
+          ? stored.plan.kind === explicitlyNamedKind
+            || representationalKind(stored.plan.kind) === explicitlyNamedKind
+          : question && namesPriorStructure(question, stored)) return context;
       }
       continue;
     }
     const priorKind = directStructureKind(turn?.question || "");
     if (priorKind && isBuildRequest(turn.question)) {
       const action = structureAction(turn.question, [], { allowModify: false });
-      if (action) return { action, index };
+      if (action) {
+        const context = { action, index };
+        fallback ||= context;
+        if (explicitlyNamedKind
+          ? action.plan.kind === explicitlyNamedKind
+            || representationalKind(action.plan.kind) === explicitlyNamedKind
+          : question && namesPriorStructure(question, action)) return context;
+      }
     }
   }
-  return undefined;
+  // A child who names a structure must never silently edit a newer, different
+  // structure. Without a matching record the caller can choose a fresh action.
+  return explicitlyNamedKind ? undefined : fallback;
 }
 
-function priorStructureAction(history = []) {
-  return priorStructureContext(history)?.action;
+function priorStructureAction(history = [], question = "") {
+  return priorStructureContext(history, question)?.action;
 }
 
 function namesPriorStructure(question, action) {
@@ -231,7 +288,7 @@ function namesPriorStructure(question, action) {
 }
 
 function isShortAcknowledgement(question = "") {
-  return /^(?:(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?|cool|nice|awesome|great|perfect|love it|looks good)[!.?]*$/i
+  return /^(?:(?:thanks|thank you|thx)(?:\s+(?:wizard|wiz))?|cool|nice|awesome|great|perfect|love it|looks good)[!.?]*$/i
     .test(question.trim());
 }
 
@@ -241,6 +298,28 @@ function latestProjectTurn(history = []) {
     if (turn?.goal?.status === "active" || allowedWizardAction(turn?.action)) return { turn, index };
   }
   return undefined;
+}
+
+function actionProjectKind(action, question = "") {
+  const stored = allowedWizardAction(action);
+  if (!stored) return undefined;
+  const kind = stored.plan?.kind
+    || stored.program?.targetKind
+    || (stored.type === "place_blueprint" ? stored.id : undefined)
+    || (stored.type === "execute_program" && isBuildRequest(question)
+      ? directStructureKind(question) || stored.program?.title
+      : stored.type === "execute_program" ? stored.program?.title : undefined);
+  return typeof kind === "string" ? kind.replace(/\s+/g, " ").trim().slice(0, 80) || undefined : undefined;
+}
+
+function projectKindNamedInQuestion(kind, question) {
+  const wanted = String(kind || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  const text = String(question || "").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+  if (!wanted || !text) return false;
+  if (` ${text} `.includes(` ${wanted} `)) return true;
+  const words = wanted.split(" ").filter((word) => word.length >= 3
+    && !/^(?:automated|automatic|build|complete|create|make|project|working)$/.test(word));
+  return words.length > 0 && words.every((word) => new RegExp(`\\b${word}\\b`, "i").test(text));
 }
 
 function latestActionTurn(history = []) {
@@ -295,7 +374,7 @@ function isGoalSatisfaction(question, history = []) {
   return Boolean(activeWizardGoal(history))
     && (!activeGoalId || projectGoalId === activeGoalId)
     && project?.status === "completed"
-    && /^(?:(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?|perfect|love it|looks good|that works|it works|all done|finished|great job|nice job|awesome)[!.]*$/i
+    && /^(?:(?:thanks|thank you|thx)(?:\s+(?:wizard|wiz))?|perfect|love it|looks good|that works|it works|all done|finished|great job|nice job|awesome)[!.]*$/i
       .test(question.trim());
 }
 
@@ -310,15 +389,17 @@ function isProjectFeedback(question, history = []) {
   const explicitNewBuild = /\b(?:build|construct|create|make)\s+(?:me\s+)?(?:an?|another|new)\s+/i.test(text)
     && !refersToProject;
   if (explicitNewBuild) return false;
-  const directCorrectionVerb = /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+|please\s+)?(?:add|remove|replace|fix|repair|redo|rework|revise|change|modify|upgrade|expand|enlarge|finish|complete|continue|make\s+(?:it|this|that)|bigger|smaller|taller|wider)\b/i.test(text);
-  const concreteEditTarget = /\b(?:balcon(?:y|ies)|battlements?|chimneys?|colors?|colou?rs?|doors?|floors?|flags?|gardens?|goats?|grass|iron\s+golems?|lights?|lighting|moats?|parks?|rainbow|railings?|rooms?|roofs?|stairs?|towers?|turrets?|villagers?|walkways?|walls?|windows?|inside|outside|decorations?|furnishings?)\b/i.test(text)
-    || /\b(?:bigger|larger|smaller|taller|shorter|wider|narrower|deeper|fancier|prettier|cooler)\b/i.test(text)
+  const directCorrectionVerb = /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+|please\s+)?(?:add|light|brighten|remove|replace|fix|repair|redo|rework|revise|change|modify|upgrade|expand|enlarge|finish|complete|continue|make\s+(?:it|this|that)|bigger|smaller|taller|wider)\b/i.test(text);
+  const concreteEditTarget = /\b(?:balcon(?:y|ies)|battlements?|benches?|beds?|chests?|chimneys?|colors?|colou?rs?|couches?|doors?|flower\s+beds?|floors?|flags?|furniture|gardens?|goats?|grass|iron\s+golems?|lights?|lighting|torches?|moats?|parks?|playgrounds?|porches?|rainbow|railings?|rooms?|roofs?|school\s+signs?|stairs?|towers?|turrets?|villagers?|walkways?|walls?|windows?|inside|outside|decorations?|furnishings?)\b/i.test(text)
+    || /\b(?:bigger|larger|smaller|taller|shorter|wider|narrower|deeper|fancier|prettier|cooler|brighter|darker|ugly)\b/i.test(text)
     || Boolean(parseRequestedDimensions(text) || requestedMaterialBlock(text));
   const directCorrection = directCorrectionVerb && concreteEditTarget;
   const reversedCorrection = concreteEditTarget
     && /\b(?:wrong|off|not\s+right|fix|change|correct|repair)\b/i.test(text);
   const observedFailure = /^(?:the\s+)?(?:chickens?|sheep|animals?|items?|blocks?)\b.{0,100}\b(?:escape|escaped|escaping|leak|leaking|fell|falling|popping|broken|stuck)\b/i.test(text);
-  return corrective && (refersToProject || directCorrection || reversedCorrection || observedFailure);
+  const conciseConcreteEdit = concreteEditTarget && text.split(/\s+/).length <= 8 && !explicitNewBuild;
+  return (corrective && (refersToProject || directCorrection || reversedCorrection || observedFailure))
+    || conciseConcreteEdit;
 }
 
 function defaultGoal(question, action) {
@@ -330,9 +411,11 @@ function defaultGoal(question, action) {
   } else if (action?.type === "world_control") {
     successCriteria = "The live world time and weather match the player's request.";
   } else if (action?.type === "give_items") {
-    successCriteria = "The requested items arrive in the player's inventory or at their feet.";
+    successCriteria = `Every requested item, amount, name, and enchantment arrives with ${action.recipient || "the requesting player"}.`;
   } else if (action?.type === "show_recipe") {
     successCriteria = "A correct, readable in-world recipe display is present nearby.";
+  } else if (action?.type === "execute_program") {
+    successCriteria = `Every observable expectation in “${action.program.title}” succeeds and the complete result satisfies: ${objective}`.slice(0, 500);
   } else if (["place_blueprint", "build_machine", "build_structure", "build_plan"].includes(action?.type)) {
     successCriteria = `The finished nearby project visibly and functionally satisfies the player's exact request: ${objective}`.slice(0, 500);
   }
@@ -348,7 +431,10 @@ function appendRequiredGoalCriterion(criteria, required) {
 
 function goalForTurn({ question, history, providerGoal, action, inWorldRequest, satisfied, review }) {
   const existing = activeWizardGoal(history);
-  const projectBaseline = existing || (isProjectFeedback(question, history) ? latestWizardGoal(history) : undefined);
+  const targetedProject = isProjectFeedback(question, history)
+    ? projectTurnForQuestion(question, history) : undefined;
+  const projectBaseline = allowedWizardGoal(targetedProject?.goal)
+    || existing || (isProjectFeedback(question, history) ? latestWizardGoal(history) : undefined);
   if (satisfied && existing) return { ...existing, status: "complete" };
   const proposed = allowedWizardGoal(providerGoal);
   if (review && existing) {
@@ -370,22 +456,26 @@ function goalForTurn({ question, history, providerGoal, action, inWorldRequest, 
 }
 
 function requestsStructureEdit(question) {
-  const operation = "(?:add|decorate|furnish|upgrade|improve|expand|enlarge|finish|change|replace|rebuild|put|place|remove)";
+  const operation = "(?:add|light|brighten|decorate|furnish|upgrade|improve|expand|enlarge|finish|fix|repair|change|move|replace|rebuild|put|place|remove)";
   const framed = new RegExp(`(?:^|[.!?,]\\s*)(?:(?:hey|wiz|wizard)[,:]?\\s*)?(?:(?:can|could|would|will)\\s+you\\b.{0,100}\\b${operation}\\b|(?:please\\s+)?${operation}\\b)`, "i")
     .test(question);
-  const makeEdit = /\bmake\s+(?:it|this|that|(?:the|my|our)\s+(?:build|structure|one|castle|fort|fortress|house|home|cabin|cottage|mansion|tower|lighthouse|bridge|barn|base|shop|store|market|school|wall|monument|treehouse|dragon|statue|maze))\s+(?:bigger|larger|wider|deeper|taller|higher|fancier|prettier|cooler|rainbow|colou?rful|\d+|(?:out of|with|using)\b|(?:spruce|birch|oak|wood|stone|cobblestone|deepslate|bricks?|concrete|quartz|glass)\b)/i
+  const makeEdit = /\bmake\s+(?:it|this|that|(?:the|my|our)\s+(?:build|structure|one|castle|fort|fortress|house|home|cabin|cottage|mansion|tower|lighthouse|bridge|barn|base|shop|store|market|school|wall|monument|treehouse|dragon|statue|maze))\s+(?:bigger|larger|wider|deeper|taller|higher|fancier|prettier|cooler|brighter|rainbow|colou?rful|\d+|(?:out of|with|using)\b|(?:spruce|birch|oak|wood|stone|cobblestone|deepslate|bricks?|concrete|quartz|glass)\b)/i
     .test(question);
   const giveEdit = /\bgive\s+(?:it|this|that|(?:the|my|our)\s+(?:build|structure|one|castle|fort|fortress|house|home|cabin|cottage|mansion|tower|lighthouse|bridge|barn|base|shop|store|market|school|wall|monument|treehouse|dragon|statue|maze))\s+\S+/i.test(question);
   const framedMakeOrGive = /(?:^|[.!?,]\s*)(?:(?:hey|wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+|please\s+)?(?:make|give)\b/i
     .test(question);
-  return framed || (framedMakeOrGive && (makeEdit || giveEdit));
+  const embeddedDetail = /\b(?:build|make|create|put|place)\b.{0,100}\b(?:benches?|beds?|chests?|couches?|decorations?|flower\s+beds?|furniture|furnishings?|playgrounds?|rooms?|school\s+signs?)\b.{0,50}\b(?:in|inside|for|to)\s+(?:my|the|our)\s+(?:build|structure|castle|house|mansion|school|tower|city|village)\b/i
+    .test(question);
+  return framed || embeddedDetail || (framedMakeOrGive && (makeEdit || giveEdit));
 }
 
 function isStructureModification(question, history = []) {
-  const context = priorStructureContext(history);
+  const context = priorStructureContext(history, question);
   const projectFeedback = isProjectFeedback(question, history);
   if (!context || (!requestsStructureEdit(question) && !projectFeedback)) return false;
-  if (/\b(?:another|new|separate|next to it|beside it)\b/i.test(question)
+  if ((/\b(?:another|new|separate)\s+(?:build|structure|castle|house|mansion|school|tower|city|village)\b/i.test(question)
+    || /\b(?:build|make|create|construct)\b.{0,30}\b(?:another|new|separate)\b/i.test(question)
+    || /\b(?:next to it|beside it)\b/i.test(question))
     && /\b(?:build|make|create|construct)\b/i.test(question)) return false;
   const onlyAcknowledgementsSince = history.slice(context.index + 1)
     .every((turn) => isShortAcknowledgement(turn?.question));
@@ -397,7 +487,7 @@ function isStructureModification(question, history = []) {
 
 function structureKind(question, history = []) {
   if (isStructureModification(question, history)) {
-    return priorStructureAction(history)?.plan.kind || "structure";
+    return priorStructureAction(history, question)?.plan.kind || "structure";
   }
   const direct = directStructureKind(question);
   if (direct) return direct;
@@ -824,7 +914,7 @@ function requestedDetailPrimitives(question, dimensions, materials) {
       primitive("foundation", moatBlock, [w, 0, 0], [w, 0, d - 1]),
     );
   }
-  if (/\bredstone[- ]powered\s+bridge\b|\bpowered\s+bridge\b/i.test(question)) {
+  if (/\bredstone(?:[- ]powered)?\s+bridge\b|\bpowered\s+bridge\b/i.test(question)) {
     const center = at(w, 0.5);
     const start = /\bmoat\b/i.test(question) ? -2 : 0;
     const end = Math.min(d - 1, 2);
@@ -838,7 +928,7 @@ function requestedDetailPrimitives(question, dimensions, materials) {
       primitive("details", "minecraft:redstone_lamp", [right, 1, start], [right, 1, end]),
     );
   }
-  if (/\b(?:too\s+dark|dark\s+inside|light\s+it\s+up|make\s+it\s+brighter|add\s+(?:more\s+)?lights?)\b/i.test(question)) {
+  if (/\b(?:too\s+dark|dark\s+inside|light\s+it\s+up|light\s+(?:(?:the|my|this|that)\s+)?(?:castle|house|mansion|tower|city|school|build|structure)\s+up|light\s+up\s+(?:(?:the|my|this|that)\s+)?(?:castle|house|mansion|tower|city|school|build|structure)|brighten(?:\s+(?:it|this|that|(?:(?:the|my|our|this|that)\s+)?(?:castle|house|mansion|tower|city|school|build|structure)))?|make\s+(?:it|this|that|(?:(?:the|my|our|this|that)\s+)?(?:castle|house|mansion|tower|city|school|build|structure))\s+brighter|add\s+(?:more\s+)?(?:lights?|torches?))\b/i.test(question)) {
     const step = Math.max(4, Math.ceil(Math.sqrt((w * d) / 48)));
     // The generated structure already uses a grid beginning at offset 2.
     // Start this patch at `step` so "light it up" adds new lights instead of
@@ -950,7 +1040,7 @@ function destructiveCityPatch(plan) {
 
 function carryForwardStructurePrimitives(action, history = [], question = "") {
   const goalAction = allowedWizardAction(latestGoalActionTurn(history)?.turn?.action);
-  const previousAction = isStagedBuildProgress(goalAction) ? goalAction : priorStructureAction(history);
+  const previousAction = isStagedBuildProgress(goalAction) ? goalAction : priorStructureAction(history, question);
   const previous = previousAction?.plan;
   if (isStagedBuildProgress(previousAction) && action?.type === previousAction.type
     && action.plan?.kind === previous.kind) {
@@ -1018,7 +1108,7 @@ function editNeedsAuthoredPrimitives(question) {
 }
 
 function arbitraryFeatureEditNeedsChangedPrimitives(question, history, nextPlan) {
-  const previous = priorStructureAction(history)?.plan;
+  const previous = priorStructureAction(history, question)?.plan;
   if (!previous || (Object.hasOwn(STRUCTURE_DEFAULTS, previous.kind) && previous.kind !== "structure")) return false;
   if (!requestedStructureFeatures(question).length) return false;
   if (!previous.primitives?.length || !nextPlan.primitives?.length) return true;
@@ -1076,8 +1166,8 @@ function requestedStructureEntities(question, kind, dimensions, features, vagueD
 
 function structureAction(question, history = [], { allowModify = true } = {}) {
   const modifying = allowModify && (isStructureModification(question, history)
-    || (isProjectFeedback(question, history) && Boolean(priorStructureAction(history))));
-  const previous = modifying ? priorStructureAction(history) : undefined;
+    || (isProjectFeedback(question, history) && Boolean(priorStructureAction(history, question))));
+  const previous = modifying ? priorStructureAction(history, question) : undefined;
   const kind = previous?.plan.kind || structureKind(question, history);
   const templateKind = representationalKind(kind);
   const ordinaryKind = Object.hasOwn(STRUCTURE_DEFAULTS, kind) && kind !== "structure";
@@ -1090,9 +1180,11 @@ function structureAction(question, history = [], { allowModify = true } = {}) {
     height: explicitDimensions?.height ?? previous?.plan.dimensions?.height ?? defaults[2],
   };
   const bigger = !explicitDimensions && /\b(?:bigger|larger|expand|enlarge)\b/i.test(question);
+  const wider = !explicitDimensions && /\bwider\b/i.test(question);
+  const deeper = !explicitDimensions && /\b(?:deeper|longer)\b/i.test(question);
   const taller = !explicitDimensions && /\b(?:taller|higher|second floor|another floor|upper floor|upstairs)\b/i.test(question);
-  const width = Math.min(STRUCTURE_LIMITS.width, Math.max(1, requested.width + (bigger ? 4 : 0)));
-  const depth = Math.min(STRUCTURE_LIMITS.depth, Math.max(1, requested.depth + (bigger ? 4 : 0)));
+  const width = Math.min(STRUCTURE_LIMITS.width, Math.max(1, requested.width + (bigger || wider ? 4 : 0)));
+  const depth = Math.min(STRUCTURE_LIMITS.depth, Math.max(1, requested.depth + (bigger || deeper ? 4 : 0)));
   const height = Math.min(STRUCTURE_LIMITS.height, Math.max(1, requested.height + (bigger ? 2 : 0) + (taller ? 4 : 0)));
   const explicitMaterial = Boolean(requestedMaterialBlock(question));
   const [primary, accent, roof] = materialPalette(question, canonicalKind);
@@ -1190,7 +1282,8 @@ function structureAction(question, history = [], { allowModify = true } = {}) {
       : proceduralCityAction(candidate, question)
     : candidate;
   const action = allowedWizardAction(executableCandidate);
-  if (modifying && (!action || !structurePlanChanged(previous?.plan, action.plan))) return null;
+  const repairsExisting = /\b(?:fix|repair|rebuild)\b/i.test(question);
+  if (modifying && (!action || (!repairsExisting && !structurePlanChanged(previous?.plan, action.plan)))) return null;
   return action;
 }
 
@@ -1211,7 +1304,7 @@ function recipeAction(question) {
 function worldControlAction(question) {
   if (isPotionRainRequest(question)) return null;
   const requestClause = requestClauses(question).find((clause) => (
-    /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:make|set|change|turn)\b/i.test(clause)
+    /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:make|set|change|turn)\b/i.test(clause)
       || /\b(?:i|we)\s+(?:want|need)\b.{0,40}\b(?:day|daytime|night|nighttime|noon|midnight|rain|clear|sunny|thunder|storm)\b/i.test(clause)
   ));
   if (!requestClause) return null;
@@ -1228,8 +1321,8 @@ function worldControlAction(question) {
 
 function explicitItemRequestClause(question) {
   return requestClauses(question).find((clause) => (
-    /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:give|bring|hand|drop)\s+(?:me|us)\b/i.test(clause)
-      || /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:can|could|may)\s+(?:i|we)\s+(?:please\s+)?(?:have|get|receive)\b/i.test(clause)
+    /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:give|bring|hand|drop)\s+(?:me|us|[a-zA-Z0-9_-]{3,32})\b/i.test(clause)
+      || /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?(?:can|could|may)\s+(?:i|we)\s+(?:please\s+)?(?:have|get|receive)\b/i.test(clause)
   ));
 }
 
@@ -1316,11 +1409,48 @@ function giveItemsAction(question) {
   });
 }
 
+const SIMPLE_PLACEABLE_BLOCKS = new Map([
+  ...LOCAL_GIFT_ITEMS,
+  ["crafting table", "minecraft:crafting_table"],
+  ["furnace", "minecraft:furnace"],
+]);
+
+function simpleBlockPlacementAction(question) {
+  const clause = requestClauses(question).find((candidate) => /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:place|put\s+down|set\s+down)\b/i.test(candidate));
+  if (!clause) return null;
+  const named = clause.match(/\b(?:place|put\s+down|set\s+down)\s+(?:an?|one|some)?\s*([a-z ]{2,40}?)(?:\s+(?:here|nearby|there|for me))?[.!?]*$/i)?.[1]
+    ?.trim().replace(/s$/, "");
+  const itemId = SIMPLE_PLACEABLE_BLOCKS.get(named?.toLowerCase());
+  if (!itemId || ["minecraft:arrow", "minecraft:bread"].includes(itemId)) return null;
+  const label = named.replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return allowedWizardAction({
+    type: "execute_program",
+    version: 1,
+    program: {
+      title: `Place ${label}`,
+      site: "nearby",
+      steps: [{
+        id: "place_block",
+        capability: "player.place-blocks",
+        arguments: { blocks: [{
+          itemId, target: [0, 0, 0], support: [0, -1, 0], expectedType: itemId,
+        }] },
+        expect: `The ${named} is placed nearby.`,
+      }, {
+        id: "verify_block",
+        capability: "verify.blocks",
+        arguments: { blocks: [{ target: [0, 0, 0], typeId: itemId }] },
+        expect: `The ${named} remains in place.`,
+      }],
+    },
+  });
+}
+
 function dimensionTravelAction(question) {
   if (/\b(?:build|make|create|construct|light|activate)\b.{0,80}\bportal\b/i.test(question)
     && !/\b(?:don't|dont|do\s+not|never)\b.{0,30}\b(?:build|make|create|construct|light|activate)\b/i.test(question)) return null;
   const clause = requestClauses(question).find((candidate) => {
-    const prefix = "(?:(?:(?:hey|hi|well|so|okay|alright)[, ]+)+)?(?:(?:wiz|wizard)[,:]?\\s*)?(?:just\\s+)?";
+    const prefix = "(?:(?:(?:hey|hi|well|so|okay|alright)[, ]+)+)?(?:(?:wizard|wiz)[,:]?\\s*)?(?:just\\s+)?";
     const destination = "(?:nether|(?:the\\s+)?end|end\\s+dimension|overworld|normal\\s+world)";
     return new RegExp(`^${prefix}(?:(?:can|could|would|will)\\s+you\\s+)?(?:please\\s+)?(?:take|teleport|transport|send|move|bring)\\s+(?:me|us|everyone|all of us|the (?:players?|party))\\s+(?:back\\s+)?(?:to|into)\\s+(?:the\\s+)?${destination}\\b`, "i").test(candidate)
       || new RegExp(`^${prefix}(?:can|could|may|should|would)\\s+(?:i|we)\\s+(?:please\\s+)?(?:go|travel)\\s+(?:back\\s+)?(?:to|into)\\s+(?:the\\s+)?${destination}\\b`, "i").test(candidate)
@@ -1344,7 +1474,7 @@ const LOCAL_EFFECTS = [
   [/\bconduit\s+power\b/i, "conduit_power"],
   [/\bregeneration\b/i, "regeneration"],
   [/\bresistance\b/i, "resistance"],
-  [/\binvisibility\b/i, "invisibility"],
+  [/\binvisib(?:ility|le)\b/i, "invisibility"],
   [/\bstrength\b/i, "strength"],
   [/\bhaste\b/i, "haste"],
   [/\bspeed\b/i, "speed"],
@@ -1352,28 +1482,106 @@ const LOCAL_EFFECTS = [
 
 function commandAction(question) {
   if (explicitlyRequestsCommand(question)) return null;
+  const effect = LOCAL_EFFECTS.find(([pattern]) => pattern.test(question));
+  if (!effect) return null;
+  if (/\b(?:potion|arrow|sword|axe|pickaxe|shovel|helmet|chestplate|leggings|boots|beacon|bridge|portal|castle|house|farm|machine|road|railway|tower|city)\b/i.test(question)
+    && !/\b(?:effect|buff|apply|cast)\b/i.test(question)) return null;
   const clauses = requestClauses(question);
   const asksForEffect = clauses.some((clause) => {
-    const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "");
-    return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:give|grant|apply|add|cast)\s+(?:me|on me)\b/i.test(direct)
-      || /^(?:i\s+(?:want|need)|let me have)\b/i.test(direct);
+    const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "");
+    const effectOnly = direct.replace(effect[0], "").replace(/\bplease\b/gi, "").replace(/[.!?]/g, "").trim() === "";
+    return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:give|grant|add)\s+me\b/i.test(direct)
+      || /^(?:can|could|may)\s+i\s+(?:please\s+)?(?:get|have|receive)\b/i.test(direct)
+      || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:apply|cast)\b.{0,80}\b(?:to|on|for)\s+me\b/i.test(direct)
+      || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?put\b.{0,80}\b(?:on|for)\s+me\b/i.test(direct)
+      || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?cast\s+me\b/i.test(direct)
+      || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?make\s+me\b/i.test(direct)
+      || /^(?:i\s+(?:want|need)|let me have)\b/i.test(direct)
+      || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:use|enable|turn\s+on)\b.{0,80}\b(?:on|for)\s+me\b/i.test(direct)
+      || /\b(?:light|brighten)\b.{0,80}\bwith\b/i.test(direct)
+      || effectOnly;
   });
   if (asksForEffect) {
-    const effect = LOCAL_EFFECTS.find(([pattern]) => pattern.test(question))?.[1];
-    if (effect) return allowedWizardAction({
+    if (effect[1]) return allowedWizardAction({
       type: "run_commands",
       version: 1,
-      commands: [`effect @s ${effect} 999999 0 true`],
+      commands: [`effect @s ${effect[1]} 999999 0 true`],
     });
   }
   return null;
 }
 
-function areaTorchAction(question) {
+function trustedAdminAction(question) {
+  const direct = String(question).trim()
+    .replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "")
+    .replace(/^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?/i, "");
+  const grantOperator = /^(?:(?:make|promote)\s+me\s+(?:an?\s+)?(?:operator|op)|op\s+me|give\s+me\s+(?:operator|op)(?:\s+(?:permission|permissions|status))?)\b/i.test(direct)
+    || /^(?:i\s+(?:want|need)\s+(?:to\s+be|operator|op)|let\s+me\s+be)\s+(?:an?\s+)?(?:operator|op)\b/i.test(direct);
+  const removeOperator = /^(?:(?:deop|demote)\s+me|remove\s+my\s+(?:operator|op)(?:\s+(?:permission|permissions|status))?)\b/i.test(direct);
+  if (!grantOperator && !removeOperator) return null;
+  const command = grantOperator ? "op {{requester}}" : "deop {{requester}}";
+  return allowedWizardAction({
+    type: "execute_program",
+    version: 1,
+    program: {
+      title: grantOperator ? "Grant operator" : "Remove operator",
+      steps: [{
+        id: grantOperator ? "grant_operator" : "remove_operator",
+        capability: "server.console",
+        arguments: { commands: [command] },
+        expect: grantOperator ? "The requesting player is an operator." : "The requesting player is no longer an operator.",
+        onFailure: "replan",
+      }],
+    },
+  });
+}
+
+function areaTorchAction(question, history = []) {
   if (explicitlyRequestsCommand(question)) return null;
+  const structureLighting = isStructureModification(question, history)
+    && (/\b(?:castle|house|mansion|tower|city|school|build|structure)\b/i.test(question)
+      || /\b(?:light\s+it\s+up|make\s+it\s+brighter|brighten\s+(?:it|this|that))\b/i.test(question));
+  if (structureLighting && /\btorches?\b/i.test(question)) {
+    const prior = priorStructureAction(history, question);
+    if (!prior?.plan?.dimensions) return null;
+    const { width, depth } = prior.plan.dimensions;
+    const xs = [...new Set([2, Math.floor(width / 2), width - 3]
+      .map((value) => Math.max(1, Math.min(width - 2, value))))];
+    const zs = [...new Set([2, Math.floor(depth / 2), depth - 3]
+      .map((value) => Math.max(1, Math.min(depth - 2, value))))];
+    const blocks = xs.flatMap((x) => zs.map((z) => ({
+      itemId: "minecraft:torch",
+      target: [x, 1, z],
+      support: [x, 0, z],
+      expectedType: "minecraft:torch",
+    }))).slice(0, 16);
+    return allowedWizardAction({
+      type: "execute_program",
+      version: 1,
+      program: {
+        title: `Light the ${prior.plan.kind} with torches`,
+        site: "active_project",
+        targetKind: prior.plan.kind,
+        steps: [{
+          id: "place_torches",
+          capability: "player.place-blocks",
+          arguments: { blocks },
+          expect: `Torches light the ${prior.plan.kind}.`,
+          onFailure: "replan",
+        }, {
+          id: "verify_torches",
+          capability: "verify.blocks",
+          arguments: { blocks: blocks.map(({ target }) => ({ target, typeId: "minecraft:torch" })) },
+          expect: "Every torch remains attached and lit.",
+          onFailure: "replan",
+        }],
+      },
+    });
+  }
+  if (structureLighting) return null;
   const asksForLight = requestClauses(question).some((clause) => {
-    const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "");
-    return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:light\s+up|brighten|add\s+lights?\s+(?:to|around|here))\b/i.test(direct)
+    const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "");
+    return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:light\s+(?:up\b|(?:it|this|that|(?:(?:this|that|the)\s+)?(?:area|place|room|space|build))\s+up\b)|brighten\b|make\s+(?:it|this|that|(?:(?:this|that|the)\s+)?(?:area|place|room|space|build))\s+brighter\b|(?:put|place|set\s+down)\s+(?:some\s+)?torches?(?:\s+down)?\s+(?:here|around|nearby|around\s+me|(?:around|near)\s+(?:(?:the|my|this|that)\s+)?portal)\b|add\s+lights?\s+(?:to|around|here)\b)/i.test(direct)
       || /^(?:it(?:'| i)s|this\s+is)\s+(?:too\s+)?dark\b.{0,50}\b(?:light|bright)/i.test(direct);
   });
   return asksForLight ? allowedWizardAction({ type: "place_area_torches", version: 1 }) : null;
@@ -1411,19 +1619,30 @@ function canonicalNetherPortalAction({ lit = false, deactivate = false, modify =
 }
 
 function netherPortalAction(question, history = []) {
-  const previous = allowedWizardAction(latestActionTurn(history)?.turn?.action);
-  const previousPortal = previous?.type === "build_machine" && /\bnether\s+portal\b/i.test(previous.plan.kind);
+  if (/\b(?:light|brighten|torches?)\b.{0,50}\b(?:area|space|ground|around|near|nearby|surroundings?)\b.{0,30}\b(?:nether\s+)?portal\b/i.test(question)
+    || /\b(?:nether\s+)?portal\b.{0,30}\b(?:area|space|ground|surroundings?)\b/i.test(question)) return null;
+  const latest = allowedWizardAction(latestActionTurn(history)?.turn?.action);
+  const latestPortal = latest?.type === "build_machine" && /\bnether\s+portal\b/i.test(latest.plan.kind);
+  const namesPortal = /\b(?:nether\s+)?portal\b/i.test(question);
+  const previous = latestPortal ? latest : namesPortal
+    ? [...history].reverse().map((turn) => allowedWizardAction(turn?.action)).find((action) => (
+      action?.type === "build_machine" && /\bnether\s+portal\b/i.test(action.plan.kind)
+    ))
+    : undefined;
+  const previousPortal = Boolean(previous);
   const deactivate = /\b(?:(?:turn|switch)\s+(?:(?:the\s+)?portal\s+off|off\s+(?:the\s+)?portal)|make\s+(?:the\s+)?portal\s+unlit|(?:deactivate|extinguish|unlight)\b.{0,40}\b(?:the\s+)?portal)\b/i.test(question)
     || previousPortal && /\b(?:(?:turn|switch)\s+(?:(?:it|that)\s+off|off\s+(?:it|that))|make\s+(?:it|that)\s+unlit|(?:deactivate|extinguish|unlight)\s+(?:it|that))\b/i.test(question)
     || previousPortal && /\bbreak\s+(?:one|1|a)\s+(?:obsidian\s+)?block\b/i.test(question);
   if (deactivate && previousPortal) return canonicalNetherPortalAction({ deactivate: true });
   const build = explicitlyRequestsBuild(question);
   const activatePrevious = previousPortal && !build
-    && /\b(?:light|activate|ignite)\s+(?:it|that|(?:the\s+)?portal)\b/i.test(question);
+    && (latestPortal
+      ? /\b(?:light(?:\s+up)?|activate|ignite)\s+(?:it|that|(?:the\s+)?portal)\b/i.test(question)
+      : /\b(?:light(?:\s+up)?|activate|ignite)\s+(?:(?:the|my|this|that)\s+)?(?:nether\s+)?portal(?:\s+up)?\b/i.test(question));
   if (activatePrevious) return canonicalNetherPortalAction({ lit: true, modify: true });
   const portal = /\bnether\b.{0,120}\bportal\b|\bportal\b.{0,120}\bnether\b/i.test(question);
   const action = build
-    || requestClauses(question).some((clause) => /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:light|activate|ignite)\b/i.test(clause));
+    || requestClauses(question).some((clause) => /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:light(?:\s+up)?|activate|ignite)\s+(?:(?:the|my|this|that)\s+)?(?:nether\s+)?portal(?:\s+up)?\b/i.test(clause));
   const buildNegated = /\b(?:don't|dont|do\s+not|never)\b.{0,30}\b(?:build|make|create|construct)\b/i.test(question);
   const ignitionNegated = /\b(?:unlit|without\s+(?:lighting|light)|(?:don't|dont|do\s+not|never)\s+(?:light|activate))\b/i.test(question);
   const lit = !ignitionNegated && /\b(?:light|lit|activate|ignite)\b/i.test(question);
@@ -1432,24 +1651,26 @@ function netherPortalAction(question, history = []) {
 
 function isOrdinaryConversation(question) {
   const text = question.trim();
-  return /^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
-    || /^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)
+  return /^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wizard|wiz))?[!.?]*$/i.test(text)
+    || /^(?:thanks|thank you|thx)(?:\s+(?:wizard|wiz))?[!.?]*$/i.test(text)
     || /\b(?:are you ready|you ready|who are you|what can you do|tell me (?:a )?joke|how are you|how(?:’|'| i)s it going|what(?:’|'| i)s up|what do you think)\b/i.test(text)
     || isWeatherConversation(text);
 }
 
 function explicitlyRequestsBuild(question) {
-  const buildTarget = /\b(?:farm|machine|harvester|generator|elevator|engine|factory|smelter|sorter|door|contraption|circuit|calculator|adder|flip\s*flop|portal|castle|house|tower|bridge|barn|base|shop|school|wall|monument|city|village|settlement|treehouse|dragon|statue|sculpture|maze|pixel\s+art|vehicle|boat|ship|car|duck|animal|creature)\b/i;
+  const buildTarget = /\b(?:farm|machine|harvester|generator|elevator|engine|factory|smelter|sorter|door|contraption|circuit|calculator|adder|flip\s*flop|portal|castle|house|tower|bridge|barn|base|shop|school|wall|monument|city|village|settlement|treehouse|dragon|statue|sculpture|maze|pixel\s+art|vehicle|boat|ship|car|duck|animal|creature|furniture|sofa|couch|chair|desk|table|bed)\b/i;
   return requestClauses(question).some((clause) => {
-    const prefix = /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i;
+    const prefix = /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i;
     const direct = clause.replace(prefix, "");
     return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:build|construct|create|place|demo|demonstrate)\b/i.test(direct)
+      || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:research|look\s+up|figure\s+out|find\s+out)\b.{0,80}\band\s+(?:then\s+)?(?:build|construct|create|place|make)\b/i.test(direct)
       || /^(?:can|could|may|would)\s+(?:i|we)\s+(?:please\s+)?(?:build|construct|create|place)\b/i.test(direct)
       || /^(?:i|we)\s+(?:want|need)\s+(?:you\s+to\s+)?(?:build|construct|create|place)\b/i.test(direct)
       || /^how\s+(?:do\s+i|can\s+i|to)\s+(?:build|construct|create)\b/i.test(direct)
       || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?make\s+(?:me|us)\b/i.test(direct)
       || (buildTarget.test(direct)
-        && /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:make|show\s+me)\b/i.test(direct));
+        && /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:make|show\s+me)\b/i.test(direct))
+      || /^(?:i|we)\s+(?:want|need)\s+(?:you\s+to\s+)?(?:an?\s+|some\s+|the\s+)?(?:furniture|sofa|couch|chair|desk|table|bed)\b/i.test(direct);
   });
 }
 
@@ -1467,6 +1688,9 @@ function groundedQuickAnswer(question, hits) {
 }
 
 function unusableWizardAnswer(answer, question) {
+  const text = String(answer || "").trim();
+  if (!/[a-z0-9]/i.test(text) || /^[{[]/.test(text) || /^(?:null|undefined|n\/a)$/i.test(text)
+    || /^(?:action|answer|goal)\s*:\s*(?:null|undefined)?\s*[,}\]]*$/i.test(text)) return true;
   if (/\b(?:my|our|the) (?:Bedrock )?(?:notes|sources|documentation|corpus)\b/i.test(answer)) return true;
   const ordinaryQuestion = !/\b(?:delete|destroy|irreversible|shared world|another player|ban|kick|kill)\b/i.test(question);
   return ordinaryQuestion && /\bask (?:an? )?adult\b/i.test(answer);
@@ -1474,13 +1698,13 @@ function unusableWizardAnswer(answer, question) {
 
 export function instantConversationAnswer(question) {
   const text = question.trim();
-  if (/^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)) {
+  if (/^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wizard|wiz))?[!.?]*$/i.test(text)) {
     return "Hi! I’m right here. What should we build or learn today?";
   }
-  if (/^(?:are you ready|you ready|ready)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)) {
+  if (/^(?:are you ready|you ready|ready)(?:\s+(?:wizard|wiz))?[!.?]*$/i.test(text)) {
     return "Ready! Tell me what you want to try, and I’ll start with you.";
   }
-  if (/^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(text)) {
+  if (/^(?:thanks|thank you|thx)(?:\s+(?:wizard|wiz))?[!.?]*$/i.test(text)) {
     return "You’re welcome! I’m ready for the next idea.";
   }
   if (/\b(?:tell me (?:a )?joke|minecraft joke)\b/i.test(text)) {
@@ -1504,6 +1728,13 @@ function normalizeActionRequest(question) {
     .replace(/\bnetherportal\b/gi, "nether portal");
 }
 
+function primaryBuildSubject(question) {
+  return question.match(/\b(?:build|construct|create|make)\s+(?:me\s+|us\s+)?(?:an?|the|some)?\s*([^,.!?]{1,100})/i)?.[1]
+    ?.split(/\b(?:next\s+to|beside|near|inside|in|at|for)\b/i, 1)[0]
+    .replace(/\b(?:with|using|made\s+of)\b.*$/i, "")
+    .trim();
+}
+
 export function classifyAction(question, history = []) {
   question = normalizeActionRequest(question);
   const refusesBuild = /\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
@@ -1511,23 +1742,27 @@ export function classifyAction(question, history = []) {
   if (isPotionRainRequest(question)) {
     return allowedWizardAction({ type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 });
   }
-  const torches = areaTorchAction(question);
-  if (torches) return torches;
+  const admin = trustedAdminAction(question);
+  if (admin) return admin;
   const command = commandAction(question);
   if (command) return command;
+  const portal = netherPortalAction(question, history);
+  if (portal) return portal;
+  const torches = areaTorchAction(question, history);
+  if (torches) return torches;
   const dimensionTravel = dimensionTravelAction(question);
   if (dimensionTravel) return dimensionTravel;
   if (refusesBuild) return null;
-  const portal = netherPortalAction(question, history);
-  if (portal) return portal;
   const pending = isActionConfirmation(question) ? pendingActionTurn(history) : undefined;
   if (pending) {
-    const pendingQuestion = `${pending.question || ""} ${pending.answer || ""}`.trim();
+    const pendingQuestion = offeredActionQuestion(pending);
     const resumed = classifyAction(pendingQuestion, history.filter((turn) => turn !== pending));
     if (resumed) return resumed;
   }
   const worldControl = worldControlAction(question);
   if (worldControl) return worldControl;
+  const placedBlock = simpleBlockPlacementAction(question);
+  if (placedBlock) return placedBlock;
   const giveItems = giveItemsAction(question);
   if (giveItems) return giveItems;
   const recipe = recipeAction(question);
@@ -1535,7 +1770,7 @@ export function classifyAction(question, history = []) {
   const woolMechanism = /\b(?:wool|sheep|shear|shears|dispens[eo]r)\b/i.test(question)
     && /\b(?:automatic|automated|farm|shear|shears|dispens[eo]r|collect|pick\s*up)\b/i.test(question);
   const directsWoolCorrection = woolMechanism && requestClauses(question).some((clause) => {
-    const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "");
+    const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "");
     return /^(?:no\b|you\s+should\b|use\b)/i.test(direct);
   });
   const wantsBuild = explicitlyRequestsBuild(question)
@@ -1568,7 +1803,8 @@ export function classifyAction(question, history = []) {
   }
   const commonFarm = wantsBuild ? commonFarmAction(question) : null;
   if (commonFarm) return allowedWizardAction(commonFarm);
-  const knownStructure = STRUCTURE_TYPES.some(([, pattern]) => pattern.test(question));
+  const requestedSubject = primaryBuildSubject(question);
+  const knownStructure = STRUCTURE_TYPES.some(([, pattern]) => pattern.test(requestedSubject || question));
   const structureFollowup = isStructureModification(question, history);
   if (wantsBuild && (knownStructure || structureFollowup)) return structureAction(question, history);
   return null;
@@ -1576,7 +1812,8 @@ export function classifyAction(question, history = []) {
 
 function isBuildRequest(question, history = []) {
   if (dimensionTravelAction(question) || worldControlAction(question) || giveItemsAction(question)
-    || areaTorchAction(question) || commandAction(question) || isPotionRainRequest(question)) return false;
+    || areaTorchAction(question, history) || commandAction(question) || trustedAdminAction(question)
+    || isPotionRainRequest(question)) return false;
   return !/\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
     && !/\bjust\s+(?:explain|describe|tell)\b/i.test(question)
     && !isRecipeRequest(question)
@@ -1592,7 +1829,7 @@ function isFunctionalBuildRequest(question, history = []) {
     && /\b(?:farm|machine|harvester|generator|elevator|engine|factory|smelter|sorter|door|contraption|circuit|clock|launcher|railway|station|system|device|trap|portal)\b/i.test(question);
 }
 
-const CUSTOM_STRUCTURE_DETAIL = /\b(?:armou?ry|ballroom|basement|courtyard|dungeon|garage|great hall|kitchen|library|pool|secret rooms?|swimming pool|throne rooms?)\b/i;
+const CUSTOM_STRUCTURE_DETAIL = /\b(?:armou?ry|ballroom|basement|benches?|beds?|chests?|couches?|courtyard|dungeon|flower\s+beds?|furniture|garage|great hall|kitchen|library|playgrounds?|pool|school\s+signs?|secret rooms?|swimming pool|throne rooms?)\b/i;
 
 function wantsModelAuthoredStructure(action, buildRequest, question) {
   return buildRequest && action?.type === "build_structure"
@@ -1603,10 +1840,10 @@ function wantsModelAuthoredStructure(action, buildRequest, question) {
 const PLANNING_DEFERRED_ANSWER = "I’m keeping this as our active project, but I don’t have a safe executable change yet. Tell me one specific block or behavior to change and I’ll continue from there.";
 
 function localAnswer(question, hits, action) {
-  if (/^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(question.trim())) {
+  if (/^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wizard|wiz))?[!.?]*$/i.test(question.trim())) {
     return "Hi! I’m MC Wizard. I can explain Bedrock redstone and commands, or build a working demo while you watch. What are you making?";
   }
-  if (/^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(question.trim())) {
+  if (/^(?:thanks|thank you|thx)(?:\s+(?:wizard|wiz))?[!.?]*$/i.test(question.trim())) {
     return "You’re welcome! Want to change the build, test it, or learn why it works?";
   }
   if (/\b(?:who are you|what can you do)\b/i.test(question)) {
@@ -1666,7 +1903,8 @@ function localAnswer(question, hits, action) {
     const items = action.items.map(({ itemId, amount }) => (
       `${amount}x ${itemId.replace("minecraft:", "").replaceAll("_", " ")}`
     )).join(", ");
-    return `Item delivery! I’ll put ${items} straight into your inventory now.`;
+    const recipient = action.recipient && action.recipient !== "requester" ? ` to ${action.recipient}` : " to you";
+    return `Item delivery! I’ll carry ${items}${recipient} now.`;
   }
   if (action?.type === "show_recipe") {
     return `I’ll lay out the ${action.itemId.replace("minecraft:", "").replaceAll("_", " ")} recipe as a giant crafting grid nearby, with the real ingredients in the right squares.`;
@@ -1676,6 +1914,10 @@ function localAnswer(question, hits, action) {
     return lesson
       ? `I’ll place the ${lesson.title.toLowerCase()} and its button nearby. Paste ${lesson.command} into it; ${lesson.explanation}`
       : "I’ll place this safe command-block lesson nearby and show you exactly what its button does.";
+  }
+  if (action?.type === "execute_program") {
+    const count = action.program.steps.length;
+    return `I’ve drawn “${action.program.title}” as ${count} real step${count === 1 ? "" : "s"}. I’ll carry ${count === 1 ? "it" : "them"} out in order, inspect each result, and revise any step that does not work.`;
   }
   if (action?.type === "build_plan") {
     return `I’ll build ${action.plan.title || "this detail"} nearby, placing all ${action.plan.blocks.length} planned blocks in support order and checking each one.`;
@@ -1707,7 +1949,7 @@ function localAnswer(question, hits, action) {
       if (/\bchimney\b/i.test(question)) additions.push("a chimney");
       if (/\bbalcony\b/i.test(question)) additions.push("a balcony");
       if (/\bmoat\b/i.test(question)) additions.push(/\blava\b/i.test(question) ? "a lava moat" : "a water-colored moat");
-      if (/\bpowered\s+bridge\b/i.test(question)) additions.push("a glowing redstone-powered bridge");
+      if (/\b(?:redstone(?:[- ]powered)?|powered)\s+bridge\b/i.test(question)) additions.push("a glowing redstone-powered bridge");
       const inhabitants = Object.entries((action.plan.entities || []).reduce((counts, { typeId }) => ({
         ...counts, [typeId]: (counts[typeId] || 0) + 1,
       }), {})).map(([typeId, count]) => (
@@ -2195,6 +2437,30 @@ function proceduralCityRevisionAction(value, previous, question) {
 
 function normalizeProviderAction(value, question = "") {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  if (value.type === "execute_program" && Array.isArray(value.program?.steps)) {
+    const touches = (left, right) => Array.isArray(left) && Array.isArray(right)
+      && left.length === 3 && right.length === 3
+      && [...left, ...right].every(Number.isInteger)
+      && left.reduce((distance, coordinate, axis) => distance + Math.abs(coordinate - right[axis]), 0) === 1;
+    return {
+      ...value,
+      program: {
+        ...value.program,
+        steps: value.program.steps.map((step) => step?.capability === "player.place-blocks"
+          && Array.isArray(step.arguments?.blocks) ? {
+            ...step,
+            arguments: {
+              ...step.arguments,
+              blocks: step.arguments.blocks.map((block) => {
+                if (!Array.isArray(block?.target) || block.target.length !== 3
+                  || !block.target.every(Number.isInteger) || touches(block.target, block.support)) return block;
+                return { ...block, support: [block.target[0], block.target[1] - 1, block.target[2]] };
+              }),
+            },
+          } : step),
+      },
+    };
+  }
   if (value.type === "build_structure" && value.plan && typeof value.plan === "object") {
     const allowedFeatures = new Set([
       "floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers",
@@ -2353,7 +2619,7 @@ function normalizeProviderGoal(value) {
 
 function plannerActionLabel(action) {
   if (!action || typeof action !== "object") return "none";
-  const detail = action.plan?.kind || action.plan?.title || action.id || "unnamed";
+  const detail = action.plan?.kind || action.plan?.title || action.program?.title || action.id || "unnamed";
   return `${String(action.type || "unknown").slice(0, 32)}:${String(detail).slice(0, 64)}`;
 }
 
@@ -2373,13 +2639,73 @@ function wizardEnvelope(text, question = "") {
   };
 }
 
+function namedProjectKind(question, history = []) {
+  const namedStructure = targetedStructureKind(question);
+  if (namedStructure) {
+    const prior = priorStructureAction(history, question);
+    if (prior?.plan.kind) return prior.plan.kind;
+  }
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const kind = actionProjectKind(history[index]?.action, history[index]?.question);
+    if (projectKindNamedInQuestion(kind, question)) return kind;
+  }
+  return undefined;
+}
+
+function projectTurnForQuestion(question, history = []) {
+  const structureContext = priorStructureContext(history, question);
+  if (targetedStructureKind(question) && structureContext) return history[structureContext.index];
+  const namedKind = namedProjectKind(question, history);
+  if (namedKind) {
+    for (let index = history.length - 1; index >= 0; index -= 1) {
+      const kind = actionProjectKind(history[index]?.action, history[index]?.question);
+      if (kind?.toLowerCase() === namedKind.toLowerCase()) return history[index];
+    }
+  }
+  return latestProjectTurn(history)?.turn;
+}
+
+function bindProgramToActiveProject(action, projectFeedback, question, history = []) {
+  if (!projectFeedback || action?.type !== "execute_program") return action;
+  const targetKind = namedProjectKind(question, history);
+  const { targetKind: _untrustedTarget, ...program } = action.program;
+  return allowedWizardAction({
+    ...action,
+    program: { ...program, site: "active_project", ...(targetKind && { targetKind }) },
+  });
+}
+
+function capabilityProgramAdvancesRequest(action, question, history = []) {
+  const steps = action.program.steps;
+  const work = steps.reduce((total, { capability, arguments: args }) => {
+    if (capability === "player.place-blocks") return total + args.blocks.length;
+    if (capability === "player.break-blocks") return total + args.targets.length;
+    if (capability === "player.use-item") return total + 1;
+    if (capability === "script.spawn-entity") return total + args.count;
+    return total;
+  }, 0);
+  const commandBacked = steps.some(({ capability }) => capability === "world.command");
+  const largeProject = /\b(?:castle|city|house|mansion|playground|school|settlement|village)\b/i.test(question);
+  const boundedDetail = Boolean(simpleBlockPlacementAction(question)) || isProjectFeedback(question, history);
+  if (!commandBacked && work < (boundedDetail ? 1 : largeProject ? 8 : 2)) return false;
+  const subject = primaryBuildSubject(question);
+  if (!subject) return true;
+  const planWords = `${action.program.title} ${steps.map(({ expect }) => expect).join(" ")}`.toLowerCase();
+  const meaningfulWords = (subject.toLowerCase().match(/[a-z0-9]+/g) || [])
+    .filter((word) => word.length >= 4 && !/^(?:automated|automatic|complete|entire|large|small|whole|working)$/.test(word));
+  return meaningfulWords.length === 0 || meaningfulWords.some((word) => planWords.includes(word));
+}
+
 function actionCompletesBuildRequest(action, question, history = []) {
   if (!action) return false;
   if (isStagedBuildProgress(action)) return false;
+  if (action.type === "execute_program") {
+    return capabilityProgramAdvancesRequest(action, question, history);
+  }
   if (isActionConfirmation(question)) {
     const pending = pendingActionTurn(history);
     if (pending) {
-      const pendingQuestion = `${pending.question || ""} ${pending.answer || ""}`.trim();
+      const pendingQuestion = offeredActionQuestion(pending);
       const resumed = classifyAction(pendingQuestion, history.filter((turn) => turn !== pending));
       if (resumed && JSON.stringify(action) === JSON.stringify(resumed)) return true;
     }
@@ -2388,8 +2714,7 @@ function actionCompletesBuildRequest(action, question, history = []) {
   if (fixedFarm?.type === "build_machine"
     && JSON.stringify(action) === JSON.stringify(fixedFarm)) return true;
   if (isProjectFeedback(question, history) && action.type === "build_structure") {
-    const latest = allowedWizardAction(latestGoalActionTurn(history)?.turn?.action);
-    const previous = latest?.type === "build_structure" ? latest.plan : undefined;
+    const previous = priorStructureAction(history, question)?.plan;
     const projectsOutside = action.plan.primitives?.some(({ blockId, from, to }) => (
       blockId !== "minecraft:air" && (from[0] < 0 || from[2] < 0
         || to[0] >= action.plan.dimensions.width || to[2] >= action.plan.dimensions.depth)
@@ -2460,7 +2785,7 @@ function actionCompletesBuildRequest(action, question, history = []) {
   const modifying = isStructureModification(question, history);
   if (modifying && action.plan.mode !== "modify") return false;
   if (modifying) {
-    const previous = priorStructureAction(history)?.plan;
+    const previous = priorStructureAction(history, question)?.plan;
     if (!structurePlanChanged(previous, action.plan)) return false;
     if (arbitraryFeatureEditNeedsChangedPrimitives(question, history, action.plan)) return false;
     if (editNeedsAuthoredPrimitives(question) && !action.plan.primitives?.length) return false;
@@ -2530,16 +2855,22 @@ function providerGiftMatchesRequest(action, question) {
   if (deterministic) return JSON.stringify(action) === JSON.stringify(deterministic);
   const clause = explicitItemRequestClause(question);
   if (!clause) return false;
-  const requested = requestedGiftTerms(clause);
   const requestedAmount = requestedItemAmount(clause);
   if (requestedAmount === null) return false;
   const suppliedAmount = action.items.reduce((total, { amount }) => total + amount, 0);
   if (requestedAmount !== undefined && suppliedAmount !== requestedAmount) return false;
-  if (!requested.length) return true;
-  const supplied = new Set(action.items.flatMap(({ itemId }) => (
-    String(itemId).replace(/^minecraft:/, "").split("_").map(normalizedWord)
-  )));
-  return requested.every((word) => supplied.has(word));
+  if (action.recipient && action.recipient !== "requester"
+    && !question.toLowerCase().includes(action.recipient.toLowerCase())) return false;
+  if (!requestedGiftTerms(clause).length) return true;
+  if (!action.items.every(({ itemId }) => namedItemMatchesQuestion(itemId, clause))) return false;
+  if (/\b(?:enchanted|enchant(?:ed|ment)?\s+with)\b/i.test(clause)
+    && action.items.some(({ enchantments }) => !enchantments?.length)) return false;
+  const requestedName = (
+    question.match(/\b(?:named|called)\s+["“]([^"”]{1,80})["”]/i)?.[1]
+    || clause.match(/\b(?:named|called)\s+([^,!?]{1,80}?)(?:\s+with\b|[,!?]|$)/i)?.[1]
+  )?.trim().replace(/[.]$/, "");
+  if (requestedName && action.items.some(({ nameTag }) => nameTag?.toLowerCase() !== requestedName.toLowerCase())) return false;
+  return true;
 }
 
 function requestedItemAmount(clause) {
@@ -2555,7 +2886,7 @@ function requestedItemAmount(clause) {
   const numeric = text.match(/(?:^|\s)([+-]?\d+)\b/);
   if (numeric) {
     const amount = Number(numeric[1]);
-    return Number.isInteger(amount) && amount >= 1 && amount <= 64 ? amount : null;
+    return Number.isInteger(amount) && amount >= 1 && amount <= 10_000 ? amount : null;
   }
   const match = text.match(/\b(?:me|us|have|get|receive)\s+(?:(?:a|an|some|the)\s+)?(sixty[- ]four|thirty[- ]two|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty)\b/i);
   if (!match) return undefined;
@@ -2567,12 +2898,133 @@ function repairProviderGift(action, question) {
   const clause = explicitItemRequestClause(question);
   if (action?.type !== "give_items" || action.items.length !== 1 || !clause) return action;
   const requestedAmount = requestedItemAmount(clause);
-  const [{ itemId, amount }] = action.items;
+  const [item] = action.items;
+  const { itemId, amount } = item;
   if (requestedAmount == null || amount === requestedAmount || !namedItemMatchesQuestion(itemId, clause)) return action;
   return allowedWizardAction({
     ...action,
-    items: [{ itemId, amount: requestedAmount }],
+    items: [{ ...item, amount: requestedAmount }],
   }) || action;
+}
+
+function providerPowerMatchesRequest(action, question) {
+  const steps = action?.type === "execute_program" ? action.program.steps : [];
+  const commands = action?.type === "run_commands" ? action.commands
+    : steps.flatMap((step) => step.arguments?.commands || []);
+  const serverControl = steps.some(({ capability }) => ["server.console", "server.configure"].includes(capability));
+  if (serverControl
+    && !/\b(?:server|operator|op|deop|promote|demote|ban|kick|allowlist|whitelist|permission|gamerule|difficulty|gamemode|game\s+mode|education|experimental|experiments?|beta|preview|cheats?|settings?|configure|reload|save|stop|shut\s+down)\b/i.test(question)) return false;
+  const hasPhysicalBuild = steps.some(({ capability }) => /^(?:player\.(?:place|break|use)|script\.spawn-entity)$/.test(capability));
+  const buildIntent = isBuildRequest(question, [])
+    || /\b(?:add|decorate|expand|fix|improve|light|modify|move|rebuild|relocate|repair|replace|resize|upgrade)\b.{0,100}\b(?:base|bridge|building|castle|city|farm|house|machine|mansion|portal|project|road|room|school|statue|structure|tower|wall)\b/i.test(question);
+  for (const step of steps) {
+    const args = step.arguments || {};
+    if (step.capability === "player.place-blocks" && !buildIntent
+      && !/\b(?:add|put|place|set)\b/i.test(question)) return false;
+    if (step.capability === "player.break-blocks" && !buildIntent
+      && !/\b(?:break|clear|delete|demolish|destroy|dig|excavate|remove)\b/i.test(question)) return false;
+    if (/^player\.use/.test(step.capability) && !buildIntent
+      && !/\b(?:activate|click|interact|light|press|toggle|turn|use)\b/i.test(question)) return false;
+    if (step.capability === "player.move" && !buildIntent
+      && !/\b(?:fly|go|move|walk)\b/i.test(question)) return false;
+    if (step.capability === "script.teleport") {
+      const travelIntent = /\b(?:bring|move|send|take|teleport|transport|tp)\b/i.test(question);
+      if (args.subject === "requester" && !travelIntent) return false;
+      if (args.subject === "wizard" && !travelIntent && !(hasPhysicalBuild && buildIntent)) return false;
+    }
+    if (step.capability === "script.effect") {
+      const effectName = String(args.effectId || "").replace(/_/g, " ");
+      if (!effectName || !question.toLowerCase().includes(effectName)) return false;
+    }
+    if (step.capability === "script.spawn-entity") {
+      const entity = String(args.typeId || "").replace(/^minecraft:/, "").replace(/_/g, " ").replace(/s$/, "");
+      if (!entity || !question.toLowerCase().includes(entity)
+        || (!buildIntent && !/\b(?:add|create|populate|spawn|summon)\b/i.test(question))) return false;
+    }
+    if (step.capability === "artifact.book"
+      && !/\b(?:book|guide|manual|write|written|journal|instructions?)\b/i.test(question)) return false;
+  }
+  const configurationSteps = steps.filter(({ capability }) => capability === "server.configure");
+  const configurationText = JSON.stringify(configurationSteps.map(({ arguments: args }) => args)).toLowerCase();
+  const requestedDifficulty = question.match(/\b(peaceful|easy|normal|hard)\b/i)?.[1].toLowerCase();
+  const requestedGameMode = question.match(/\b(survival|creative|adventure|spectator)\b/i)?.[1].toLowerCase();
+  if (configurationSteps.length && (
+    (requestedDifficulty && (!configurationText.includes("difficulty") || !configurationText.includes(requestedDifficulty)))
+    || (requestedGameMode && (!configurationText.includes("gamemode") || !configurationText.includes(requestedGameMode)))
+    || (/\b(?:education|education edition)\b/i.test(question) && !/education|eduoffer/.test(configurationText))
+    || (/\b(?:experimental|experiments?|beta|preview)\b/i.test(question) && !configurationText.includes('"experiments"'))
+    || (/\b(?:allow cheats?|cheats?)\b/i.test(question) && !configurationText.includes("allow-cheats"))
+    || (/\b(?:default player permission|default permission)\b/i.test(question)
+      && !configurationText.includes("default-player-permission-level"))
+  )) return false;
+  const guardedCommands = [
+    { command: /\bkill\b/i, intent: /\b(?:kill|remove|delete|destroy)\b/i },
+    { command: /\bdamage\b/i, intent: /\b(?:damage|hurt|harm|hit|attack|kill)\b/i },
+    {
+      command: /\b(?:fill\b[^\r\n]{0,180}\b(?:air|lava|tnt|fire)\b|setblock\b[^\r\n]{0,100}\b(?:air|lava|tnt|fire)\b|summon\s+(?:minecraft:)?tnt\b)/i,
+      intent: /\b(?:clear|remove|delete|destroy|erase|demolish|break|dig|excavate|lava|fire|burn|explode|explosion|blow\s+up|tnt)\b/i,
+    },
+    { command: /\bclear\b/i, intent: /\b(?:clear|remove|delete|empty)\b/i },
+    { command: /\bban\b/i, intent: /\bban\b/i },
+    { command: /\bkick\b/i, intent: /\bkick\b/i },
+    { command: /\bdeop\b/i, intent: /\b(?:deop|remove\s+(?:my\s+)?(?:op|operator)|demote)\b/i },
+    { command: /\bop\b/i, intent: /\b(?:op|operator|promote)\b/i },
+    { command: /\b(?:allowlist|whitelist)\b/i, intent: /\b(?:allowlist|whitelist)\b/i },
+    { command: /\bdifficulty\b/i, intent: /\b(?:difficulty|peaceful|easy|normal|hard)\b/i },
+    { command: /\bgamemode\b/i, intent: /\b(?:gamemode|game\s+mode|creative|survival|adventure|spectator)\b/i },
+    { command: /\bgamerule\b/i, intent: /\b(?:gamerule|game\s+rule|daylight|weather\s+cycle|mob\s+grief|keep\s+inventory|fire\s+spread|immediate\s+respawn|command\s+block)\b/i },
+    { command: /\breload\b/i, intent: /\breload\b/i },
+    { command: /\bsave(?:-all|-hold|-query|-resume)?\b/i, intent: /\bsave\b/i },
+    { command: /\bstop\b/i, intent: /\b(?:stop|shut\s+down)\b/i },
+  ];
+  const subjectMatches = (name) => {
+    const subject = String(name || "").replace(/^minecraft:/, "").replace(/_/g, " ");
+    const singular = subject.replace(/s$/, "");
+    return subject.length >= 3 && (question.toLowerCase().includes(subject)
+      || question.toLowerCase().includes(singular)
+      || /\b(?:mobs?|entities|animals?|creatures?)\b/i.test(question));
+  };
+  const commandMatchesRequest = (value) => {
+    const command = String(value);
+    const commandDifficulty = command.match(/\bdifficulty\s+(peaceful|easy|normal|hard)\b/i)?.[1].toLowerCase();
+    if (commandDifficulty && requestedDifficulty && commandDifficulty !== requestedDifficulty) return false;
+    const commandGameMode = command.match(/\bgamemode\s+(creative|survival|adventure|spectator|[0126csad])\b/i)?.[1].toLowerCase();
+    const requestedGameMode = question.match(/\b(creative|survival|adventure|spectator)\b/i)?.[1].toLowerCase();
+    const normalizedCommandGameMode = ({
+      0: "survival", s: "survival", 1: "creative", c: "creative",
+      2: "adventure", a: "adventure", 6: "spectator",
+    })[commandGameMode] || commandGameMode;
+    if (normalizedCommandGameMode && requestedGameMode && normalizedCommandGameMode !== requestedGameMode) return false;
+    const administrator = command.match(/\b(?:op|deop|ban|kick)\s+(\{\{requester\}\}|[^\s]+)/i)?.[1]
+      || command.match(/\b(?:allowlist|whitelist)\s+(?:add|remove)\s+(\{\{requester\}\}|[^\s]+)/i)?.[1];
+    if (administrator && administrator !== "{{requester}}"
+      && !question.toLowerCase().includes(administrator.toLowerCase())) return false;
+    const allowlistOperation = command.match(/\b(?:allowlist|whitelist)\s+(add|remove|on|off)\b/i)?.[1].toLowerCase();
+    const requestedAllowlistOperation = question.match(/\b(add|remove|enable|disable|turn\s+on|turn\s+off)\b/i)?.[1]
+      ?.toLowerCase().replace(/^enable$|^turn\s+on$/, "on").replace(/^disable$|^turn\s+off$/, "off");
+    if (allowlistOperation && requestedAllowlistOperation && allowlistOperation !== requestedAllowlistOperation) return false;
+    const broadPlayers = /@a\b/i.test(command);
+    if (broadPlayers && !/\b(?:all|everyone|everybody|players?|us|we)\b/i.test(question)) return false;
+    const entitySelectors = [...command.matchAll(/@e\[[^\]]*\btype\s*=\s*(!?)(?:minecraft:)?([a-z0-9_]+)/gi)];
+    if (entitySelectors.some((match) => !subjectMatches(match[2]))) return false;
+    if (entitySelectors.some((match) => match[1] === "!"
+      && !/\b(?:except|excluding|other\s+than|but\s+not|not)\b/i.test(question))) return false;
+    if (/@e\b(?!\[)/i.test(command)
+      && !/\b(?:all|everything|mobs?|entities|animals?|creatures?)\b/i.test(question)) return false;
+    const summoned = command.match(/\bsummon\s+(?:minecraft:)?([a-z0-9_]+)/i)?.[1];
+    if (summoned && !subjectMatches(summoned)) return false;
+    if (/\bscoreboard\b/i.test(command)
+      && !/\b(?:score|scoreboard|objective|counter|timer|display|points?|team)\b/i.test(question)) return false;
+    if (/\beffect\b[^\r\n]{0,100}\b(?:fatal_poison|poison|instant_damage|wither)\b/i.test(command)
+      && !/\b(?:poison|damage|hurt|harm|attack|kill|wither)\b/i.test(question)) return false;
+    if (/\b(?:tp|teleport)\b[^\r\n]{0,100}(?:~-\d{2,}|\s-\d{2,}\s)/i.test(command)
+      && !/\b(?:teleport|tp|move|send|take|bring|down|below|underground|void)\b/i.test(question)) return false;
+    return true;
+  };
+  return commands.every((command) => commandMatchesRequest(command)
+    && guardedCommands.every((guard) => (
+      !guard.command.test(String(command)) || guard.intent.test(question)
+    )));
 }
 
 function providerActionMatchesRequest(action, question, history = [], {
@@ -2582,16 +3034,30 @@ function providerActionMatchesRequest(action, question, history = [], {
 } = {}) {
   if (!action) return true;
   if (reviewRequest) return correctiveActionContinuesGoal(action, history);
+  if (action.type === "execute_program") {
+    if (!providerPowerMatchesRequest(action, question)) return false;
+    if (!projectFeedback && action.program.targetKind) return false;
+    if (isOrdinaryConversation(question) || explicitlyRequestsCommand(question)) return false;
+    if (buildRequest) return actionCompletesBuildRequest(action, question, history);
+    if (projectFeedback) return true;
+    return requestClauses(question).some((clause) => {
+      const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "");
+      const verb = "(?:apply|ban|break|build|cast|change|clear|clone|configure|construct|create|deop|disable|drop|effect|enable|enchant|fill|give|grant|kick|light|make|move|op|place|promote|reload|remove|replace|run|save|set|show|spawn|stop|summon|teleport|tp|turn|use|write)";
+      return new RegExp(`^(?:(?:can|could|would|will)\\s+you\\s+)?(?:please\\s+)?${verb}\\b`, "i").test(direct)
+        || new RegExp(`^(?:i|we)\\s+(?:want|need)\\s+(?:you\\s+to\\s+)?${verb}\\b`, "i").test(direct);
+    });
+  }
   if (BUILD_ACTION_TYPES.has(action.type)) {
     return (buildRequest || projectFeedback) && actionCompletesBuildRequest(action, question, history);
   }
   const classified = classifyAction(question, history);
   if (action.type === "run_commands") {
+    if (!providerPowerMatchesRequest(action, question)) return false;
     if (classified?.type === "run_commands") return JSON.stringify(action) === JSON.stringify(classified);
     if (buildRequest || projectFeedback || explicitlyRequestsCommand(question) || isOrdinaryConversation(question)) return false;
     return requestClauses(question).some((clause) => {
-      const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "");
-      const verb = "(?:give|grant|apply|remove|clear|set|change|turn|make|spawn|summon|teleport|tp|move|fill|replace|clone|enchant|effect|execute|run|cast|light|brighten|strike|kill)";
+      const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "");
+      const verb = "(?:give|grant|apply|remove|clear|set|change|turn|make|spawn|summon|teleport|tp|move|fill|replace|clone|enchant|effect|execute|run|cast|light|brighten|strike|kill|enable|disable|configure|ban|kick|op|deop|promote|reload|save|stop)";
       return new RegExp(`^(?:(?:can|could|would|will)\\s+you\\s+)?(?:please\\s+)?${verb}\\b`, "i").test(direct)
         || new RegExp(`^(?:i|we)\\s+(?:want|need)\\s+(?:you\\s+to\\s+)?${verb}\\b`, "i").test(direct);
     });
@@ -2616,11 +3082,15 @@ function providerActionMatchesRequest(action, question, history = [], {
 }
 
 const MAX_AUTOMATIC_GOAL_ACTIONS = 6;
+const EXECUTOR_VERIFIED_ACTION_TYPES = new Set([
+  "dimension_travel", "give_items", "place_area_torches",
+  "potion_rain", "run_commands", "world_control",
+]);
 const GOAL_REVIEW_FEEDBACK = "Fix this same active build so every success criterion is observable in the world.";
 const RETRYABLE_ACTION_TYPES = new Set([
   "place_blueprint", "build_machine", "build_structure", "build_plan",
   "dimension_travel", "world_control", "potion_rain", "give_items",
-  "run_commands", "place_area_torches", "show_recipe", "command_lesson",
+  "run_commands", "place_area_torches", "show_recipe", "command_lesson", "execute_program",
 ]);
 
 const isAutomaticGoalQuestion = (question) => /^(?:The last attempt failed:|Review the completed in-world attempt|Fix this same active build)/i
@@ -2652,6 +3122,9 @@ function correctiveActionContinuesGoal(action, history = []) {
   const previousTurn = latestGoalActionTurn(history)?.turn;
   const previous = allowedWizardAction(previousTurn?.action);
   if (!previous || !action) return false;
+  if (previous.type === "execute_program") {
+    return action.type === "execute_program" && reusableLearnedAction(action);
+  }
   if (isStagedBuildProgress(previous)) {
     const goalId = previousTurn?.goalId || previousTurn?.requestId;
     const contract = history.findLast((turn) => (
@@ -2668,6 +3141,8 @@ function correctiveActionContinuesGoal(action, history = []) {
   }
   const buildTypes = new Set(["place_blueprint", "build_machine", "build_structure", "build_plan"]);
   if (buildTypes.has(previous.type)) {
+    if (!buildTypes.has(action.type)
+      && !(action.type === "execute_program" && reusableLearnedAction(action))) return false;
     if (!actionCompletesBuildRequest(action, GOAL_REVIEW_FEEDBACK, history)) return false;
     if (action.type !== "build_structure") return true;
     if (previous.type === "build_structure" && !structurePlanPreservesPrior(previous.plan, action.plan)) return false;
@@ -2760,7 +3235,7 @@ function localStructureFallback(question, history) {
   if (commonFarm) return allowedWizardAction(commonFarm);
   if (isProjectFeedback(question, history)) {
     return projectFeedbackFallback(question, history)
-      || (priorStructureAction(history) ? structureAction(question, history) : null);
+      || (priorStructureAction(history, question) ? structureAction(question, history) : null);
   }
   if (isFunctionalBuildRequest(question, history)) return stagedMachineProgressAction(question, history);
   const kind = structureKind(question, history);
@@ -3005,6 +3480,17 @@ function providerActionSummary(action) {
       .reduce((total, entries) => total + (Array.isArray(entries) ? entries.length : 0), 0);
     if (steps) summary.plan.steps = steps;
   }
+  const program = action?.program;
+  if (program && typeof program === "object" && !Array.isArray(program)) {
+    summary.program = {
+      title: text(program.title),
+      steps: Array.isArray(program.steps) ? program.steps.slice(0, 12).map((step) => ({
+        id: text(step.id, 32),
+        capability: text(step.capability, 64),
+        expect: text(step.expect, 120),
+      })) : [],
+    };
+  }
   const serialized = JSON.stringify(summary);
   if (serialized.length <= 1_600) return serialized;
   return JSON.stringify({
@@ -3081,7 +3567,7 @@ function providerHistorySummary(history, { fullProject = false } = {}) {
     .map(([, summary]) => summary).join("\n\n");
 }
 
-async function askProvider({ provider, fetchImpl, question, hits, history, player, env, safetySalt, general, buildRequest, reviewRequest, tuning, context }) {
+async function askProvider({ provider, fetchImpl, question, hits, history, player, env, safetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context }) {
   const sources = hits.map((hit, index) =>
     `[Source ${index + 1}: ${hit.title}; edition=${hit.edition}; channel=${hit.channel}; version=${hit.version}]\n${hit.text}`,
   ).join("\n\n");
@@ -3096,7 +3582,7 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const runtimeTokens = general ? tuning.generalMaxOutputTokens : tuning.wizardMaxOutputTokens;
   const configuredTokens = runtimeTokens || (general ? env.AI_GENERAL_MAX_OUTPUT_TOKENS : env.AI_MAX_OUTPUT_TOKENS);
   const planningRequest = buildRequest || reviewRequest;
-  const defaultTokens = general ? 1_200 : (planningRequest ? 1_200 : 260);
+  const defaultTokens = general ? 1_200 : (planningRequest ? 3_000 : 260);
   const tokenLimit = general || planningRequest ? 3_000 : 400;
   const maxOutputTokens = Math.min(Math.max(Number(configuredTokens) || defaultTokens, 64), tokenLimit);
   const addendum = general ? tuning.generalPromptAddendum : tuning.wizardPromptAddendum;
@@ -3106,7 +3592,10 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const reviewRequirement = reviewRequest
     ? `\n\nMC_WIZARD_GOAL_REVIEW\nThis is a semantic review of an already completed executor batch. Use the fresh live-world snapshot and active success criteria. Return either goal.status="complete" with action=null, or goal.status="active" with one corrective action for the same existing project.`
     : "";
-  const systemPrompt = `${general ? GENERAL_PROMPT : SYSTEM_PROMPT}${addendum ? `\n\nOperator tuning:\n${addendum}` : ""}${actionRequirement}${reviewRequirement}`;
+  const researchRequirement = researchRequired
+    ? `\n\nMC_WIZARD_RESEARCH_REQUIRED\nThis is a new or unfamiliar design. Before planning, use current web research. Prefer Bedrock documentation and mechanics; cross-check community wikis, build guides, and video descriptions or transcripts when useful. Distinguish Bedrock from Java. Synthesize the research into one complete executable action now. Do not return a research step, source dump, tutorial promise, or knowledge.research capability. For furniture and other compact decorative assemblies, use execute_program with player.place-blocks plus verify.blocks; name the requested subject in the program title and expectations. Use build_complete_structure only when the requested result is itself a whole bounded structure.`
+    : "";
+  const systemPrompt = `${general ? GENERAL_PROMPT : SYSTEM_PROMPT}${addendum ? `\n\nOperator tuning:\n${addendum}` : ""}${actionRequirement}${reviewRequirement}${researchRequirement}`;
   const body = provider.style === "chat"
     ? {
         model: provider.model,
@@ -3130,19 +3619,33 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const headers = { "content-type": "application/json" };
   if (provider.apiKey) headers.authorization = `Bearer ${provider.apiKey}`;
   const endpoint = provider.style === "chat" ? "chat/completions" : "responses";
-  const response = await fetchImpl(`${provider.baseUrl}/${endpoint}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeout),
-  });
-  if (!response.ok) {
-    const detail = (await response.text()).slice(0, 300);
-    throw new Error(`AI provider returned ${response.status}: ${detail}`);
+  const attempts = planningRequest ? 2 : 1;
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const response = await fetchImpl(`${provider.baseUrl}/${endpoint}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeout),
+    });
+    if (!response.ok) {
+      const detail = (await response.text()).slice(0, 300);
+      lastError = new Error(`AI provider returned ${response.status}: ${detail}`);
+      if (response.status >= 500 && attempt + 1 < attempts) continue;
+      throw lastError;
+    }
+    let answer;
+    try {
+      answer = responseText(await response.json(), provider.style).trim();
+      if (!answer) throw new Error("AI provider returned no text");
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < attempts) continue;
+      throw error;
+    }
+    return general ? answer : answer.slice(0, 24_000);
   }
-  const answer = responseText(await response.json(), provider.style).trim();
-  if (!answer) throw new Error("AI provider returned no text");
-  return general ? answer : answer.slice(0, 24_000);
+  throw lastError;
 }
 
 export function createWizard({
@@ -3151,6 +3654,7 @@ export function createWizard({
   fetchImpl = fetch,
   logger = console,
   sessions = createMemorySessionStore(),
+  recipes = createMemoryLearnedRecipeStore(),
   settings = async () => ({}),
   safetySalt,
 } = {}) {
@@ -3160,10 +3664,15 @@ export function createWizard({
   const configuredSafetySalt = String(env.WIZARD_SALT || "").trim();
   const providerSafetySalt = injectedSafetySalt
     || (configuredSafetySalt.length >= 24 ? configuredSafetySalt : randomUUID());
+  const terminalActionResults = new Map();
 
   const api = {
     provider: provider.name,
     clearSession(player, mode = "wizard") {
+      if (mode === "wizard") {
+        const prefix = `${player}\u0000`;
+        for (const key of terminalActionResults.keys()) if (key.startsWith(prefix)) terminalActionResults.delete(key);
+      }
       return sessions.delete(player, mode);
     },
     async recordFeedback({ player, requestId, grade, feedback, context }) {
@@ -3196,18 +3705,73 @@ export function createWizard({
       if (binding.duplicate) {
         return { ...result, message: "I already saved that grade for this request." };
       }
+      const feedbackHistory = sessions.get(player, "wizard");
+      const gradedTurnIndex = feedbackHistory.findLastIndex((turn) => turn.requestId === requestId);
+      const goalVerified = Boolean(binding.goalId && gradedTurnIndex >= 0
+        && feedbackHistory.slice(gradedTurnIndex + 1).some((turn) => (
+          !turn.action && turn.goalId === binding.goalId
+          && allowedWizardGoal(turn.goal)?.status === "complete"
+        )));
+      const forgetRejectedRecipe = async () => {
+        if (binding.responseMode !== "learned-recipe" || typeof recipes.remove !== "function") return;
+        try {
+          await recipes.remove(binding.question);
+        } catch (error) {
+          logger.warn(`[wizard] could not remove rejected learned recipe: ${error.message}`);
+        }
+      };
+      const rememberSuccessfulRecipe = async () => {
+        if (binding.status !== "completed" || grade < 4
+          || isStagedBuildProgress(binding.action)
+          || !reusableLearnedAction(binding.action)
+          || typeof recipes.promote !== "function") return false;
+        try {
+          return Boolean(await recipes.promote({
+            question: binding.question,
+            action: binding.action,
+            grade,
+            verified: goalVerified,
+          }));
+        } catch (error) {
+          logger.warn(`[wizard] could not save learned recipe: ${error.message}`);
+          return false;
+        }
+      };
       if (!note) {
         if (grade <= 3) {
+          await forgetRejectedRecipe();
           return {
             ...result,
             needsFeedback: true,
             message: "Tell me one thing I should change, and I’ll use it as my next instruction.",
           };
         }
-        return { ...result, message: "Thanks for the grade! I saved it with this request." };
+        const learned = await rememberSuccessfulRecipe();
+        return {
+          ...result,
+          ...(learned && { learned: true }),
+          message: learned
+            ? "Thanks! That worked, so I’ll remember this as a tested recipe for next time."
+            : "Thanks for the grade! I saved it with this request.",
+        };
       }
 
-      const correctiveAction = classifyAction(note, sessions.get(player, "wizard"));
+      const requestsChange = /\b(?:but|however|please|should|needs?|want|fix|repair|redo|change|add|remove|replace|make|build|place|give|teleport|move|light|decorate|furnish|improve|bigger|smaller|shorter|longer|taller|wider|brighter|darker|clearer|easier|ugly|wrong|broken|missing|not\s+enough|too\s+(?:dark|small|big|plain|short|tall))\b/i
+        .test(note)
+        || Boolean(binding.goalId && isProjectFeedback(note, feedbackHistory));
+      if (grade >= 4 && !requestsChange) {
+        const learned = await rememberSuccessfulRecipe();
+        return {
+          ...result,
+          ...(learned && { learned: true }),
+          message: learned
+            ? "Thanks! I saved that as a tested recipe because it worked."
+            : "Thanks! I saved your grade and I’m glad that worked.",
+        };
+      }
+      await forgetRejectedRecipe();
+
+      const correctiveAction = classifyAction(note, feedbackHistory);
       const immediateCorrection = correctiveAction && !BUILD_ACTION_TYPES.has(correctiveAction.type);
       if (binding.goalId && immediateCorrection) {
         const followUp = await api.ask({
@@ -3280,38 +3844,105 @@ export function createWizard({
       };
     },
     async recordActionResult({ player, requestId, status, detail, context }) {
+      const terminal = ["completed", "failed", "partial"].includes(status);
+      const resultKey = `${player}\u0000${requestId}`;
+      if (terminal && terminalActionResults.has(resultKey)) {
+        return { ...structuredClone(terminalActionResults.get(resultKey)), updated: false, replayed: true };
+      }
+      if (terminal && typeof sessions.getActionResult === "function") {
+        const persisted = await sessions.getActionResult(player, "wizard", requestId);
+        if (persisted) {
+          terminalActionResults.set(resultKey, structuredClone(persisted));
+          return { ...persisted, updated: false, replayed: true };
+        }
+      }
+      const remember = async (result) => {
+        if (terminal) {
+          if (typeof sessions.setActionResult === "function") {
+            await sessions.setActionResult(player, "wizard", requestId, result);
+          }
+          terminalActionResults.delete(resultKey);
+          terminalActionResults.set(resultKey, structuredClone(result));
+          while (terminalActionResults.size > 256) terminalActionResults.delete(terminalActionResults.keys().next().value);
+        }
+        return result;
+      };
       if (typeof sessions.updateAction !== "function") return { matched: false, updated: false };
-      const outcome = await sessions.updateAction(player, "wizard", { requestId, status, detail });
-      if (!outcome.matched || !outcome.updated || !["completed", "failed"].includes(status)
+      let outcome = await sessions.updateAction(player, "wizard", { requestId, status, detail });
+      const terminalRecovery = terminal && outcome.matched && !outcome.updated && outcome.status === status;
+      if (!outcome.matched || (!outcome.updated && !terminalRecovery) || !terminal
         || /\b(?:superseded|player left|all players left|server stopp)/i.test(detail || "")) return outcome;
+      if (terminalRecovery) outcome = { ...outcome, updated: true, recovered: true };
       const history = sessions.get(player, "wizard");
       const actionTurn = history.findLast((turn) => turn.requestId === requestId);
-      if (!allowedWizardAction(actionTurn?.action)) return outcome;
+      if (!allowedWizardAction(actionTurn?.action)) return remember(outcome);
+      const goalId = actionTurn.goalId || actionTurn.requestId;
+      const existingCompletion = terminalRecovery && status === "completed" && history.find((turn) => (
+        !turn.action && turn.goalId === goalId
+        && turn.requestSequence > actionTurn.requestSequence
+        && allowedWizardGoal(turn.goal)?.status === "complete"
+      ));
+      if (existingCompletion) {
+        return remember({
+          ...outcome,
+          review: {
+            answer: existingCompletion.answer,
+            action: null,
+            goal: existingCompletion.goal,
+            sources: [],
+            mode: "recovered-local-verification",
+            kind: "wizard",
+            label: provider.label,
+            requestId: existingCompletion.requestId,
+          },
+        });
+      }
+      const existingReplan = terminalRecovery && history.find((turn) => (
+        turn.retryOfRequestId === requestId && turn.goalId === goalId
+        && ["pending", "started"].includes(turn.status) && allowedWizardAction(turn.action)
+      ));
+      if (existingReplan) {
+        return remember({
+          ...outcome,
+          replan: {
+            answer: existingReplan.answer,
+            action: existingReplan.action,
+            ...(existingReplan.goal && { goal: existingReplan.goal }),
+            sources: [],
+            mode: existingReplan.responseMode || "recovered-replan",
+            kind: "wizard",
+            label: provider.label,
+            requestId: existingReplan.requestId,
+            goalId,
+          },
+        });
+      }
       if (actionTurn.requestSequence && typeof sessions.isCurrent === "function"
         && !sessions.isCurrent(player, "wizard", actionTurn.requestSequence)) {
-        return { ...outcome, superseded: true };
+        return remember({ ...outcome, superseded: true });
       }
       const newerProject = history.some((turn) => turn.requestSequence > actionTurn.requestSequence
         && (allowedWizardAction(turn.action) || allowedWizardGoal(turn.goal)?.status === "active"));
-      if (newerProject) return { ...outcome, superseded: true };
+      if (newerProject) return remember({ ...outcome, superseded: true });
       const goal = activeWizardGoal(history);
-      if (!goal) return outcome;
-      const goalId = actionTurn.goalId || actionTurn.requestId;
+      if (!goal) return remember(outcome);
       if (status === "completed") {
+        const executorVerified = EXECUTOR_VERIFIED_ACTION_TYPES.has(actionTurn.action.type);
         const completedActions = history.filter((turn) => turn.status === "completed"
           && (turn.goalId || turn.requestId) === goalId).length;
-        if (completedActions >= MAX_AUTOMATIC_GOAL_ACTIONS) {
-          return { ...outcome, reviewLimitReached: true };
+        if (!executorVerified && completedActions >= MAX_AUTOMATIC_GOAL_ACTIONS) {
+          return remember({ ...outcome, reviewLimitReached: true });
         }
-        if (!context) return { ...outcome, reviewDeferred: true };
-        if (observedStructureSatisfiesAction(context, actionTurn)) {
+        if (executorVerified || (context && observedStructureSatisfiesAction(context, actionTurn))) {
           const completedGoal = { ...goal, status: "complete" };
           const review = {
-            answer: "I checked the finished structure against its full plan and the fresh world result. Goal complete.",
+            answer: executorVerified
+              ? "The action’s own checks passed. Goal complete."
+              : "I checked the finished structure against its full plan and the fresh world result. Goal complete.",
             action: null,
             goal: completedGoal,
             sources: [],
-            mode: "local-world-verification",
+            mode: executorVerified ? "local-executor-verification" : "local-world-verification",
             kind: "wizard",
             label: provider.label,
             requestId: randomUUID(),
@@ -3326,8 +3957,9 @@ export function createWizard({
           };
           if (typeof sessions.append === "function") await sessions.append(player, "wizard", reviewTurn);
           else await sessions.set(player, "wizard", [...history, reviewTurn]);
-          return { ...outcome, review };
+          return remember({ ...outcome, review });
         }
+        if (!context) return remember({ ...outcome, reviewDeferred: true });
         const review = await api.ask({
           player,
           mode: "wizard",
@@ -3335,10 +3967,10 @@ export function createWizard({
           context,
           goalReview: { goalId },
         });
-        if (review.action) return { ...outcome, review, replan: review };
+        if (review.action) return remember({ ...outcome, review, replan: review });
         if (isStagedBuildProgress(actionTurn.action)) {
           const contract = originalGoalContract(history, goalId, actionTurn);
-          return {
+          return remember({
             ...outcome,
             review,
             retry: {
@@ -3346,26 +3978,27 @@ export function createWizard({
               reason: "staged-progress",
               goalId,
             },
-          };
+          });
         }
-        return { ...outcome, review };
+        return remember({ ...outcome, review });
       }
-      if (!RETRYABLE_ACTION_TYPES.has(actionTurn.action.type)) return outcome;
-      const failures = history.filter((turn) => turn.status === "failed"
+      if (!RETRYABLE_ACTION_TYPES.has(actionTurn.action.type)) return remember(outcome);
+      const failures = history.filter((turn) => ["failed", "partial"].includes(turn.status)
         && (turn.goalId || turn.requestId) === goalId).length;
-      if (failures >= 3) return { ...outcome, retryLimitReached: true };
+      if (failures >= 3) return remember({ ...outcome, retryLimitReached: true });
       const contract = originalGoalContract(history, goalId, actionTurn);
       const originalQuestion = contract?.question || actionTurn.question;
       const replan = await api.ask({
         player,
         mode: "wizard",
         question: originalQuestion,
-        failureRetry: { goalId },
+        context,
+        failureRetry: { goalId, requestId },
       });
-      if (replan.superseded) return { ...outcome, superseded: true, replan };
-      return replan.action
+      if (replan.superseded) return remember({ ...outcome, superseded: true, replan });
+      return remember(replan.action
         ? { ...outcome, replan }
-        : { ...outcome, retry: { question: originalQuestion, reason: "failed-action", goalId } };
+        : { ...outcome, retry: { question: originalQuestion, reason: "failed-action", goalId } });
     },
     async ask({
       question,
@@ -3413,6 +4046,13 @@ export function createWizard({
       const hits = rankedHits.filter((hit) => hit.score >= relevanceFloor);
       const action = general || reviewRequest || answerOnlyRequest
         ? null : classifyAction(question, actionHistory);
+      const learnedEntry = !general && !reviewRequest && !answerOnlyRequest && buildRequest && !projectFeedback
+        && typeof recipes.find === "function" ? await recipes.find(question) : null;
+      const learnedCandidate = allowedWizardAction(learnedEntry?.action);
+      const learnedAction = learnedCandidate
+        && providerActionMatchesRequest(learnedCandidate, question, actionHistory, { buildRequest: true })
+        && actionCompletesBuildRequest(learnedCandidate, question, actionHistory)
+        ? learnedCandidate : null;
       const groundedAnswer = reviewRequest || answerOnlyRequest
         ? undefined : groundedQuickAnswer(question, hits);
       let answer = reviewRequest
@@ -3422,15 +4062,18 @@ export function createWizard({
         : instantAnswer || groundedAnswer || (general
         ? `${provider.label} did not answer yet. I’ll keep this request short and try again when you ask.`
         : localAnswer(question, hits, action));
-      let selectedAction = action;
+      let selectedAction = learnedAction || action;
       let providerGoal;
       let providerActionRejection;
       let rejectedProviderAction;
       let title = general ? bookTitle(question) : undefined;
       let responseMode = answerOnlyRequest ? "feedback-answer-fallback" : reviewRequest ? "review-deferred"
-        : instantAnswer ? "local-instant" : groundedAnswer ? "local-grounded" : action ? "local-skill" : "offline";
+        : instantAnswer ? "local-instant" : groundedAnswer ? "local-grounded"
+          : learnedAction ? "learned-recipe" : action ? "local-skill" : "offline";
+      const researchRequired = !general && buildRequest && !learnedAction
+        && (!action || wantsModelAuthoredStructure(action, buildRequest, question));
       const askModel = !instantAnswer && !groundedAnswer && provider.enabled && tuning.aiEnabled
-        && (answerOnlyRequest || reviewRequest || !action
+        && !learnedAction && (answerOnlyRequest || reviewRequest || !action
           || wantsModelAuthoredStructure(action, buildRequest, question));
       if (askModel) {
         const safeFallback = {
@@ -3443,7 +4086,7 @@ export function createWizard({
         try {
           const providerAnswer = await askProvider({
             provider, fetchImpl, question, hits, history: actionHistory, player, env,
-            safetySalt: providerSafetySalt, general, buildRequest, reviewRequest, tuning, context,
+            safetySalt: providerSafetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context,
           });
           const envelope = general ? generalEnvelope(providerAnswer, question) : wizardEnvelope(providerAnswer, question);
           if (!general && !envelope) throw new Error("AI provider returned an invalid Wizard response");
@@ -3461,13 +4104,19 @@ export function createWizard({
           }
           else {
             const carriedProviderCandidate = carryForwardStructurePrimitives(envelope.action, actionHistory, question);
-            const providerCandidate = repairProviderGift(carriedProviderCandidate, question);
-            const repairedProviderGift = providerCandidate !== carriedProviderCandidate;
-            const intentAllowed = providerActionMatchesRequest(providerCandidate, question, actionHistory, {
+            const projectBoundProviderCandidate = bindProgramToActiveProject(
+              carriedProviderCandidate, projectFeedback, question, actionHistory,
+            );
+            const providerCandidate = repairProviderGift(projectBoundProviderCandidate, question);
+            const repairedProviderGift = providerCandidate !== projectBoundProviderCandidate;
+            const researchAllowed = !researchRequired || reusableLearnedAction(providerCandidate);
+            const intentAllowed = researchAllowed && providerActionMatchesRequest(providerCandidate, question, actionHistory, {
               buildRequest, projectFeedback, reviewRequest,
             });
             providerActionRejection = envelope.rawActionRejection
-              || (providerCandidate && !intentAllowed ? "action does not match the player's explicit request" : undefined);
+              || (providerCandidate && !researchAllowed
+                ? "web-researched build plans cannot contain server administration or arbitrary commands"
+                : providerCandidate && !intentAllowed ? "action does not match the player's explicit request" : undefined);
             if (providerCandidate && !intentAllowed) rejectedProviderAction = providerCandidate;
             providerGoal = (reviewRequest || buildRequest || projectFeedback || (providerCandidate && intentAllowed))
               ? envelope.goal : undefined;
@@ -3490,7 +4139,7 @@ export function createWizard({
                 const repairedProviderAnswer = await askProvider({
                   provider, fetchImpl, question, hits, history: repairHistory, player, env,
                   safetySalt: providerSafetySalt, general: false, buildRequest: false,
-                  reviewRequest: false, tuning, context,
+                  reviewRequest: false, researchRequired: false, tuning, context,
                 });
                 const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
                 const repairedGift = repairingGift && !repairedEnvelope?.rawActionRejection
@@ -3550,6 +4199,7 @@ export function createWizard({
           }
           if (!general && buildRequest && !actionCompletesBuildRequest(selectedAction, question, actionHistory)) {
             const repairDetail = plannerRepairDetail(question, rejectedProviderAction || selectedAction, actionHistory, providerActionRejection);
+            logger.warn(`[wizard] planner contract rejected: ${repairDetail}`);
             const repairHistory = [...actionHistory, {
               question,
               answer,
@@ -3560,12 +4210,21 @@ export function createWizard({
             }];
             const repairedProviderAnswer = await askProvider({
               provider, fetchImpl, question, hits, history: repairHistory, player, env,
-              safetySalt: providerSafetySalt, general: false, buildRequest: true, tuning, context,
+              safetySalt: providerSafetySalt, general: false, buildRequest: true, researchRequired, tuning, context,
             });
             const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
             if (repairedEnvelope && !unusableWizardAnswer(repairedEnvelope.answer, question)) {
-              const repairedAction = carryForwardStructurePrimitives(repairedEnvelope.action, actionHistory, question);
-              if (providerActionMatchesRequest(repairedAction, question, actionHistory, { buildRequest: true })
+              const repairedAction = bindProgramToActiveProject(
+                carryForwardStructurePrimitives(repairedEnvelope.action, actionHistory, question),
+                projectFeedback,
+                question,
+                actionHistory,
+              );
+              if ((!researchRequired || reusableLearnedAction(repairedAction))
+                && providerActionMatchesRequest(repairedAction, question, actionHistory, {
+                  buildRequest: true,
+                  projectFeedback,
+                })
                 && actionCompletesBuildRequest(repairedAction, question, actionHistory)) {
                 answer = repairedEnvelope.answer;
                 selectedAction = repairedAction;
@@ -3574,6 +4233,7 @@ export function createWizard({
             }
             const repaired = actionCompletesBuildRequest(selectedAction, question, actionHistory);
             if (!repaired) {
+              logger.warn(`[wizard] repaired planner action still missed the request: ${plannerRepairDetail(question, selectedAction, actionHistory, repairedEnvelope?.rawActionRejection)}`);
               const fallback = localStructureFallback(question, actionHistory);
               if (!fallback || !actionAdvancesBuildRequest(fallback, question, actionHistory)) {
                 throw new Error(`AI planner action did not satisfy the active goal (raw=${envelope.rawActionLabel}; rejection=${providerActionRejection || "goal mismatch"}; repaired=${repairedEnvelope?.rawActionLabel || "none"}; repairedRejection=${repairedEnvelope?.rawActionRejection || "goal mismatch"}; requested=${structureKind(question, actionHistory)})`);
@@ -3633,7 +4293,9 @@ export function createWizard({
         satisfied,
         review: reviewRequest,
       });
-      const priorProject = latestProjectTurn(actionHistory)?.turn;
+      const priorProject = projectFeedback
+        ? projectTurnForQuestion(question, actionHistory)
+        : latestProjectTurn(actionHistory)?.turn;
       const repeatedActiveRequest = Boolean(activeWizardGoal(actionHistory))
         && priorProject?.question === question;
       const goalId = general || !goal ? undefined
@@ -3662,12 +4324,18 @@ export function createWizard({
         ...(goal && { goal }),
         ...(safeRequestId && { requestId: safeRequestId }),
         ...(goalId && { goalId }),
+        ...(failureRetry?.requestId && { retryOfRequestId: failureRetry.requestId }),
         ...(selectedAction && { status: "pending" }),
         responseMode,
         ...(requestSequence && { requestSequence }),
       };
       if (requestSequence && typeof sessions.appendIfCurrent === "function") {
-        if (!await sessions.appendIfCurrent(player, requestMode, turn)) return supersededResponse();
+        try {
+          if (!await sessions.appendIfCurrent(player, requestMode, turn)) return supersededResponse();
+        } catch (error) {
+          if (typeof sessions.release === "function") sessions.release(player, requestMode, requestSequence);
+          throw error;
+        }
       } else if (typeof sessions.append === "function") await sessions.append(player, requestMode, turn);
       else await sessions.set(player, requestMode, [...history, turn]);
       return {

@@ -1057,6 +1057,12 @@ function completedHouseProfile(dimension, x, y, z, size) {
     let windows = 0;
     let lights = 0;
     let doorway = false;
+    for (let dx = 0; dx < size; dx += 1) {
+      for (let dz = 0; dz < size; dz += 1) {
+        const floorType = dimension.getBlock({ x: x + dx, y, z: z + dz })?.typeId ?? "";
+        if (isHouseLight(floorType)) lights += 1;
+      }
+    }
     for (let offset = 1; offset <= roofOffset; offset += 1) {
       const perimeter = housePerimeterLocations(x, y + offset, z, size);
       const boundaryBlocks = perimeter.filter((location) => {
@@ -1168,7 +1174,8 @@ function automaticKelpFarmIsWorking(kid, station) {
   const hopper = machineLocation(origin, [0, 4, 2]);
   const plant = machineLocation(origin, [0, 1, 4]);
   const piston = machineLocation(origin, [0, 2, 5]);
-  const observer = machineLocation(origin, [-1, 2, 4]);
+  const observer = machineLocation(origin, [-1, 3, 4]);
+  const refillSources = [[1, 2, 4], [0, 2, 3]].map((point) => machineLocation(origin, point));
   const water = (location) => blockIs(dimension, location, ["minecraft:water", "minecraft:flowing_water"]);
   const submergedKelp = (location) => blockIs(dimension, location, [
     "minecraft:water",
@@ -1182,6 +1189,7 @@ function automaticKelpFarmIsWorking(kid, station) {
     && blockIs(dimension, plant, ["minecraft:kelp", "minecraft:kelp_plant"])
     && [2, 3, 4, 5].every((y) => submergedKelp(machineLocation(origin, [0, y, 4])))
     && [3, 2].every((z) => water(machineLocation(origin, [0, 5, z])))
+    && refillSources.every(water)
     && blockIs(dimension, piston, "minecraft:piston")
     && blockIs(dimension, observer, "minecraft:observer")
     && containerContains(dimension, chest, "minecraft:kelp");
@@ -1212,12 +1220,25 @@ async function proveLiveKelpHarvest(kid, station) {
   dimension.runCommand("gamerule randomtickspeed 1000");
   let observerPowered = false;
   let pistonExtended = false;
+  let harvestCellRefilled = false;
+  let outputCollected = false;
   try {
     for (let tick = 0; tick < 800; tick += 1) {
-      observerPowered ||= dimension.getBlock(at([-1, 2, 4]))?.permutation.getState("powered_bit") === true;
+      observerPowered ||= dimension.getBlock(at([-1, 3, 4]))?.permutation.getState("powered_bit") === true;
       pistonExtended ||= /piston_arm/.test(dimension.getBlock(at([0, 2, 4]))?.typeId || "");
-      if (containerContains(dimension, chest, "minecraft:kelp")) return;
+      if (containerContains(dimension, chest, "minecraft:kelp")) {
+        outputCollected = true;
+        break;
+      }
       await system.waitTicks(1);
+    }
+    if (outputCollected) {
+      dimension.runCommand("gamerule randomtickspeed 1");
+      for (let tick = 0; tick < 80; tick += 1) {
+        harvestCellRefilled = blockIs(dimension, at([0, 2, 4]), "minecraft:water");
+        if (observerPowered && pistonExtended && harvestCellRefilled) return;
+        await system.waitTicks(1);
+      }
     }
     const dropped = dimension.getEntities({ type: "minecraft:item", location: plant, maxDistance: 12 })
       .map((entity) => entity.getComponent("minecraft:item")?.itemStack?.typeId)
@@ -1232,15 +1253,16 @@ async function proveLiveKelpHarvest(kid, station) {
     };
     const column = [1, 2, 3, 4, 5].map((y) => blockSnapshot([0, y, 4]));
     const circuit = [
-      blockSnapshot([-1, 2, 4]),
-      blockSnapshot([-2, 2, 4]),
-      blockSnapshot([-2, 2, 5]),
-      blockSnapshot([-1, 2, 5]),
+      blockSnapshot([-1, 3, 4]),
+      blockSnapshot([-2, 3, 4]),
+      blockSnapshot([-2, 3, 5]),
+      blockSnapshot([-1, 3, 5]),
       blockSnapshot([0, 2, 5]),
     ];
     throw new Error(
-      `timed out waiting for naturally grown kelp to be harvested through the stream into the chest`
-        + `; observerPowered=${observerPowered}; pistonExtended=${pistonExtended}; dropped=${JSON.stringify(dropped)}`
+      `timed out waiting for naturally grown kelp to be harvested, collected, and leave a refilled harvest cell`
+        + `; observerPowered=${observerPowered}; pistonExtended=${pistonExtended}; harvestCellRefilled=${harvestCellRefilled}`
+        + `; dropped=${JSON.stringify(dropped)}`
         + `; column=${JSON.stringify(column)}; circuit=${JSON.stringify(circuit)}`,
     );
   } finally {
@@ -1741,6 +1763,65 @@ function playerAndDroppedItemIds(kid) {
   return ids;
 }
 
+function playerAndDroppedItemAmount(player, itemId, nameTag = null) {
+  let amount = 0;
+  const inventory = player.getComponent("minecraft:inventory")?.container;
+  for (let slot = 0; inventory && slot < inventory.size; slot += 1) {
+    const item = inventory.getItem(slot);
+    if (item?.typeId === itemId && (nameTag === null || item.nameTag === nameTag)) amount += item.amount;
+  }
+  for (const entity of player.dimension.getEntities({ type: "minecraft:item", location: player.location, maxDistance: 8 })) {
+    const item = entity.getComponent("minecraft:item")?.itemStack;
+    if (item?.typeId === itemId && (nameTag === null || item.nameTag === nameTag)) amount += item.amount;
+  }
+  return amount;
+}
+
+async function proveRemoteGift(kid, station) {
+  const friendName = `WizPal-${runId.slice(0, 8)}`;
+  const friend = spawnSimulatedPlayer(
+    { dimension: kid.dimension, x: station.x + 0.5, y: station.y, z: station.z + 0.5 },
+    friendName,
+    GameMode.Creative,
+  );
+  try {
+    friend.addTag(TEST_TAG);
+    if (playerAndDroppedItemAmount(kid, "minecraft:diamond") !== 0
+      || playerAndDroppedItemAmount(friend, "minecraft:diamond") !== 0) {
+      throw new Error("remote gift proof requires both players to start without diamonds");
+    }
+    await chatCallbacks.deliverTestGift(kid, friendName);
+    await waitFor(
+      () => playerAndDroppedItemAmount(friend, "minecraft:diamond", "Seven Stars") === 7
+        && playerAndDroppedItemAmount(friend, "minecraft:diamond") === 7,
+      400,
+      "all seven named diamonds at the connected recipient",
+    );
+    if (playerAndDroppedItemAmount(kid, "minecraft:diamond") !== 0) {
+      throw new Error("the remote gift was also duplicated at the requester");
+    }
+    report("CHECK", "child-remote-gift", "visible Wizard delivered exactly seven named items to the recipient and none to the requester");
+  } finally {
+    try { friend.disconnect(); } catch {}
+  }
+}
+
+async function runRemoteGiftAcceptance(kid) {
+  try {
+    const station = {
+      x: Math.floor(kid.location.x) + 40,
+      y: Math.round(kid.location.y),
+      z: Math.floor(kid.location.z),
+    };
+    await proveRemoteGift(kid, station);
+    report("PASS", "remote-gift-pipeline", "a second simulated child received exactly the physical named gift without requester duplication");
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    report("FAIL", "remote-gift-pipeline", String(error));
+    try { kid.disconnect(); } catch {}
+  }
+}
+
 function recipeDisplayIsComplete(kid, station) {
   const min = { x: station.x - 16, y: station.y, z: station.z - 16 };
   const max = { x: station.x + 16, y: station.y + 5, z: station.z + 16 };
@@ -2172,6 +2253,9 @@ async function runChildRequestAcceptance(kid) {
     );
     report("CHECK", "child-iron-tools", `request via ${toolsTransport}; all five physical items verified`);
 
+    currentRequest = "deliver seven named diamonds to another connected child";
+    await proveRemoteGift(kid, recipeStation);
+
     currentRequest = "show me how to craft a hopper";
     await teleportToStation(kid, recipeStation);
     const recipeTransport = await routeWizardRequest(kid, "wizard, show me how to craft a hopper", "hopper-recipe");
@@ -2184,7 +2268,7 @@ async function runChildRequestAcceptance(kid) {
     report(
       "PASS",
       "child-action-pipeline",
-      "exact child requests produced sized and in-place-upgraded structures, working chicken, wool, and kelp farms, potion rain, world changes, gifted tools, and an in-world recipe",
+      "exact child requests produced sized and in-place-upgraded structures, working chicken, wool, and kelp farms, potion rain, world changes, local and remote gifts, and an in-world recipe",
     );
     try { kid.disconnect(); } catch {}
   } catch (error) {
@@ -3057,7 +3141,7 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "mc_wizard_e2e_run is required");
     return;
   }
-  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp") {
+  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp" && scope !== "delivery") {
     report("FAIL", "configuration", `unsupported mc_wizard_e2e_scope: ${scope}`);
     return;
   }
@@ -3068,7 +3152,8 @@ export async function startE2E(callbacks) {
     || typeof callbacks?.hasCommittedBuild !== "function"
     || typeof callbacks?.buildValidatedPlan !== "function"
     || typeof callbacks?.prepareBuildWorkshop !== "function"
-    || typeof callbacks?.deliverTestBook !== "function") {
+    || typeof callbacks?.deliverTestBook !== "function"
+    || typeof callbacks?.deliverTestGift !== "function") {
     report("FAIL", "configuration", "shared chat router callbacks are required");
     return;
   }
@@ -3087,7 +3172,8 @@ export async function startE2E(callbacks) {
         : scope === "refinement" ? "castle-refinement"
           : scope === "feedback" ? "feedback-refinement"
           : scope === "farms" ? "common-farm-pipeline"
-            : scope === "kelp" ? "kelp-farm-pipeline" : "visible-player-t-flip-flop";
+            : scope === "kelp" ? "kelp-farm-pipeline"
+              : scope === "delivery" ? "remote-gift-pipeline" : "visible-player-t-flip-flop";
   report("START", startCheck);
   try {
     const dimension = world.getDimension("overworld");
@@ -3156,6 +3242,10 @@ export async function startE2E(callbacks) {
     }
     if (scope === "kelp") {
       system.runTimeout(() => void runKelpFarmAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "delivery") {
+      system.runTimeout(() => void runRemoteGiftAcceptance(kid), 80);
       return;
     }
     system.runTimeout(async () => {
