@@ -47,8 +47,8 @@ test("runtime normalizes a physical build and its observable verification", () =
     expectedStates: {},
   });
   assert.deepEqual(normalizeRuntimeStep(step("verify.entities", {
-    typeId: "minecraft:horse", minimum: 1, maxDistance: 32,
-  })).arguments, { typeId: "minecraft:horse", minimum: 1, maxDistance: 32 });
+    typeId: "minecraft:horse", location: [2, 0, 1], minimum: 1, maxDistance: 4,
+  })).arguments, { typeId: "minecraft:horse", location: [2, 0, 1], minimum: 1, maxDistance: 4 });
 });
 
 test("runtime keeps ordinary commands requester-scoped and rejects server authority", () => {
@@ -57,10 +57,14 @@ test("runtime keeps ordinary commands requester-scoped and rejects server author
   })).arguments.commands, ["effect @s night_vision 1200 0 true"]);
   for (const command of [
     "kick OtherKid", "kill OtherKid", "effect @a night_vision 20", "effect OtherKid night_vision 20",
-    "execute as @s run op @s", "/say nope",
+    "execute as @s run op @s", "tp OtherKid @s", "damage OtherKid 100", "fill ~ ~ ~ ~10 ~10 ~10 air",
+    "summon wither", "scoreboard players set OtherKid score 1", "/say nope",
   ]) {
-    assert.throws(() => normalizeRuntimeStep(step("world.command", { commands: [command] })), /authority|broad|safe command|requesting player/);
+    assert.throws(() => normalizeRuntimeStep(step("world.command", { commands: [command] })), /allowed requester-only|broad|safe command/);
   }
+  assert.throws(() => normalizeRuntimeStep(step("script.spawn-entity", {
+    typeId: "minecraft:wither", location: [0, 0, 0], count: 1,
+  })), /elevated authority/);
   assert.throws(() => normalizeRuntimeStep(step("knowledge.research", { query: "cake" })), /not installed/);
 });
 
@@ -78,12 +82,30 @@ test("runtime evidence covers every physical mutation instead of trusting prose 
   assert.equal(runtimeProgramHasEvidence([placement, wrong]), false);
   assert.equal(runtimeProgramHasEvidence([placement, matching]), true);
   assert.equal(runtimeProgramHasEvidence([normalizeRuntimeStep(step("observe.snapshot", {}))]), false);
+  assert.equal(runtimeProgramHasEvidence([normalizeRuntimeStep(step("world.command", {
+    commands: ["effect @s night_vision 1200 0 true"],
+  }))]), false);
+  const spawn = normalizeRuntimeStep(step("script.spawn-entity", {
+    typeId: "minecraft:horse", location: [2, 0, 1], count: 1,
+  }));
+  const wrongLocation = normalizeRuntimeStep(step("verify.entities", {
+    typeId: "minecraft:horse", location: [0, 0, 0], minimum: 1, maxDistance: 4,
+  }));
+  const spawnCheck = normalizeRuntimeStep(step("verify.entities", {
+    typeId: "minecraft:horse", location: [2, 0, 1], minimum: 1, maxDistance: 4,
+  }));
+  assert.equal(runtimeProgramHasEvidence([spawn, wrongLocation]), false);
+  assert.equal(runtimeProgramHasEvidence([spawn, spawnCheck]), true);
 });
 
 test("Bedrock executes programs sequentially and reports failed steps with a fresh snapshot", () => {
-  assert.match(packScript, /import \{ normalizeRuntimeStep \} from "\.\/capability-runtime\.js"/);
+  assert.match(packScript, /import \{ normalizeRuntimeStep, runtimeProgramHasEvidence \} from "\.\/capability-runtime\.js"/);
   assert.match(packScript, /async function executeCapabilityProgram\(player, program\)/);
+  assert.match(packScript, /function capabilityProgramFrame\(player, program\)/);
+  assert.match(packScript, /program\.site === "active_project"/);
+  assert.match(packScript, /lastProjectFor\(player\) \|\| lastStructureFor\(player\)/);
   assert.match(packScript, /program\.steps\.map\(normalizeRuntimeStep\)/);
+  assert.match(packScript, /if \(!runtimeProgramHasEvidence\(steps\)\) throw/);
   assert.match(packScript, /await executeCapabilityStep\(player, step, frame\)/);
   assert.match(packScript, /action\?\.type === "execute_program" && action\.version === 1/);
   assert.match(packScript, /void executeCapabilityProgram\(player, action\.program\)/);

@@ -185,10 +185,13 @@ test("embodies the guide as an official simulated player", () => {
 });
 
 test("verifies simulated-player gifts before repairing a missing drop at the child's feet", () => {
-  assert.match(packScript, /const before = nearbyGiftAmount\(player, itemId\)/);
-  assert.match(packScript, /const arrived = Math\.max\(0, nearbyGiftAmount\(player, itemId\) - before\)/);
+  assert.match(packScript, /const before = nearbyGiftAmount\(target, itemId\)/);
+  assert.match(packScript, /const arrived = Math\.max\(0, nearbyGiftAmount\(target, itemId\) - before\)/);
   assert.match(packScript, /if \(arrived < count\)/);
-  assert.match(packScript, /player\.dimension\.spawnItem\(new ItemStack\(itemId, missing\)/);
+  assert.match(packScript, /target\.dimension\.spawnItem\(giftStack\(spec, missing\)/);
+  assert.match(packScript, /EnchantmentTypes\.get\(id\)/);
+  assert.match(packScript, /component\.addEnchantments\(enchantments\)/);
+  assert.match(packScript, /candidate\.name\.trim\(\)\.toLowerCase\(\) === wanted/);
 });
 
 test("retries a busy brain instead of abandoning a child's fast follow-up", () => {
@@ -319,7 +322,7 @@ test("removes unsolicited provider commands without discarding typed actions", a
     type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 16 }],
   });
   assert.doesNotMatch(gift.answer, /\/give\b/i);
-  assert.match(gift.answer, /16x torch.*inventory/i);
+  assert.match(gift.answer, /16x torch.*to you/i);
 
   const helloLesson = await providerWizard.ask({
     player: "CommandKid",
@@ -915,7 +918,7 @@ test("replaces every premature provider success phrase while keeping its pending
     ["The castle’s ready.", "Build me a castle", castle, /coming up|I’ll build/i],
     ["The castle has been completed.", "Build me a castle", castle, /coming up|I’ll build/i],
     ["We did it.", "Build me a castle", castle, /coming up|I’ll build/i],
-    ["Done — the torches are in your inventory.", "Can I have something useful?", torchGift, /I’ll put 16x torch/i],
+    ["Done — the torches are in your inventory.", "Can I have something useful?", torchGift, /I’ll carry 16x torch/i],
   ];
   for (const [providerAnswer, question, action, truthfulAnswer] of cases) {
     const modelWizard = createWizard({
@@ -1891,7 +1894,7 @@ test("requires provider gifts to match the child's requested quantity", async ()
   });
   assert.equal(short.goal?.status, "active");
   assert.equal(short.mode, "local-action-repair");
-  assert.match(short.answer, /16x ladder.*inventory/i);
+  assert.match(short.answer, /16x ladder.*to you/i);
   assert.doesNotMatch(short.answer, /keeping this project active/i);
   const extra = await giftWizard.ask({ player: "OverfullLadderKid", question: "Give me 16 ladders" });
   assert.deepEqual(extra.action, {
@@ -1899,7 +1902,34 @@ test("requires provider gifts to match the child's requested quantity", async ()
   });
   assert.equal(extra.goal?.status, "active");
   assert.equal(extra.mode, "local-action-repair");
-  assert.match(extra.answer, /16x ladder.*inventory/i);
+  assert.match(extra.answer, /16x ladder.*to you/i);
+});
+
+test("accepts a rich large delivery to an exact named connected player", async () => {
+  const action = {
+    type: "give_items", version: 1, recipient: "enti1ty303",
+    items: [{
+      itemId: "minecraft:diamond_sword", amount: 256, nameTag: "Star Cutter",
+      enchantments: [{ id: "minecraft:sharpness", level: 5 }],
+    }],
+  };
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "I’ll carry 256 enchanted Star Cutters to enti1ty303.", action, goal: {
+        objective: "Deliver the named enchanted swords",
+        successCriteria: "enti1ty303 receives all 256 swords with the requested name and enchantment",
+        status: "active",
+      },
+    }) } }] }), { status: 200 }),
+  });
+  const result = await wizard.ask({
+    player: "alt3rname",
+    question: "Give enti1ty303 256 enchanted diamond swords named Star Cutter",
+  });
+  assert.deepEqual(result.action, action);
+  assert.match(result.answer, /enti1ty303/i);
 });
 
 test("keeps the wrong gift rejected unless one bounded repair returns the requested item", async () => {
@@ -1931,7 +1961,7 @@ test("keeps the wrong gift rejected unless one bounded repair returns the reques
     type: "give_items", version: 1, items: [{ itemId: "minecraft:ladder", amount: 16 }],
   });
   assert.equal(repairedResult.goal?.status, "active");
-  assert.match(repairedResult.answer, /16x ladder.*inventory/i);
+  assert.match(repairedResult.answer, /16x ladder.*to you/i);
 
   const rejected = makeWizard([response("minecraft:diamond"), response("minecraft:diamond")]);
   const rejectedResult = await rejected.wizard.ask({ player: "WrongGiftKid", question: "Give me 16 ladders" });
@@ -1961,7 +1991,7 @@ test("constructs exact safe gifts locally and never guesses unsafe item ids", as
     assert.deepEqual(result.action, action);
     assert.equal(result.goal?.status, "active");
     assert.equal(result.mode, "local-skill");
-    assert.match(result.answer, /inventory now/i);
+    assert.match(result.answer, /to you now/i);
   }
 
   let providerCalls = 0;
@@ -1986,12 +2016,16 @@ test("constructs exact safe gifts locally and never guesses unsafe item ids", as
   assert.equal(classifyAction("Give me a command block"), null);
 });
 
-test("rejects negated and out-of-range local gift quantities instead of defaulting to one", async () => {
+test("supports large gifts and rejects negated or truly out-of-range quantities", async () => {
+  for (const amount of [65, 999, 10_000]) {
+    assert.deepEqual(classifyAction(`Give me ${amount} torches`), {
+      type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount }],
+    });
+  }
   const invalid = [
     "Give me no torches",
     "Give me 0 torches",
-    "Give me 65 torches",
-    "Give me 999 torches",
+    "Give me 10001 torches",
     "Give me -1 torches",
   ];
   const offlineWizard = createWizard({ corpus: { search: () => [] }, env: {} });
@@ -2078,17 +2112,19 @@ test("never dumps retrieved documentation when the model is unavailable", async 
 });
 
 test("never relays a malformed provider fragment to a child", async () => {
+  const fragments = ["{", "goal: null", "...", "null"];
   const malformedWizard = createWizard({
     corpus,
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
     logger: { warn() {} },
     fetchImpl: async () => new Response(JSON.stringify({
-      choices: [{ message: { content: JSON.stringify({ answer: "{", goal: null, action: null }) } }],
+      choices: [{ message: { content: JSON.stringify({ answer: fragments.shift(), goal: null, action: null }) } }],
     }), { status: 200 }),
   });
-  const result = await malformedWizard.ask({ player: "FragmentKid", question: "give me surgery" });
-  assert.notEqual(result.answer.trim(), "{");
-  assert.equal(result.mode, "offline-fallback");
+  for (let index = 0; index < 4; index += 1) {
+    const result = await malformedWizard.ask({ player: `FragmentKid${index}`, question: "give me surgery" });
+    assert.equal(result.mode, "offline-fallback");
+  }
 });
 
 test("answers ordinary conversation instantly without invoking the provider", async () => {
@@ -2291,7 +2327,7 @@ test("lets the model compose and retain a novel executable capability program", 
       {
         id: "verify_horse",
         capability: "verify.entities",
-        arguments: { typeId: "minecraft:horse", minimum: 1, maxDistance: 32 },
+        arguments: { typeId: "minecraft:horse", location: [2, 0, 1], minimum: 1, maxDistance: 4 },
         expect: "The test horse remains nearby.",
         onFailure: "replan",
       },
@@ -2323,6 +2359,69 @@ test("lets the model compose and retain a novel executable capability program", 
   assert.equal(result.goal.status, "active");
   assert.match(requests[0].messages[0].content, /Runtime capability manifest/);
   assert.match(requests[0].messages[0].content, /player\.place-blocks/);
+});
+
+test("binds model-authored furniture revisions to the existing project", async () => {
+  const sessions = createMemorySessionStore();
+  const blocks = Array.from({ length: 8 }, (_, index) => ({
+    itemId: "minecraft:oak_planks",
+    target: [index % 4, 1, Math.floor(index / 4)],
+    support: [index % 4, 0, Math.floor(index / 4)],
+    expectedType: "minecraft:oak_planks",
+  }));
+  let request;
+  const wizard = createWizard({
+    corpus: { search: () => [] }, sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async (url, options) => {
+      request = JSON.parse(options.body);
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "I’ll furnish the same mansion with couches and beds now.",
+        goal: { objective: "Furnish the mansion", successCriteria: "Couches and beds are inside it", status: "active" },
+        action: { type: "execute_program", version: 1, program: {
+          title: "Mansion couches and beds",
+          steps: [{
+            id: "place_furniture", capability: "player.place-blocks", arguments: { blocks },
+            expect: "Couches and beds are arranged inside the mansion.",
+          }, {
+            id: "verify_furniture", capability: "verify.blocks",
+            arguments: { blocks: blocks.map(({ target, expectedType: typeId }) => ({ target, typeId })) },
+            expect: "Every furniture block remains in place.",
+          }],
+        } },
+      }) } }] }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const mansion = await wizard.ask({ player: "FurnitureKid", question: "Build a mansion" });
+  await sessions.updateAction("FurnitureKid", "wizard", {
+    requestId: mansion.requestId, status: "completed", detail: "mansion verified",
+  });
+  const furnished = await wizard.ask({
+    player: "FurnitureKid", question: "build couches and beds in my mansion",
+  });
+  assert.equal(furnished.action.type, "execute_program");
+  assert.equal(furnished.action.program.site, "active_project");
+  assert.equal(request.max_tokens, 3000);
+});
+
+test("keeps short child continuations and nearby playground requests actionable", async () => {
+  const house = classifyAction("Build a house");
+  const history = [{
+    question: "Build a house", answer: "Done.", action: house, status: "completed",
+    goal: { objective: "Build a house", successCriteria: "A house exists", status: "active" },
+    requestId: "house", goalId: "house",
+  }];
+  const decorated = classifyAction("decorations!", history);
+  assert.equal(decorated.type, "build_structure");
+  assert.equal(decorated.plan.mode, "modify");
+  assert.equal(classifyAction("build a playground next to the school", history), null);
+  assert.equal(classifyAction("yes,", [...history, {
+    question: "Want another detail?",
+    answer: "I can place a chest nearby. Want that?",
+  }]).type, "execute_program");
+  const chest = classifyAction("place a chest here");
+  assert.equal(chest.type, "execute_program");
+  assert.equal(chest.program.steps[0].arguments.blocks[0].itemId, "minecraft:chest");
 });
 
 test("tells the model whether prior actions are planned, active, completed, failed, or unknown", async () => {

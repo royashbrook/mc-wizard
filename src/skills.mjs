@@ -10,6 +10,7 @@ import {
 } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-program.js";
 import {
   capabilityRuntimePrompt,
+  normalizeRequesterCommand,
   normalizeRuntimeStep,
   runtimeProgramHasEvidence,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
@@ -74,7 +75,7 @@ export const WIZARD_SKILLS = [
   },
   {
     name: "give_player_items",
-    description: "Put requested ordinary Minecraft items directly into the requesting player's inventory instead of relaying a give command.",
+    description: "Physically bring requested Minecraft items to the requester or an exact connected player. Supports large amounts, a custom nameTag, and Bedrock enchantments. Use recipient=\"requester\" unless the child names another connected player.",
     action: { type: "give_items", version: 1, items: [{ itemId: "minecraft:iron_pickaxe", amount: 1 }] },
   },
   {
@@ -109,28 +110,12 @@ export const WIZARD_SKILLS = [
   })),
 ];
 
-const FORBIDDEN_COMMAND_ROOTS = new Set([
-  "allowlist", "ban", "ban-ip", "banlist", "changesetting", "deop", "kick", "op",
-  "pardon", "pardon-ip", "permissions", "reload", "reloadconfig",
-  "reloadpacketlimitconfig", "save", "script", "sendshowstoreoffer", "setmaxplayers",
-  "stop", "whitelist", "execute", "kill",
-]);
-const REQUESTER_TARGET_COMMANDS = new Set([
-  "ability", "clear", "effect", "enchant", "gamemode", "give", "inputpermission",
-  "permission", "playanimation", "recipe", "replaceitem", "spawnpoint", "teleport", "tp", "xp",
-]);
-
 function allowedCommand(value) {
-  if (typeof value !== "string") return null;
-  const command = value.trim();
-  if (!command || command.length > 240 || command.startsWith("/")
-    || /[\u0000-\u001f\u007f]/.test(command)) return null;
-  const root = command.split(/\s+/, 1)[0].toLowerCase();
-  if (FORBIDDEN_COMMAND_ROOTS.has(root)) return null;
-  // Every player selector must stay requester-scoped. World-coordinate commands need no selector.
-  if (/@(?:a|e|p|r)(?:\b|\[)/i.test(command)) return null;
-  if (REQUESTER_TARGET_COMMANDS.has(root) && !/(?:^|\s)@s(?:\b|\[)/i.test(command)) return null;
-  return command;
+  try {
+    return normalizeRequesterCommand(value);
+  } catch {
+    return null;
+  }
 }
 
 export function allowedWizardAction(value) {
@@ -172,12 +157,31 @@ export function allowedWizardAction(value) {
   }
   if (value?.type === "give_items" && value.version === 1 && Array.isArray(value.items)
     && value.items.length >= 1 && value.items.length <= 16) {
-    const items = value.items.map(({ itemId, amount }) => ({ itemId: String(itemId || ""), amount: Number(amount) }));
-    if (items.every(({ itemId, amount }) => /^minecraft:[a-z0-9_]+$/.test(itemId)
-      && Number.isInteger(amount) && amount >= 1 && amount <= 64)) {
-      return { type: "give_items", version: 1, items };
-    }
-    return null;
+    const recipient = value.recipient === undefined ? undefined : String(value.recipient)
+      .replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+    if (recipient && (recipient.length > 32 || !/^[a-zA-Z0-9 _-]+$/.test(recipient))) return null;
+    const items = value.items.map((item) => {
+      if (!item || typeof item !== "object" || Array.isArray(item)
+        || Object.keys(item).some((key) => !["itemId", "amount", "nameTag", "enchantments"].includes(key))) return null;
+      const itemId = String(item.itemId || "");
+      const amount = Number(item.amount);
+      const nameTag = item.nameTag === undefined ? undefined : String(item.nameTag)
+        .replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+      if (!/^minecraft:[a-z0-9_]+$/.test(itemId) || !Number.isInteger(amount) || amount < 1 || amount > 10_000
+        || (nameTag !== undefined && (!nameTag || nameTag.length > 80))) return null;
+      const enchantments = item.enchantments === undefined ? undefined : Array.isArray(item.enchantments)
+        && item.enchantments.length >= 1 && item.enchantments.length <= 16
+        ? item.enchantments.map((enchantment) => {
+          const id = String(enchantment?.id || "");
+          const level = Number(enchantment?.level);
+          return /^minecraft:[a-z0-9_]+$/.test(id) && Number.isInteger(level) && level >= 1 && level <= 255
+            ? { id, level } : null;
+        }) : null;
+      if (enchantments === null || enchantments?.some((entry) => !entry)) return null;
+      return { itemId, amount, ...(nameTag && { nameTag }), ...(enchantments && { enchantments }) };
+    });
+    if (items.some((item) => !item)) return null;
+    return { type: "give_items", version: 1, ...(recipient && { recipient }), items };
   }
   if (value?.type === "run_commands" && value.version === 1 && Array.isArray(value.commands)
     && value.commands.length >= 1 && value.commands.length <= 8) {

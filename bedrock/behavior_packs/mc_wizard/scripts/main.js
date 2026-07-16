@@ -1,6 +1,7 @@
 import {
   BlockPermutation,
   Direction,
+  EnchantmentTypes,
   EquipmentSlot,
   GameMode,
   ItemStack,
@@ -36,7 +37,7 @@ import { createTwoByTwoPistonDoorBlueprint } from "./piston-door.js";
 import { createRecipeDisplay } from "./recipe-display.js";
 import { createAutomaticWoolFarmBlueprint } from "./wool-farm.js";
 import { splitMessage } from "./chat.js";
-import { normalizeRuntimeStep } from "./capability-runtime.js";
+import { normalizeRuntimeStep, runtimeProgramHasEvidence } from "./capability-runtime.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
 const WIZARD_NAME = "MC Wizard";
@@ -5003,11 +5004,33 @@ function nearbyGiftAmount(player, itemId) {
   return amount;
 }
 
-async function giveItemsAsWizard(player, items, report) {
+function giftRecipient(requester, recipient) {
+  if (!recipient || recipient === "requester") return requester;
+  const wanted = String(recipient).trim().toLowerCase();
+  return humanPlayers().find((candidate) => candidate.name.trim().toLowerCase() === wanted);
+}
+
+function giftStack(spec, amount) {
+  const stack = new ItemStack(spec.itemId, amount);
+  if (spec.nameTag) stack.nameTag = spec.nameTag;
+  if (spec.enchantments?.length) {
+    const component = stack.getComponent("minecraft:enchantable");
+    if (!component) throw new Error(`${spec.itemId} cannot be enchanted`);
+    const enchantments = spec.enchantments.map(({ id, level }) => {
+      const type = EnchantmentTypes.get(id);
+      if (!type) throw new Error(`unknown enchantment ${id}`);
+      return { type, level };
+    });
+    component.addEnchantments(enchantments);
+  }
+  return stack;
+}
+
+async function giveItemsAsWizard(player, items, report, recipient) {
   if (buildInProgress || buildPreparing) {
     queueBuild(
       player,
-      (current) => giveItemsAsWizard(current, items, report),
+      (current) => giveItemsAsWizard(current, items, report, recipient),
       40,
       "I’m gathering those items and will bring them over as soon as my current spell is stable.",
     );
@@ -5016,39 +5039,47 @@ async function giveItemsAsWizard(player, items, report) {
   const reservation = beginBuildPreparation();
   let activeReport = report;
   try {
+    const target = giftRecipient(player, recipient);
+    if (!target) {
+      activeReport ||= beginImmediateAction(player);
+      speak(player, `I can’t see a connected player named ${recipient}. I’m keeping the delivery ready for an exact connected name.`);
+      endImmediateAction(activeReport, "failed", `exact recipient ${recipient} is not connected`);
+      return;
+    }
     const bot = bringWizardTo(player, true, true);
     if (!bot) {
-      queueBuild(player, (current) => giveItemsAsWizard(current, items, report), 40, "I’m gathering those items and will bring them over as soon as I reappear.");
+      queueBuild(player, (current) => giveItemsAsWizard(current, items, report, recipient), 40, "I’m gathering those items and will bring them over as soon as I reappear.");
       return;
     }
     activeReport ||= beginImmediateAction(player);
-    for (let attempts = 0; attempts < 60 && distanceSquared(bot.location, player.location) > 5 * 5; attempts += 1) {
-      moveWizardBeside(bot, player);
+    for (let attempts = 0; attempts < 60 && distanceSquared(bot.location, target.location) > 5 * 5; attempts += 1) {
+      moveWizardBeside(bot, target);
       await system.waitTicks(2);
     }
     let dropped = 0;
     const requested = items.reduce((total, { amount }) => total + amount, 0);
-    for (const { itemId, amount } of items) {
+    for (const spec of items) {
+      const { itemId, amount } = spec;
       try {
-        const probe = new ItemStack(itemId, 1);
+        const probe = giftStack(spec, 1);
         let remaining = amount;
         while (remaining > 0) {
           const count = Math.min(remaining, probe.maxAmount || 1);
-          const stack = new ItemStack(itemId, count);
-          const before = nearbyGiftAmount(player, itemId);
+          const stack = giftStack(spec, count);
+          const before = nearbyGiftAmount(target, itemId);
           if (!bot.setItem(stack, 0, true) || !bot.dropSelectedItem()) {
             throw new Error(`could not drop ${itemId}`);
           }
           await system.waitTicks(4);
-          const arrived = Math.max(0, nearbyGiftAmount(player, itemId) - before);
+          const arrived = Math.max(0, nearbyGiftAmount(target, itemId) - before);
           if (arrived < count) {
             const missing = count - arrived;
-            player.dimension.spawnItem(new ItemStack(itemId, missing), {
-              x: player.location.x,
-              y: player.location.y + 0.5,
-              z: player.location.z,
+            target.dimension.spawnItem(giftStack(spec, missing), {
+              x: target.location.x,
+              y: target.location.y + 0.5,
+              z: target.location.z,
             });
-            console.warn(`[MC Wizard] repaired missing ${itemId} delivery at ${player.name}'s feet`);
+            console.warn(`[MC Wizard] repaired missing ${itemId} delivery at ${target.name}'s feet`);
           }
           dropped += count;
           remaining -= count;
@@ -5059,8 +5090,9 @@ async function giveItemsAsWizard(player, items, report) {
     }
     equipWizard();
     const complete = dropped === requested;
+    const recipientLabel = target.id === player.id ? "your feet" : `${target.name}'s feet`;
     speak(player, complete
-      ? `There you are—I brought ${dropped} item${dropped === 1 ? "" : "s"} and dropped them at your feet.`
+      ? `There you are—I brought ${dropped} item${dropped === 1 ? "" : "s"} and dropped them at ${recipientLabel}.`
       : dropped > 0
         ? `I brought ${dropped} of ${requested} items. I’m keeping this request active so I can retry the missing ones.`
         : "Those item names were smudged. Tell me what they look like and I’ll try a matching item next.");
@@ -5078,7 +5110,17 @@ async function giveItemsAsWizard(player, items, report) {
   }
 }
 
-function capabilityProgramFrame(player) {
+function capabilityProgramFrame(player, program) {
+  if (program.site === "active_project") {
+    const project = lastProjectFor(player) || lastStructureFor(player);
+    if (!project) throw new Error("the active project location is unavailable");
+    if (project.dimensionId !== player.dimension.id) throw new Error("the active project is in another dimension");
+    return {
+      origin: { ...project.origin },
+      forward: { ...project.forward },
+      right: { ...project.right },
+    };
+  }
   const forward = cardinalDirection(player);
   const right = { x: -forward.z, z: forward.x };
   const base = {
@@ -5212,7 +5254,7 @@ async function executeCapabilityStep(player, step, frame) {
   if (step.capability === "verify.entities") {
     const count = player.dimension.getEntities({
       type: args.typeId,
-      location: player.location,
+      location: capabilityLocation(frame, args.location),
       maxDistance: args.maxDistance,
     }).length;
     if (count < args.minimum) throw new Error(`found ${count} of ${args.minimum} required ${args.typeId}`);
@@ -5294,7 +5336,8 @@ async function executeCapabilityProgram(player, program) {
   let changedWorld = false;
   try {
     const steps = program.steps.map(normalizeRuntimeStep);
-    const frame = capabilityProgramFrame(player);
+    if (!runtimeProgramHasEvidence(steps)) throw new Error("the program lacks runtime evidence for its mutations");
+    const frame = capabilityProgramFrame(player, program);
     const expectedBlocks = steps.flatMap((step) => {
       if (step.capability === "player.place-blocks") return step.arguments.blocks.map((block) => ({
         location: capabilityLocation(frame, block.target),
@@ -5340,8 +5383,11 @@ async function executeCapabilityProgram(player, program) {
       speak(player, `I completed ${results.length} step${results.length === 1 ? "" : "s"}, but “${first.id}” needs another approach. I’m checking the world and replanning it now.`);
       endBuildAction(token, "failed", `program ${program.title}: ${results.length}/${steps.length} steps; ${first.id}: ${first.detail}`);
     } else {
-      speak(player, `Done—“${program.title}” completed all ${results.length} step${results.length === 1 ? "" : "s"}. Its explicit checks passed; I’m comparing that result with your whole request now.`);
-      endBuildAction(token, "completed", `program ${program.title}: completed ${results.length}/${steps.length} steps with explicit checks passed`);
+      const explicitChecks = steps.filter(({ capability }) => capability.startsWith("verify.")).length;
+      speak(player, explicitChecks
+        ? `Done—“${program.title}” completed all ${results.length} steps, including ${explicitChecks} explicit check${explicitChecks === 1 ? "" : "s"}. I’m comparing that result with your whole request now.`
+        : `Done—“${program.title}” completed all ${results.length} steps. I’m comparing that result with your whole request now.`);
+      endBuildAction(token, "completed", `program ${program.title}: completed ${results.length}/${steps.length} steps; explicit checks=${explicitChecks}`);
     }
   } catch (error) {
     if (transactionStarted) {
@@ -5432,7 +5478,7 @@ function applyResponse(playerId, payload, question) {
   } else if (action?.type === "potion_rain" && action.version === 1) {
     castPotionRain(player, action);
   } else if (action?.type === "give_items" && action.version === 1) {
-    void giveItemsAsWizard(player, action.items || []);
+    void giveItemsAsWizard(player, action.items || [], undefined, action.recipient);
   } else if (action?.type === "run_commands" && action.version === 1) {
     runCommandsForPlayer(player, action.commands || []);
   } else if (action?.type === "execute_program" && action.version === 1) {

@@ -83,14 +83,25 @@ function answerPromisesAction(answer = "") {
       .test(answer);
 }
 
+function answerOffersAction(answer = "") {
+  return /\b(?:i\s+can|shall\s+i|should\s+i|would\s+you\s+like\s+me\s+to|want\s+me\s+to)\b.{0,180}\b(?:build|place|make|create|construct|set\s*up|start|add|decorate|change|put|give|bring|spawn|summon|show|rebuild|expand|upgrade|improve|finish|fix|repair|furnish|wire|assemble|install|craft|modify|update)\b/i
+    .test(answer);
+}
+
+function offeredActionQuestion(turn) {
+  const clause = String(turn?.answer || "").match(/\b(?:build|place|make|create|construct|set\s*up|start|add|decorate|change|put|give|bring|spawn|summon|show|rebuild|expand|upgrade|improve|finish|fix|repair|furnish|wire|assemble|install|craft|modify|update)\b[^.!?]{0,240}/i)?.[0];
+  return clause ? `Please ${clause}.` : `${turn?.question || ""} ${turn?.answer || ""}`.trim();
+}
+
 function isActionConfirmation(question) {
-  return /^(?:(?:ok(?:ay)?|yes|sure)(?:,?\s+(?:do it|go(?:\s+ahead)?(?:\s+and)?(?:\s+do it)?|start|build it))?|do it|go(?:\s+ahead)?(?:\s+and)?(?:\s+do it)?|start)(?:\s+please)?[.!]*$/i
+  return /^(?:(?:ok(?:ay)?|yes|yeah|yep|sure)(?:,?\s+(?:do it|go(?:\s+ahead)?(?:\s+and)?(?:\s+do it)?|start|build it))?|do it|go(?:\s+ahead)?(?:\s+and)?(?:\s+do it)?|start)(?:\s+please)?[,!.?]*$/i
     .test(question.trim());
 }
 
 function pendingActionTurn(history = []) {
   const turn = history.at(-1);
-  return turn && !allowedWizardAction(turn.action) && answerPromisesAction(turn.answer) ? turn : undefined;
+  return turn && !allowedWizardAction(turn.action)
+    && (answerPromisesAction(turn.answer) || answerOffersAction(turn.answer)) ? turn : undefined;
 }
 
 const STRUCTURE_TYPES = [
@@ -311,14 +322,16 @@ function isProjectFeedback(question, history = []) {
     && !refersToProject;
   if (explicitNewBuild) return false;
   const directCorrectionVerb = /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+|please\s+)?(?:add|remove|replace|fix|repair|redo|rework|revise|change|modify|upgrade|expand|enlarge|finish|complete|continue|make\s+(?:it|this|that)|bigger|smaller|taller|wider)\b/i.test(text);
-  const concreteEditTarget = /\b(?:balcon(?:y|ies)|battlements?|chimneys?|colors?|colou?rs?|doors?|floors?|flags?|gardens?|goats?|grass|iron\s+golems?|lights?|lighting|moats?|parks?|rainbow|railings?|rooms?|roofs?|stairs?|towers?|turrets?|villagers?|walkways?|walls?|windows?|inside|outside|decorations?|furnishings?)\b/i.test(text)
-    || /\b(?:bigger|larger|smaller|taller|shorter|wider|narrower|deeper|fancier|prettier|cooler)\b/i.test(text)
+  const concreteEditTarget = /\b(?:balcon(?:y|ies)|battlements?|benches?|beds?|chests?|chimneys?|colors?|colou?rs?|couches?|doors?|flower\s+beds?|floors?|flags?|furniture|gardens?|goats?|grass|iron\s+golems?|lights?|lighting|moats?|parks?|playgrounds?|porches?|rainbow|railings?|rooms?|roofs?|school\s+signs?|stairs?|towers?|turrets?|villagers?|walkways?|walls?|windows?|inside|outside|decorations?|furnishings?)\b/i.test(text)
+    || /\b(?:bigger|larger|smaller|taller|shorter|wider|narrower|deeper|fancier|prettier|cooler|brighter|darker|ugly)\b/i.test(text)
     || Boolean(parseRequestedDimensions(text) || requestedMaterialBlock(text));
   const directCorrection = directCorrectionVerb && concreteEditTarget;
   const reversedCorrection = concreteEditTarget
     && /\b(?:wrong|off|not\s+right|fix|change|correct|repair)\b/i.test(text);
   const observedFailure = /^(?:the\s+)?(?:chickens?|sheep|animals?|items?|blocks?)\b.{0,100}\b(?:escape|escaped|escaping|leak|leaking|fell|falling|popping|broken|stuck)\b/i.test(text);
-  return corrective && (refersToProject || directCorrection || reversedCorrection || observedFailure);
+  const conciseConcreteEdit = concreteEditTarget && text.split(/\s+/).length <= 8 && !explicitNewBuild;
+  return (corrective && (refersToProject || directCorrection || reversedCorrection || observedFailure))
+    || conciseConcreteEdit;
 }
 
 function defaultGoal(question, action) {
@@ -330,7 +343,7 @@ function defaultGoal(question, action) {
   } else if (action?.type === "world_control") {
     successCriteria = "The live world time and weather match the player's request.";
   } else if (action?.type === "give_items") {
-    successCriteria = "The requested items arrive in the player's inventory or at their feet.";
+    successCriteria = `Every requested item, amount, name, and enchantment arrives with ${action.recipient || "the requesting player"}.`;
   } else if (action?.type === "show_recipe") {
     successCriteria = "A correct, readable in-world recipe display is present nearby.";
   } else if (action?.type === "execute_program") {
@@ -380,14 +393,18 @@ function requestsStructureEdit(question) {
   const giveEdit = /\bgive\s+(?:it|this|that|(?:the|my|our)\s+(?:build|structure|one|castle|fort|fortress|house|home|cabin|cottage|mansion|tower|lighthouse|bridge|barn|base|shop|store|market|school|wall|monument|treehouse|dragon|statue|maze))\s+\S+/i.test(question);
   const framedMakeOrGive = /(?:^|[.!?,]\s*)(?:(?:hey|wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+|please\s+)?(?:make|give)\b/i
     .test(question);
-  return framed || (framedMakeOrGive && (makeEdit || giveEdit));
+  const embeddedDetail = /\b(?:build|make|create|put|place)\b.{0,100}\b(?:benches?|beds?|chests?|couches?|decorations?|flower\s+beds?|furniture|furnishings?|playgrounds?|rooms?|school\s+signs?)\b.{0,50}\b(?:in|inside|for|to)\s+(?:my|the|our)\s+(?:build|structure|castle|house|mansion|school|tower|city|village)\b/i
+    .test(question);
+  return framed || embeddedDetail || (framedMakeOrGive && (makeEdit || giveEdit));
 }
 
 function isStructureModification(question, history = []) {
   const context = priorStructureContext(history);
   const projectFeedback = isProjectFeedback(question, history);
   if (!context || (!requestsStructureEdit(question) && !projectFeedback)) return false;
-  if (/\b(?:another|new|separate|next to it|beside it)\b/i.test(question)
+  if ((/\b(?:another|new|separate)\s+(?:build|structure|castle|house|mansion|school|tower|city|village)\b/i.test(question)
+    || /\b(?:build|make|create|construct)\b.{0,30}\b(?:another|new|separate)\b/i.test(question)
+    || /\b(?:next to it|beside it)\b/i.test(question))
     && /\b(?:build|make|create|construct)\b/i.test(question)) return false;
   const onlyAcknowledgementsSince = history.slice(context.index + 1)
     .every((turn) => isShortAcknowledgement(turn?.question));
@@ -1230,7 +1247,7 @@ function worldControlAction(question) {
 
 function explicitItemRequestClause(question) {
   return requestClauses(question).find((clause) => (
-    /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:give|bring|hand|drop)\s+(?:me|us)\b/i.test(clause)
+    /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:give|bring|hand|drop)\s+(?:me|us|[a-zA-Z0-9_-]{3,32})\b/i.test(clause)
       || /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:can|could|may)\s+(?:i|we)\s+(?:please\s+)?(?:have|get|receive)\b/i.test(clause)
   ));
 }
@@ -1315,6 +1332,43 @@ function giveItemsAction(question) {
     type: "give_items",
     version: 1,
     items: [{ itemId, amount: amount ?? 1 }],
+  });
+}
+
+const SIMPLE_PLACEABLE_BLOCKS = new Map([
+  ...LOCAL_GIFT_ITEMS,
+  ["crafting table", "minecraft:crafting_table"],
+  ["furnace", "minecraft:furnace"],
+]);
+
+function simpleBlockPlacementAction(question) {
+  const clause = requestClauses(question).find((candidate) => /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:place|put\s+down|set\s+down)\b/i.test(candidate));
+  if (!clause) return null;
+  const named = clause.match(/\b(?:place|put\s+down|set\s+down)\s+(?:an?|one|some)?\s*([a-z ]{2,40}?)(?:\s+(?:here|nearby|there|for me))?[.!?]*$/i)?.[1]
+    ?.trim().replace(/s$/, "");
+  const itemId = SIMPLE_PLACEABLE_BLOCKS.get(named);
+  if (!itemId || ["minecraft:arrow", "minecraft:bread"].includes(itemId)) return null;
+  const label = named.replace(/\b\w/g, (letter) => letter.toUpperCase());
+  return allowedWizardAction({
+    type: "execute_program",
+    version: 1,
+    program: {
+      title: `Place ${label}`,
+      site: "nearby",
+      steps: [{
+        id: "place_block",
+        capability: "player.place-blocks",
+        arguments: { blocks: [{
+          itemId, target: [0, 0, 0], support: [0, -1, 0], expectedType: itemId,
+        }] },
+        expect: `The ${named} is placed nearby.`,
+      }, {
+        id: "verify_block",
+        capability: "verify.blocks",
+        arguments: { blocks: [{ target: [0, 0, 0], typeId: itemId }] },
+        expect: `The ${named} remains in place.`,
+      }],
+    },
   });
 }
 
@@ -1470,7 +1524,8 @@ function groundedQuickAnswer(question, hits) {
 
 function unusableWizardAnswer(answer, question) {
   const text = String(answer || "").trim();
-  if (!/[a-z0-9]/i.test(text) || /^[{[]/.test(text) || /^(?:null|undefined|n\/a)$/i.test(text)) return true;
+  if (!/[a-z0-9]/i.test(text) || /^[{[]/.test(text) || /^(?:null|undefined|n\/a)$/i.test(text)
+    || /^(?:action|answer|goal)\s*:\s*(?:null|undefined)?\s*[,}\]]*$/i.test(text)) return true;
   if (/\b(?:my|our|the) (?:Bedrock )?(?:notes|sources|documentation|corpus)\b/i.test(answer)) return true;
   const ordinaryQuestion = !/\b(?:delete|destroy|irreversible|shared world|another player|ban|kick|kill)\b/i.test(question);
   return ordinaryQuestion && /\bask (?:an? )?adult\b/i.test(answer);
@@ -1508,6 +1563,13 @@ function normalizeActionRequest(question) {
     .replace(/\bnetherportal\b/gi, "nether portal");
 }
 
+function primaryBuildSubject(question) {
+  return question.match(/\b(?:build|construct|create|make)\s+(?:me\s+|us\s+)?(?:an?|the|some)?\s*([^,.!?]{1,100})/i)?.[1]
+    ?.split(/\b(?:next\s+to|beside|near|inside|in|at|for)\b/i, 1)[0]
+    .replace(/\b(?:with|using|made\s+of)\b.*$/i, "")
+    .trim();
+}
+
 export function classifyAction(question, history = []) {
   question = normalizeActionRequest(question);
   const refusesBuild = /\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
@@ -1526,12 +1588,14 @@ export function classifyAction(question, history = []) {
   if (portal) return portal;
   const pending = isActionConfirmation(question) ? pendingActionTurn(history) : undefined;
   if (pending) {
-    const pendingQuestion = `${pending.question || ""} ${pending.answer || ""}`.trim();
+    const pendingQuestion = offeredActionQuestion(pending);
     const resumed = classifyAction(pendingQuestion, history.filter((turn) => turn !== pending));
     if (resumed) return resumed;
   }
   const worldControl = worldControlAction(question);
   if (worldControl) return worldControl;
+  const placedBlock = simpleBlockPlacementAction(question);
+  if (placedBlock) return placedBlock;
   const giveItems = giveItemsAction(question);
   if (giveItems) return giveItems;
   const recipe = recipeAction(question);
@@ -1572,7 +1636,8 @@ export function classifyAction(question, history = []) {
   }
   const commonFarm = wantsBuild ? commonFarmAction(question) : null;
   if (commonFarm) return allowedWizardAction(commonFarm);
-  const knownStructure = STRUCTURE_TYPES.some(([, pattern]) => pattern.test(question));
+  const requestedSubject = primaryBuildSubject(question);
+  const knownStructure = STRUCTURE_TYPES.some(([, pattern]) => pattern.test(requestedSubject || question));
   const structureFollowup = isStructureModification(question, history);
   if (wantsBuild && (knownStructure || structureFollowup)) return structureAction(question, history);
   return null;
@@ -1596,7 +1661,7 @@ function isFunctionalBuildRequest(question, history = []) {
     && /\b(?:farm|machine|harvester|generator|elevator|engine|factory|smelter|sorter|door|contraption|circuit|clock|launcher|railway|station|system|device|trap|portal)\b/i.test(question);
 }
 
-const CUSTOM_STRUCTURE_DETAIL = /\b(?:armou?ry|ballroom|basement|courtyard|dungeon|garage|great hall|kitchen|library|pool|secret rooms?|swimming pool|throne rooms?)\b/i;
+const CUSTOM_STRUCTURE_DETAIL = /\b(?:armou?ry|ballroom|basement|benches?|beds?|chests?|couches?|courtyard|dungeon|flower\s+beds?|furniture|garage|great hall|kitchen|library|playgrounds?|pool|school\s+signs?|secret rooms?|swimming pool|throne rooms?)\b/i;
 
 function wantsModelAuthoredStructure(action, buildRequest, question) {
   return buildRequest && action?.type === "build_structure"
@@ -1670,7 +1735,8 @@ function localAnswer(question, hits, action) {
     const items = action.items.map(({ itemId, amount }) => (
       `${amount}x ${itemId.replace("minecraft:", "").replaceAll("_", " ")}`
     )).join(", ");
-    return `Item delivery! I’ll put ${items} straight into your inventory now.`;
+    const recipient = action.recipient && action.recipient !== "requester" ? ` to ${action.recipient}` : " to you";
+    return `Item delivery! I’ll carry ${items}${recipient} now.`;
   }
   if (action?.type === "show_recipe") {
     return `I’ll lay out the ${action.itemId.replace("minecraft:", "").replaceAll("_", " ")} recipe as a giant crafting grid nearby, with the real ingredients in the right squares.`;
@@ -2380,21 +2446,44 @@ function wizardEnvelope(text, question = "") {
   };
 }
 
+function bindProgramToActiveProject(action, projectFeedback) {
+  if (!projectFeedback || action?.type !== "execute_program") return action;
+  return allowedWizardAction({
+    ...action,
+    program: { ...action.program, site: "active_project" },
+  });
+}
+
+function capabilityProgramAdvancesRequest(action, question) {
+  const steps = action.program.steps;
+  const work = steps.reduce((total, { capability, arguments: args }) => {
+    if (capability === "player.place-blocks") return total + args.blocks.length;
+    if (capability === "player.break-blocks") return total + args.targets.length;
+    if (capability === "player.use-item") return total + 1;
+    if (capability === "script.spawn-entity") return total + args.count;
+    return total;
+  }, 0);
+  const commandBacked = steps.some(({ capability }) => capability === "world.command");
+  const largeProject = /\b(?:castle|city|house|mansion|playground|school|settlement|village)\b/i.test(question);
+  if (!commandBacked && work < (largeProject ? 8 : 2)) return false;
+  const subject = primaryBuildSubject(question);
+  if (!subject) return true;
+  const planWords = `${action.program.title} ${steps.map(({ expect }) => expect).join(" ")}`.toLowerCase();
+  const meaningfulWords = (subject.toLowerCase().match(/[a-z0-9]+/g) || [])
+    .filter((word) => word.length >= 4 && !/^(?:automated|automatic|complete|entire|large|small|whole|working)$/.test(word));
+  return meaningfulWords.length === 0 || meaningfulWords.some((word) => planWords.includes(word));
+}
+
 function actionCompletesBuildRequest(action, question, history = []) {
   if (!action) return false;
   if (isStagedBuildProgress(action)) return false;
   if (action.type === "execute_program") {
-    return action.program.steps.some(({ capability }) => (
-      capability === "player.place-blocks"
-      || capability === "player.break-blocks"
-      || capability === "player.use-item"
-      || capability === "world.command"
-    ));
+    return capabilityProgramAdvancesRequest(action, question);
   }
   if (isActionConfirmation(question)) {
     const pending = pendingActionTurn(history);
     if (pending) {
-      const pendingQuestion = `${pending.question || ""} ${pending.answer || ""}`.trim();
+      const pendingQuestion = offeredActionQuestion(pending);
       const resumed = classifyAction(pendingQuestion, history.filter((turn) => turn !== pending));
       if (resumed && JSON.stringify(action) === JSON.stringify(resumed)) return true;
     }
@@ -2545,16 +2634,19 @@ function providerGiftMatchesRequest(action, question) {
   if (deterministic) return JSON.stringify(action) === JSON.stringify(deterministic);
   const clause = explicitItemRequestClause(question);
   if (!clause) return false;
-  const requested = requestedGiftTerms(clause);
   const requestedAmount = requestedItemAmount(clause);
   if (requestedAmount === null) return false;
   const suppliedAmount = action.items.reduce((total, { amount }) => total + amount, 0);
   if (requestedAmount !== undefined && suppliedAmount !== requestedAmount) return false;
-  if (!requested.length) return true;
-  const supplied = new Set(action.items.flatMap(({ itemId }) => (
-    String(itemId).replace(/^minecraft:/, "").split("_").map(normalizedWord)
-  )));
-  return requested.every((word) => supplied.has(word));
+  if (action.recipient && action.recipient !== "requester"
+    && !question.toLowerCase().includes(action.recipient.toLowerCase())) return false;
+  if (!requestedGiftTerms(clause).length) return true;
+  if (!action.items.every(({ itemId }) => namedItemMatchesQuestion(itemId, clause))) return false;
+  if (/\b(?:enchanted|enchant(?:ed|ment)?\s+with)\b/i.test(clause)
+    && action.items.some(({ enchantments }) => !enchantments?.length)) return false;
+  const requestedName = clause.match(/\b(?:named|called)\s+["“]?([^"”.,!?]{1,80}?)(?:["”]|\s+with\b|[.,!?]|$)/i)?.[1].trim();
+  if (requestedName && action.items.some(({ nameTag }) => nameTag?.toLowerCase() !== requestedName.toLowerCase())) return false;
+  return true;
 }
 
 function requestedItemAmount(clause) {
@@ -2570,7 +2662,7 @@ function requestedItemAmount(clause) {
   const numeric = text.match(/(?:^|\s)([+-]?\d+)\b/);
   if (numeric) {
     const amount = Number(numeric[1]);
-    return Number.isInteger(amount) && amount >= 1 && amount <= 64 ? amount : null;
+    return Number.isInteger(amount) && amount >= 1 && amount <= 10_000 ? amount : null;
   }
   const match = text.match(/\b(?:me|us|have|get|receive)\s+(?:(?:a|an|some|the)\s+)?(sixty[- ]four|thirty[- ]two|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|thirty|forty|fifty|sixty)\b/i);
   if (!match) return undefined;
@@ -2582,11 +2674,12 @@ function repairProviderGift(action, question) {
   const clause = explicitItemRequestClause(question);
   if (action?.type !== "give_items" || action.items.length !== 1 || !clause) return action;
   const requestedAmount = requestedItemAmount(clause);
-  const [{ itemId, amount }] = action.items;
+  const [item] = action.items;
+  const { itemId, amount } = item;
   if (requestedAmount == null || amount === requestedAmount || !namedItemMatchesQuestion(itemId, clause)) return action;
   return allowedWizardAction({
     ...action,
-    items: [{ itemId, amount: requestedAmount }],
+    items: [{ ...item, amount: requestedAmount }],
   }) || action;
 }
 
@@ -3138,7 +3231,7 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const runtimeTokens = general ? tuning.generalMaxOutputTokens : tuning.wizardMaxOutputTokens;
   const configuredTokens = runtimeTokens || (general ? env.AI_GENERAL_MAX_OUTPUT_TOKENS : env.AI_MAX_OUTPUT_TOKENS);
   const planningRequest = buildRequest || reviewRequest;
-  const defaultTokens = general ? 1_200 : (planningRequest ? 1_200 : 260);
+  const defaultTokens = general ? 1_200 : (planningRequest ? 3_000 : 260);
   const tokenLimit = general || planningRequest ? 3_000 : 400;
   const maxOutputTokens = Math.min(Math.max(Number(configuredTokens) || defaultTokens, 64), tokenLimit);
   const addendum = general ? tuning.generalPromptAddendum : tuning.wizardPromptAddendum;
@@ -3249,14 +3342,15 @@ export function createWizard({
         return { ...result, message: "Thanks for the grade! I saved it with this request." };
       }
 
-      const requestsChange = /\b(?:but|however|please|should|need|want|fix|repair|redo|change|add|remove|replace|make|build|place|give|teleport|move|light|decorate|furnish|improve|bigger|smaller|shorter|longer|taller|wider|clearer|easier|wrong|broken|missing|not\s+enough|too\s+(?:dark|small|big|plain))\b/i
+      const feedbackHistory = sessions.get(player, "wizard");
+      const requestsChange = /\b(?:but|however|please|should|needs?|want|fix|repair|redo|change|add|remove|replace|make|build|place|give|teleport|move|light|decorate|furnish|improve|bigger|smaller|shorter|longer|taller|wider|brighter|darker|clearer|easier|ugly|wrong|broken|missing|not\s+enough|too\s+(?:dark|small|big|plain|short|tall))\b/i
         .test(note)
-        || Boolean(binding.goalId && /^(?:more\s+)?(?:windows?|doors?|rooms?|towers?|lights?|lighting|decorations?|furniture|stairs?|floors?|roofs?|walls?)[!.]*$/i.test(note));
+        || Boolean(binding.goalId && isProjectFeedback(note, feedbackHistory));
       if (grade >= 4 && !requestsChange) {
         return { ...result, message: "Thanks! I saved your grade and I’m glad that worked." };
       }
 
-      const correctiveAction = classifyAction(note, sessions.get(player, "wizard"));
+      const correctiveAction = classifyAction(note, feedbackHistory);
       const immediateCorrection = correctiveAction && !BUILD_ACTION_TYPES.has(correctiveAction.type);
       if (binding.goalId && immediateCorrection) {
         const followUp = await api.ask({
@@ -3513,8 +3607,9 @@ export function createWizard({
           }
           else {
             const carriedProviderCandidate = carryForwardStructurePrimitives(envelope.action, actionHistory, question);
-            const providerCandidate = repairProviderGift(carriedProviderCandidate, question);
-            const repairedProviderGift = providerCandidate !== carriedProviderCandidate;
+            const projectBoundProviderCandidate = bindProgramToActiveProject(carriedProviderCandidate, projectFeedback);
+            const providerCandidate = repairProviderGift(projectBoundProviderCandidate, question);
+            const repairedProviderGift = providerCandidate !== projectBoundProviderCandidate;
             const intentAllowed = providerActionMatchesRequest(providerCandidate, question, actionHistory, {
               buildRequest, projectFeedback, reviewRequest,
             });
@@ -3616,7 +3711,10 @@ export function createWizard({
             });
             const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
             if (repairedEnvelope && !unusableWizardAnswer(repairedEnvelope.answer, question)) {
-              const repairedAction = carryForwardStructurePrimitives(repairedEnvelope.action, actionHistory, question);
+              const repairedAction = bindProgramToActiveProject(
+                carryForwardStructurePrimitives(repairedEnvelope.action, actionHistory, question),
+                projectFeedback,
+              );
               if (providerActionMatchesRequest(repairedAction, question, actionHistory, { buildRequest: true })
                 && actionCompletesBuildRequest(repairedAction, question, actionHistory)) {
                 answer = repairedEnvelope.answer;

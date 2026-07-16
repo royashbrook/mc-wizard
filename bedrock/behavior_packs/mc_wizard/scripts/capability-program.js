@@ -42,10 +42,12 @@ function cleanJson(value, name, depth = 0) {
 
 export function validateCapabilityProgram(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("program must be an object");
-  if (Object.keys(value).some((key) => !["title", "steps"].includes(key))) {
+  if (Object.keys(value).some((key) => !["title", "site", "steps"].includes(key))) {
     throw new Error("program has an unsupported field");
   }
   const title = cleanText(value.title, "program.title", 80);
+  const site = value.site === undefined ? undefined : cleanText(value.site, "program.site", 32);
+  if (site && !["nearby", "active_project"].includes(site)) throw new Error("program.site is invalid");
   if (!Array.isArray(value.steps) || value.steps.length < 1 || value.steps.length > CAPABILITY_PROGRAM_LIMITS.steps) {
     throw new Error(`program.steps must contain 1-${CAPABILITY_PROGRAM_LIMITS.steps} steps`);
   }
@@ -70,7 +72,7 @@ export function validateCapabilityProgram(value) {
     const onFailure = step.onFailure === "continue" ? "continue" : "replan";
     return { id: step.id, capability: step.capability, arguments: args, expect, onFailure };
   });
-  const program = { title, steps };
+  const program = { title, ...(site && { site }), steps };
   if (JSON.stringify(program).length > CAPABILITY_PROGRAM_LIMITS.totalBytes) throw new Error("program is too large");
   return program;
 }
@@ -84,7 +86,8 @@ export function capabilityProgramRequiredAuthority(program) {
 }
 
 export function capabilityProgramPrompt() {
-  return `For a novel or multi-step in-world goal, use execute_program with program={"title":"short plan name","steps":[{"id":"unique_step","capability":"registered.capability","arguments":{},"expect":"observable result","onFailure":"replan"}]}. `
+  return `For a novel or multi-step in-world goal, use execute_program with program={"title":"short plan name","site":"nearby|active_project","steps":[{"id":"unique_step","capability":"registered.capability","arguments":{},"expect":"observable result","onFailure":"replan"}]}. `
     + `Programs may contain 1-${CAPABILITY_PROGRAM_LIMITS.steps} ordered steps. Capability arguments are bounded JSON. Use only capabilities from the runtime manifest. `
+    + `Use site="active_project" for every requested revision, decoration, addition, or repair so relative vectors modify the existing project instead of creating another one. `
     + `A failed expectation is an observation: research or revise the remaining program and keep pursuing the active goal instead of abandoning it.`;
 }

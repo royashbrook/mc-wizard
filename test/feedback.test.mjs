@@ -182,7 +182,10 @@ test("a high grade with praise closes cleanly instead of inventing corrective wo
 });
 
 test("a high grade still applies short concrete corrections to the active project", async () => {
-  for (const feedback of ["more windows", "taller", "not enough light", "windows"]) {
+  for (const feedback of [
+    "more windows", "taller", "not enough light", "windows", "too short", "needs windows",
+    "chimney", "needs a porch", "more color", "brighter", "darker", "ugly",
+  ]) {
     const player = `CorrectionKid-${feedback}`;
     const sessions = createMemorySessionStore();
     const wizard = createWizard({ corpus, sessions, env: {}, logger: quiet });

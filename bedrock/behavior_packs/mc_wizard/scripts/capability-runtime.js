@@ -17,15 +17,21 @@ export const RUNTIME_CAPABILITIES = Object.freeze([
 const CAPABILITIES = new Set(RUNTIME_CAPABILITIES);
 const ITEM_ID = /^minecraft:[a-z0-9_]+$/;
 const EFFECT_ID = /^(?:minecraft:)?[a-z0-9_]+$/;
-const FORBIDDEN_COMMAND_ROOTS = new Set([
-  "allowlist", "ban", "ban-ip", "banlist", "changesetting", "deop", "kick", "op",
-  "pardon", "pardon-ip", "permissions", "reload", "reloadconfig",
-  "reloadpacketlimitconfig", "save", "script", "sendshowstoreoffer", "setmaxplayers",
-  "stop", "whitelist", "execute", "kill",
-]);
-const REQUESTER_TARGET_COMMANDS = new Set([
-  "ability", "clear", "effect", "enchant", "gamemode", "give", "inputpermission",
-  "permission", "playanimation", "recipe", "replaceitem", "spawnpoint", "teleport", "tp", "xp",
+const REQUESTER_SELECTOR = "@s(?:\\[[^\\]\\r\\n]{1,120}\\])?";
+const REQUESTER_COMMAND_PATTERNS = [
+  new RegExp(`^ability\\s+${REQUESTER_SELECTOR}\\s+\\S+(?:\\s+\\S+)?$`, "i"),
+  new RegExp(`^clear\\s+${REQUESTER_SELECTOR}(?:\\s+\\S+){0,3}$`, "i"),
+  new RegExp(`^effect\\s+${REQUESTER_SELECTOR}\\s+(?:clear|[a-z0-9_]+(?:\\s+\\d+){0,2}(?:\\s+(?:true|false))?)$`, "i"),
+  new RegExp(`^enchant\\s+${REQUESTER_SELECTOR}\\s+[a-z0-9_]+(?:\\s+\\d+)?$`, "i"),
+  new RegExp(`^gamemode\\s+\\S+\\s+${REQUESTER_SELECTOR}$`, "i"),
+  new RegExp(`^give\\s+${REQUESTER_SELECTOR}\\s+[a-z0-9_:]+(?:\\s+\\d+){0,2}$`, "i"),
+  new RegExp(`^(?:teleport|tp)\\s+${REQUESTER_SELECTOR}\\s+(?:-?~?\\d+(?:\\.\\d+)?\\s+){2}-?~?\\d+(?:\\.\\d+)?(?:\\s+(?:true|false))?$`, "i"),
+  new RegExp(`^spawnpoint\\s+${REQUESTER_SELECTOR}(?:\\s+-?~?\\d+(?:\\.\\d+)?){0,3}$`, "i"),
+  new RegExp(`^xp\\s+[-+]?\\d+[lL]?\\s+${REQUESTER_SELECTOR}$`, "i"),
+];
+const FORBIDDEN_SPAWN_ENTITIES = new Set([
+  "minecraft:ender_crystal", "minecraft:ender_dragon", "minecraft:lightning_bolt",
+  "minecraft:tnt", "minecraft:wither", "minecraft:wither_skull",
 ]);
 
 function exactKeys(value, allowed, name) {
@@ -70,14 +76,12 @@ function vectorList(value, name) {
   return vectors;
 }
 
-function requesterCommand(value, name) {
+export function normalizeRequesterCommand(value, name = "command") {
   const command = text(value, name, 240);
   if (command.startsWith("/") || /[\r\n\0]/.test(value)) throw new Error(`${name} is not one safe command`);
-  const root = command.split(/\s+/, 1)[0].toLowerCase();
-  if (FORBIDDEN_COMMAND_ROOTS.has(root)) throw new Error(`${name} requires server authority`);
   if (/@(?:a|e|p|r)(?:\b|\[)/i.test(command)) throw new Error(`${name} contains a broad player selector`);
-  if (REQUESTER_TARGET_COMMANDS.has(root) && !/(?:^|\s)@s(?:\b|\[)/i.test(command)) {
-    throw new Error(`${name} must target only the requesting player with @s`);
+  if (!REQUESTER_COMMAND_PATTERNS.some((pattern) => pattern.test(command))) {
+    throw new Error(`${name} is not an allowed requester-only command`);
   }
   return command;
 }
@@ -165,7 +169,7 @@ function normalizeArguments(capability, value) {
     if (!Array.isArray(value.commands) || value.commands.length < 1 || value.commands.length > 16) {
       throw new Error(`${name}.commands must contain 1-16 commands`);
     }
-    return { commands: value.commands.map((entry, index) => requesterCommand(entry, `${name}.commands[${index}]`)) };
+    return { commands: value.commands.map((entry, index) => normalizeRequesterCommand(entry, `${name}.commands[${index}]`)) };
   }
   if (capability === "artifact.book") {
     exactKeys(value, ["title", "text", "author"], name);
@@ -187,17 +191,20 @@ function normalizeArguments(capability, value) {
     return { blocks: value.blocks.map((entry, index) => blockExpectation(entry, `${name}.blocks[${index}]`)) };
   }
   if (capability === "verify.entities") {
-    exactKeys(value, ["typeId", "minimum", "maxDistance"], name);
+    exactKeys(value, ["typeId", "location", "minimum", "maxDistance"], name);
     return {
       typeId: itemId(value.typeId, `${name}.typeId`),
+      location: vector(value.location, `${name}.location`),
       minimum: integer(value.minimum, `${name}.minimum`, 0, 64),
       maxDistance: integer(value.maxDistance, `${name}.maxDistance`, 1, 64),
     };
   }
   if (capability === "script.spawn-entity") {
     exactKeys(value, ["typeId", "location", "count", "nameTag"], name);
+    const typeId = itemId(value.typeId, `${name}.typeId`);
+    if (FORBIDDEN_SPAWN_ENTITIES.has(typeId)) throw new Error(`${name}.typeId requires elevated authority`);
     return {
-      typeId: itemId(value.typeId, `${name}.typeId`),
+      typeId,
       location: vector(value.location, `${name}.location`),
       count: value.count === undefined ? 1 : integer(value.count, `${name}.count`, 1, 32),
       ...(value.nameTag && { nameTag: text(value.nameTag, `${name}.nameTag`, 64) }),
@@ -247,11 +254,12 @@ export function runtimeProgramHasEvidence(steps) {
   const entityChecks = steps.filter(({ capability }) => capability === "verify.entities");
   if (spawned.some(({ arguments: spawn }) => !entityChecks.some(({ arguments: check }) => (
     check.typeId === spawn.typeId && check.minimum >= spawn.count
+      && check.location.join(",") === spawn.location.join(",")
   )))) return false;
   const mutatesWorld = steps.some(({ capability }) => /^(?:artifact\.|player\.(?:break|place|use)|script\.|world\.)/.test(capability));
   const hasExplicitVerifier = steps.some(({ capability }) => capability.startsWith("verify."));
   const selfCheckingMutation = steps.some(({ capability }) => [
-    "artifact.book", "player.use-item", "script.effect", "script.teleport", "world.command",
+    "artifact.book", "player.use-item", "script.effect", "script.teleport",
   ].includes(capability));
   return mutatesWorld && (hasExplicitVerifier || selfCheckingMutation);
 }
@@ -268,6 +276,6 @@ export function capabilityRuntimePrompt() {
     + `- script.effect arguments={"subject":"requester|wizard","effectId":"night_vision","duration":1200,"amplifier":0,"showParticles":false}\n`
     + `- artifact.book arguments={"title":"short title","text":"complete book text","author":"MC Wizard"}\n`
     + `- observe.snapshot arguments={}\n- verify.blocks arguments={"blocks":[{"target":[x,y,z],"typeId":"minecraft:stone"}]}\n`
-    + `- verify.entities arguments={"typeId":"minecraft:horse","minimum":1,"maxDistance":32}\n`
+    + `- verify.entities arguments={"typeId":"minecraft:horse","location":[2,0,1],"minimum":1,"maxDistance":4}\n`
     + `- control.wait arguments={"ticks":20}`;
 }

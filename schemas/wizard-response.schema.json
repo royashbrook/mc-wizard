@@ -280,6 +280,7 @@
           "properties": {
             "type": { "type": "string", "const": "give_items" },
             "version": { "type": "integer", "const": 1 },
+            "recipient": { "type": "string", "minLength": 1, "maxLength": 32, "pattern": "^[a-zA-Z0-9 _-]+$" },
             "items": {
               "type": "array",
               "minItems": 1,
@@ -290,7 +291,22 @@
                 "required": ["itemId", "amount"],
                 "properties": {
                   "itemId": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
-                  "amount": { "type": "integer", "minimum": 1, "maximum": 64 }
+                  "amount": { "type": "integer", "minimum": 1, "maximum": 10000 },
+                  "nameTag": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "\\S" },
+                  "enchantments": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "items": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "required": ["id", "level"],
+                      "properties": {
+                        "id": { "type": "string", "pattern": "^minecraft:[a-z0-9_]+$" },
+                        "level": { "type": "integer", "minimum": 1, "maximum": 255 }
+                      }
+                    }
+                  }
                 }
               }
             }
@@ -309,6 +325,7 @@
               "required": ["title", "steps"],
               "properties": {
                 "title": { "type": "string", "minLength": 1, "maxLength": 80, "pattern": "\\S" },
+                "site": { "type": "string", "enum": ["nearby", "active_project"] },
                 "steps": {
                   "type": "array",
                   "minItems": 1,

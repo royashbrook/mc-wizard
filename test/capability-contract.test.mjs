@@ -44,6 +44,7 @@ test("capability programs compose novel actions without extending the response u
   assert.equal(allowedWizardAction({ type: "execute_program", version: 1, program }), null);
   const executable = {
     title: "Cake step",
+    site: "active_project",
     steps: [{
       id: "build_step",
       capability: "player.place-blocks",
@@ -130,8 +131,27 @@ test("requester-scoped Bedrock commands are executable but admin and broad selec
   assert.equal(allowedWizardAction({ ...action, commands: ["op @s"] }), null);
   assert.equal(allowedWizardAction({ ...action, commands: ["execute as @s run op @s"] }), null);
   assert.equal(allowedWizardAction({ ...action, commands: ["kill OtherKid"] }), null);
+  assert.equal(allowedWizardAction({ ...action, commands: ["tp OtherKid @s"] }), null);
+  assert.equal(allowedWizardAction({ ...action, commands: ["damage OtherKid 100"] }), null);
+  assert.equal(allowedWizardAction({ ...action, commands: ["fill ~ ~ ~ ~10 ~10 ~10 air"] }), null);
   assert.equal(allowedWizardAction({ ...action, commands: ["/effect @s night_vision 60"] }), null);
   assert.match(wizardSkillPrompt(), /use @s for the requesting child/i);
+});
+
+test("rich item delivery supports exact connected recipients, names, enchantments, and large amounts", () => {
+  const action = {
+    type: "give_items", version: 1, recipient: "enti1ty303",
+    items: [{
+      itemId: "minecraft:diamond_sword", amount: 256, nameTag: "Star Cutter",
+      enchantments: [{ id: "minecraft:sharpness", level: 5 }],
+    }],
+  };
+  assert.deepEqual(allowedWizardAction(action), action);
+  assert.equal(allowedWizardAction({ ...action, recipient: "@a" }), null);
+  assert.equal(allowedWizardAction({ ...action, items: [{ ...action.items[0], amount: 10_001 }] }), null);
+  assert.equal(allowedWizardAction({
+    ...action, items: [{ ...action.items[0], enchantments: [{ id: "sharpness", level: 5 }] }],
+  }), null);
 });
 
 test("common effects become commands while area lighting defaults to player-placed torches", () => {
@@ -168,9 +188,14 @@ test("JSON response schema exposes goal, travel, and command contracts", async (
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "place_area_torches"));
   const program = actions.find((entry) => entry.properties?.type?.const === "execute_program");
   assert.equal(program.properties.program.properties.steps.maxItems, 48);
+  assert.deepEqual(program.properties.program.properties.site.enum, ["nearby", "active_project"]);
   assert.equal(program.properties.program.properties.steps.items.properties.arguments.type, "object");
   assert.equal(program.properties.program.properties.steps.items.properties.arguments.maxProperties, 64);
   assert.equal(program.properties.program.properties.title.pattern, "\\S");
+  const gift = actions.find((entry) => entry.properties?.type?.const === "give_items");
+  assert.equal(gift.properties.items.items.properties.amount.maximum, 10000);
+  assert.ok(gift.properties.items.items.properties.nameTag);
+  assert.ok(gift.properties.items.items.properties.enchantments);
 });
 
 test("capability prompt distinguishes projects and revisions", () => {
@@ -181,4 +206,5 @@ test("capability prompt distinguishes projects and revisions", () => {
   assert.match(prompt, /status="complete" only after the live-world observation proves/i);
   assert.match(prompt, /novel or multi-step in-world goal, use execute_program/i);
   assert.match(prompt, /failed expectation is an observation/i);
+  assert.match(prompt, /site="active_project" for every requested revision/i);
 });
