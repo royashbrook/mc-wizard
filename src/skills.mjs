@@ -16,6 +16,26 @@ import {
 
 const RECIPE_ITEM_IDS = new Set(recipeItemIds());
 
+export const LOCATABLE_STRUCTURES = Object.freeze({
+  ancient_city: { label: "ancient city", dimensions: ["overworld"] },
+  bastion_remnant: { label: "bastion remnant", dimensions: ["nether"] },
+  buried_treasure: { label: "buried treasure", dimensions: ["overworld"] },
+  end_city: { label: "End city", dimensions: ["the_end"] },
+  fortress: { label: "Nether fortress", dimensions: ["nether"] },
+  mansion: { label: "woodland mansion", dimensions: ["overworld"] },
+  mineshaft: { label: "mineshaft", dimensions: ["overworld"] },
+  monument: { label: "ocean monument", dimensions: ["overworld"] },
+  pillager_outpost: { label: "pillager outpost", dimensions: ["overworld"] },
+  ruined_portal: { label: "ruined portal", dimensions: ["overworld", "nether"] },
+  ruins: { label: "ocean ruins", dimensions: ["overworld"] },
+  shipwreck: { label: "shipwreck", dimensions: ["overworld"] },
+  stronghold: { label: "stronghold", dimensions: ["overworld"] },
+  temple: { label: "temple", dimensions: ["overworld"] },
+  trail_ruins: { label: "trail ruins", dimensions: ["overworld"] },
+  trial_chambers: { label: "trial chambers", dimensions: ["overworld"] },
+  village: { label: "village", dimensions: ["overworld"] },
+});
+
 export const WIZARD_SKILLS = [
   {
     name: "build_t_flip_flop",
@@ -69,7 +89,7 @@ export const WIZARD_SKILLS = [
   },
   {
     name: "travel_to_local_destination",
-    description: "Immediately move the requesting player and MC Wizard to a safe Overworld destination. Use destination=surface for requests to escape underground or reach the Overworld surface, and destination=nearest_village for requests to find or teleport to the nearest generated village. Do not substitute a command or explanation.",
+    description: `Immediately move the requesting player and MC Wizard to a safe destination. Use destination=surface to escape underground; use destination=nearest_village for a village; use destination=nearest_structure with a Bedrock structure, label, and dimension for any other generated structure. Supported structure identifiers: ${Object.keys(LOCATABLE_STRUCTURES).join(", ")}. Do not substitute a command or explanation.`,
     action: { type: "local_travel", version: 1, destination: "surface" },
   },
   {
@@ -189,8 +209,18 @@ export function allowedWizardAction(value) {
       ? { type: "dimension_travel", version: 1, destination: value.destination } : null;
   }
   if (value?.type === "local_travel") {
-    return value.version === 1 && ["surface", "nearest_village"].includes(value.destination)
-      ? { type: "local_travel", version: 1, destination: value.destination } : null;
+    if (value.version !== 1) return null;
+    if (["surface", "nearest_village"].includes(value.destination)) {
+      return { type: "local_travel", version: 1, destination: value.destination };
+    }
+    const structure = String(value.structure || "").replace(/^minecraft:/, "");
+    const metadata = LOCATABLE_STRUCTURES[structure];
+    const dimension = value.dimension || metadata?.dimensions[0];
+    if (value.destination !== "nearest_structure" || !metadata || !metadata.dimensions.includes(dimension)) return null;
+    return {
+      type: "local_travel", version: 1, destination: "nearest_structure",
+      structure, dimension, label: metadata.label,
+    };
   }
   if (value?.type === "potion_rain" && value.version === 1) {
     const radius = Math.min(12, Math.max(3, Math.floor(Number(value.radius) || 8)));

@@ -122,6 +122,28 @@ const TRAVEL_DIMENSIONS = Object.freeze({
   nether: { id: "minecraft:nether", name: "nether", label: "Nether" },
   the_end: { id: "minecraft:the_end", name: "the_end", label: "End" },
 });
+const LOCATABLE_STRUCTURES = Object.freeze({
+  ancient_city: { label: "ancient city", dimension: "overworld" },
+  bastion_remnant: { label: "bastion remnant", dimension: "nether" },
+  buried_treasure: { label: "buried treasure", dimension: "overworld" },
+  end_city: { label: "End city", dimension: "the_end" },
+  fortress: { label: "Nether fortress", dimension: "nether" },
+  mansion: { label: "woodland mansion", dimension: "overworld" },
+  mineshaft: { label: "mineshaft", dimension: "overworld" },
+  monument: { label: "ocean monument", dimension: "overworld" },
+  pillager_outpost: { label: "pillager outpost", dimension: "overworld" },
+  ruined_portal: { label: "ruined portal", dimension: "overworld" },
+  ruins: { label: "ocean ruins", dimension: "overworld" },
+  shipwreck: { label: "shipwreck", dimension: "overworld" },
+  stronghold: { label: "stronghold", dimension: "overworld" },
+  temple: { label: "temple", dimension: "overworld" },
+  trail_ruins: { label: "trail ruins", dimension: "overworld" },
+  trial_chambers: { label: "trial chambers", dimension: "overworld" },
+  village: { label: "village", dimension: "overworld" },
+});
+const UNDERGROUND_LOCATABLE_STRUCTURES = new Set([
+  "ancient_city", "mineshaft", "stronghold", "trail_ruins", "trial_chambers",
+]);
 const TRAVEL_GROUND_HAZARDS = new Set([
   "minecraft:campfire",
   "minecraft:cactus",
@@ -4962,13 +4984,14 @@ async function waitForTravelChunk(dimension, anchor) {
   return false;
 }
 
-async function requestVillageLocation(player, anchor) {
+async function requestStructureLocation(player, anchor, structure, dimension) {
   const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/locate"))
     .setMethod(HttpRequestMethod.Post)
     .setBody(JSON.stringify({
       player: player.name,
       origin: { x: anchor.x, z: anchor.z },
-      structure: "village",
+      structure,
+      dimension,
     }))
     .addHeader("Content-Type", "application/json");
   if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
@@ -4976,7 +4999,7 @@ async function requestVillageLocation(player, anchor) {
   let result = {};
   try { result = JSON.parse(response.body || "{}"); } catch {}
   if (response.status < 200 || response.status >= 300) {
-    const error = new Error(result.error || `village locator returned HTTP ${response.status}`);
+    const error = new Error(result.error || `${structure} locator returned HTTP ${response.status}`);
     if (response.status === 404 && result.code === "not_found") error.code = "STRUCTURE_NOT_FOUND";
     throw error;
   }
@@ -4984,40 +5007,68 @@ async function requestVillageLocation(player, anchor) {
   const z = Number(result.location?.z);
   if (!Number.isInteger(x) || !Number.isInteger(z)
     || Math.abs(x) > 30_000_000 || Math.abs(z) > 30_000_000) {
-    throw new Error("village locator returned invalid coordinates");
+    throw new Error(`${structure} locator returned invalid coordinates`);
   }
   return { x, z };
 }
 
-async function locateVillageForPlayer(player, anchor) {
+async function locateStructureForPlayer(player, anchor, structure, dimension) {
   let lastError;
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      return await requestVillageLocation(player, anchor);
+      return await requestStructureLocation(player, anchor, structure, dimension);
     } catch (error) {
       if (error.code === "STRUCTURE_NOT_FOUND") throw error;
       lastError = error;
       if (attempt === 0) await system.waitTicks(10);
     }
   }
-  throw lastError || new Error("village locator was unavailable");
+  throw lastError || new Error(`${structure} locator was unavailable`);
+}
+
+function localTravelStructure(action) {
+  if (action.destination === "nearest_village") {
+    return { id: "village", ...LOCATABLE_STRUCTURES.village };
+  }
+  if (action.destination !== "nearest_structure") return undefined;
+  const id = String(action.structure || "").replace(/^minecraft:/, "");
+  const metadata = LOCATABLE_STRUCTURES[id];
+  const dimension = String(action.dimension || metadata?.dimension || "");
+  if (!metadata || (dimension !== metadata.dimension && !(id === "ruined_portal" && dimension === "nether"))) {
+    return undefined;
+  }
+  return { id, ...metadata, dimension };
+}
+
+function localTravelOrigin(player, target) {
+  if (player.dimension.id === target.id) {
+    return { x: Math.floor(player.location.x), y: 80, z: Math.floor(player.location.z) };
+  }
+  if (target.name === "overworld" && player.dimension.id === "minecraft:nether") {
+    return { x: Math.floor(player.location.x * 8), y: 80, z: Math.floor(player.location.z * 8) };
+  }
+  if (target.name === "nether" && player.dimension.id === "minecraft:overworld") {
+    return { x: Math.floor(player.location.x / 8), y: 80, z: Math.floor(player.location.z / 8) };
+  }
+  if (target.name === "overworld") {
+    const spawn = world.getDefaultSpawnLocation();
+    return { x: Math.floor(spawn.x), y: 80, z: Math.floor(spawn.z) };
+  }
+  return target.name === "the_end" ? { x: 100, y: 80, z: 0 } : { x: 0, y: 80, z: 0 };
 }
 
 async function localTravelAnchor(player, action) {
-  let anchor;
-  if (player.dimension.id === "minecraft:nether") {
-    anchor = { x: Math.floor(player.location.x * 8), y: 80, z: Math.floor(player.location.z * 8) };
-  } else if (player.dimension.id === "minecraft:overworld") {
-    anchor = { x: Math.floor(player.location.x), y: 80, z: Math.floor(player.location.z) };
-  } else {
-    const spawn = world.getDefaultSpawnLocation();
-    anchor = { x: Math.floor(spawn.x), y: 80, z: Math.floor(spawn.z) };
-  }
-  if (action.destination !== "nearest_village") return anchor;
-  return { ...await locateVillageForPlayer(player, anchor), y: 80 };
+  const structure = localTravelStructure(action);
+  const target = structure ? TRAVEL_DIMENSIONS[structure.dimension] : TRAVEL_DIMENSIONS.overworld;
+  const anchor = localTravelOrigin(player, target);
+  if (!structure) return anchor;
+  return {
+    ...await locateStructureForPlayer(player, anchor, structure.id, target.name),
+    y: 80,
+  };
 }
 
-function generatedVillageAtLocate(dimension, location) {
+function generatedStructureAtLocate(dimension, location, structure) {
   if (typeof dimension.getGeneratedStructures !== "function") return true;
   const x = Math.floor(location.x);
   const z = Math.floor(location.z);
@@ -5028,7 +5079,7 @@ function generatedVillageAtLocate(dimension, location) {
   const { minFeet } = travelHeightRange(dimension);
   for (let y = topY + 8; y >= Math.max(minFeet, topY - 24); y -= 1) {
     try {
-      if (dimension.getGeneratedStructures({ x, y, z }).some((type) => /village/i.test(String(type)))) {
+      if (dimension.getGeneratedStructures({ x, y, z }).some((type) => String(type).includes(structure))) {
         return true;
       }
     } catch {}
@@ -5036,8 +5087,30 @@ function generatedVillageAtLocate(dimension, location) {
   return false;
 }
 
+async function findGeneratedStructureTravelSite(dimension, anchor, offsets, structure) {
+  if (typeof dimension.getGeneratedStructures !== "function") return undefined;
+  const { minFeet, maxFeet } = travelHeightRange(dimension);
+  let checks = 0;
+  for (const center of surfaceSearchCenters(anchor)) {
+    for (let y = maxFeet; y >= minFeet; y -= 2) {
+      try {
+        const inside = dimension.getGeneratedStructures({ x: center.x, y, z: center.z })
+          .some((type) => String(type).includes(structure));
+        if (inside) {
+          const site = findTravelSite(dimension, { x: center.x, y, z: center.z }, offsets);
+          if (site) return site;
+        }
+      } catch {}
+      checks += 1;
+      if (checks % 128 === 0) await system.waitTicks(1);
+    }
+  }
+  return undefined;
+}
+
 async function applyLocalTravel(player, action, capturedPartyIds = nearbyTravelParty(player).map(({ id }) => id)) {
-  if (!["surface", "nearest_village"].includes(action.destination)) {
+  const structure = localTravelStructure(action);
+  if (action.destination !== "surface" && !structure) {
     const report = beginImmediateAction(player);
     endImmediateAction(report, "failed", "local destination was not supported");
     return;
@@ -5063,15 +5136,19 @@ async function applyLocalTravel(player, action, capturedPartyIds = nearbyTravelP
   }
   const report = beginImmediateAction(player);
   const playersById = new Map(humanPlayers().map((member) => [member.id, member]));
-  const party = capturedPartyIds.map((id) => playersById.get(id)).filter((member) => (
-    member && (member.id === player.id || !needsTeleportConsent(member))
-  ));
-  if (!party.some((member) => member.id === player.id)) {
-    endImmediateAction(report, "failed", "requesting player left before local travel began");
+  const capturedParty = capturedPartyIds.map((id) => playersById.get(id)).filter(Boolean);
+  if (capturedParty.length !== capturedPartyIds.length) {
+    speak(player, "One traveler left before the spell began, so I kept everyone else together here instead of splitting the party.");
+    endImmediateAction(report, "failed", "a captured party member left before local travel began");
     return;
   }
+  const party = capturedParty.filter((member) => member.id === player.id || !needsTeleportConsent(member));
+  if (party.length < capturedParty.length) {
+    speak(player, "One traveler is staying behind, so I kept the rest of the trip together.");
+  }
   const reservation = beginBuildPreparation();
-  const targetDimension = world.getDimension("overworld");
+  const target = structure ? TRAVEL_DIMENSIONS[structure.dimension] : TRAVEL_DIMENSIONS.overworld;
+  const targetDimension = world.getDimension(target.name);
   const travelers = [...party, bot];
   const sources = travelers.map((entity) => ({
     entity,
@@ -5097,15 +5174,15 @@ async function applyLocalTravel(player, action, capturedPartyIds = nearbyTravelP
   const offsets = travelPartyOffsets(travelers.length);
   const tickingArea = allocateTravelTickingArea();
   let anchor;
-  let villageFallback;
+  let structureFallback;
   try {
     try {
       anchor = await localTravelAnchor(player, action);
     } catch (error) {
-      if (action.destination !== "nearest_village") throw error;
-      villageFallback = error.code === "STRUCTURE_NOT_FOUND" ? "not_found" : "locator_unavailable";
-      console.warn(`[MC Wizard] village locator fallback: ${error}`);
-      anchor = await localTravelAnchor(player, { ...action, destination: "surface" });
+      if (!structure) throw error;
+      structureFallback = error.code === "STRUCTURE_NOT_FOUND" ? "not_found" : "locator_unavailable";
+      console.warn(`[MC Wizard] ${structure.id} locator fallback: ${error}`);
+      anchor = localTravelOrigin(player, target);
     }
     try {
       targetDimension.runCommand(`tickingarea remove ${tickingArea}`);
@@ -5114,14 +5191,23 @@ async function applyLocalTravel(player, action, capturedPartyIds = nearbyTravelP
     if (!await waitForTravelChunk(targetDimension, anchor)) {
       throw new Error(`destination chunk at ${anchor.x},${anchor.z} did not become loaded and ticking`);
     }
-    if (action.destination === "nearest_village" && !villageFallback
-      && !generatedVillageAtLocate(targetDimension, anchor)) {
-      console.warn(`[MC Wizard] located village was not observable at authoritative coordinate ${anchor.x},${anchor.z}`);
+    if (structure && !structureFallback
+      && !generatedStructureAtLocate(targetDimension, anchor, structure.id)) {
+      console.warn(`[MC Wizard] located ${structure.id} was not observable at authoritative coordinate ${anchor.x},${anchor.z}`);
     }
-    const site = findSurfaceTravelSite(targetDimension, anchor, offsets)
-      || prepareTravelPad(targetDimension, surfaceFallbackAnchor(targetDimension, anchor), offsets);
+    const needsUndergroundArrival = Boolean(structure && !structureFallback
+      && UNDERGROUND_LOCATABLE_STRUCTURES.has(structure.id));
+    const undergroundSite = needsUndergroundArrival
+      ? await findGeneratedStructureTravelSite(targetDimension, anchor, offsets, structure.id)
+      : undefined;
+    const aboveStructure = needsUndergroundArrival && !undergroundSite;
+    const site = undergroundSite || (target.name === "overworld"
+      ? (findSurfaceTravelSite(targetDimension, anchor, offsets)
+        || prepareTravelPad(targetDimension, surfaceFallbackAnchor(targetDimension, anchor), offsets))
+      : (findTravelSite(targetDimension, anchor, offsets)
+        || prepareTravelPad(targetDimension, anchor, offsets)));
     const arrived = () => travelers.every((member, index) => (
-      entityReachedDimension(member, "minecraft:overworld")
+      entityReachedDimension(member, target.id)
       && distanceSquared(member.location, {
         x: site.x + offsets[index].x + 0.5,
         y: site.y,
@@ -5149,19 +5235,23 @@ async function applyLocalTravel(player, action, capturedPartyIds = nearbyTravelP
       const restored = await restoreAll();
       throw new Error(`not every traveler reached the selected surface site; rollback=${restored}`);
     }
-    speak(player, villageFallback === "not_found"
-      ? "This world has no generated village in the locator’s range, so I brought us safely to the surface instead. I can build a new village here if you’d like."
-      : villageFallback === "locator_unavailable"
-      ? "My village map is fuzzy right now, so I brought us safely to the surface instead of leaving you stuck. Ask me for the village again and I’ll retry."
-      : action.destination === "nearest_village"
-      ? "Village found! We’re safely on the surface beside it, and I came with you."
+    speak(player, structureFallback === "not_found"
+      ? `I searched for the nearest ${structure.label}, but this world reported none in range. I brought us safely to the ${target.label} instead, so I can try another approach from here.`
+      : structureFallback === "locator_unavailable"
+      ? `My ${structure.label} compass is fuzzy right now, so I brought us safely to the ${target.label} instead of leaving you stuck. Ask me again and I’ll retry.`
+      : aboveStructure
+      ? `I found the nearest ${structure.label} below us. Its inside had no safe landing room, so I brought us to safe ground directly above it.`
+      : structure
+      ? `${structure.label[0].toUpperCase()}${structure.label.slice(1)} found! We’re safely beside it, and I came with you.`
       : "There we are—safe, above ground, and under the open sky.");
-    endImmediateAction(report, "completed", villageFallback === "not_found"
-      ? `confirmed no generated village was locatable and surfaced ${travelers.length} travelers instead`
-      : villageFallback === "locator_unavailable"
-      ? `village locator remained unavailable after a bounded retry; surfaced ${travelers.length} travelers instead`
-      : action.destination === "nearest_village"
-      ? `located a village and observed ${travelers.length} travelers at its surface`
+    endImmediateAction(report, structureFallback ? "partial" : "completed", structureFallback === "not_found"
+      ? `confirmed no generated ${structure.id} was locatable and moved ${travelers.length} travelers safely to ${target.id}`
+      : structureFallback === "locator_unavailable"
+      ? `${structure.id} locator remained unavailable after a bounded retry; moved ${travelers.length} travelers safely to ${target.id}`
+      : aboveStructure
+      ? `located ${structure.id} and moved ${travelers.length} travelers safely above its authoritative coordinates`
+      : structure
+      ? `located ${structure.id} and observed ${travelers.length} travelers together in ${target.id}`
       : `observed ${travelers.length} travelers safely on the Overworld surface`);
   } catch (error) {
     console.warn(`[MC Wizard] local travel failed: ${error}`);

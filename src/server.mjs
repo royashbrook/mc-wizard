@@ -12,6 +12,7 @@ import { createFileSessionStore } from "./sessions.mjs";
 import { createFileLearnedRecipeStore } from "./learned-recipes.mjs";
 import { createFilePlayerPreferenceStore } from "./player-preferences.mjs";
 import { createWizard } from "./wizard.mjs";
+import { LOCATABLE_STRUCTURES } from "./skills.mjs";
 import { readRuntimeSettings } from "./runtime-settings.mjs";
 import { createServerControl } from "./server-control.mjs";
 import { normalizeRuntimeStep } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
@@ -56,8 +57,14 @@ export function validateLocateBody(body) {
   const origin = worldVector({ x: body?.origin?.x, y: 80, z: body?.origin?.z });
   if (!player || player.length > 32) throw Object.assign(new Error("player must be 1-32 characters"), { status: 400 });
   if (!origin) throw Object.assign(new Error("origin must contain bounded integer x and z coordinates"), { status: 400 });
-  if (body.structure !== "village") throw Object.assign(new Error("structure must be village"), { status: 400 });
-  return { player, origin: { x: origin.x, z: origin.z }, structure: "village" };
+  const structure = String(body.structure || "").replace(/^minecraft:/, "");
+  const metadata = LOCATABLE_STRUCTURES[structure];
+  const dimension = String(body.dimension || metadata?.dimensions[0] || "");
+  if (!metadata) throw Object.assign(new Error("structure must be a supported Bedrock locate structure"), { status: 400 });
+  if (!metadata.dimensions.includes(dimension)) {
+    throw Object.assign(new Error("dimension does not support that generated structure"), { status: 400 });
+  }
+  return { player, origin: { x: origin.x, z: origin.z }, structure, dimension };
 }
 
 function structurePoint(value, dimensions) {
@@ -572,8 +579,8 @@ export function createHttpServer({
         return;
       }
       try {
-        const { origin, structure } = validateLocateBody(await readJson(request));
-        const location = await locateStructure({ ...origin, structure });
+        const { origin, structure, dimension } = validateLocateBody(await readJson(request));
+        const location = await locateStructure({ ...origin, structure, dimension });
         logger.log(`[mc-wizard] located ${structure} for local travel`);
         sendJson(response, 200, { structure, location });
       } catch (error) {

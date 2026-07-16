@@ -76,20 +76,33 @@ export function locateStructureNotFound(output) {
 }
 
 export function locateBedrockStructure(execute, {
-  x, z, structure = "village", containerName = "mc-wizard-bedrock", timeoutMs = 8_000,
+  x, z, structure = "village", dimension = "overworld",
+  containerName = "mc-wizard-bedrock", timeoutMs = 8_000,
 }) {
   return withBedrockCommandLock(async () => {
+    if (!/^[a-z0-9_]{1,64}$/.test(structure) || !["overworld", "nether", "the_end"].includes(dimension)) {
+      throw new Error("invalid Bedrock locate structure or dimension");
+    }
     const readLogs = () => execute("container", ["logs", "-n", "500", containerName], 4_000);
     const before = await readLogs();
-    const previousLines = new Set(String(before.output || "").split("\n"));
-    const command = `execute positioned ${Math.floor(x)} 80 ${Math.floor(z)} run locate structure ${structure}`;
+    const logLines = (output) => String(output || "").replace(/(?:\r?\n)+$/, "").split(/\r?\n/);
+    let cursorLines = logLines(before.output);
+    const command = `execute in ${dimension} positioned ${Math.floor(x)} 80 ${Math.floor(z)} run locate structure ${structure}`;
     const sent = await sendBedrockCommandUnlocked(execute, command, containerName);
     if (sent.code !== 0) throw new Error(sent.output || "could not send locate command to Bedrock");
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, 100));
       const current = await readLogs();
-      const newLines = String(current.output || "").split("\n").filter((line) => !previousLines.has(line));
+      const currentLines = logLines(current.output);
+      let overlap = Math.min(cursorLines.length, currentLines.length);
+      while (overlap > 0) {
+        const oldStart = cursorLines.length - overlap;
+        if (cursorLines.slice(oldStart).every((line, index) => line === currentLines[index])) break;
+        overlap -= 1;
+      }
+      const newLines = currentLines.slice(overlap);
+      cursorLines = currentLines;
       for (const line of newLines.reverse()) {
         const located = parseLocatedStructureReport(line, structure);
         if (located && locatedReportMatchesOrigin(located, x, z)) {
