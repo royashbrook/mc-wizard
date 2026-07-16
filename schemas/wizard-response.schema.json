@@ -61,7 +61,10 @@
           "properties": {
             "type": { "type": "string", "const": "local_travel" },
             "version": { "type": "integer", "const": 1 },
-            "destination": { "type": "string", "enum": ["surface", "nearest_village"] }
+            "destination": { "type": "string", "enum": ["surface", "nearest_village", "nearest_structure"] },
+            "structure": { "type": "string", "pattern": "^[a-z0-9_]{1,64}$" },
+            "dimension": { "type": "string", "enum": ["overworld", "nether", "the_end"] },
+            "label": { "type": "string", "minLength": 1, "maxLength": 40 }
           }
         },
         {

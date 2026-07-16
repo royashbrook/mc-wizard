@@ -152,14 +152,29 @@ test("dimension travel is a validated in-world capability", () => {
   assert.match(wizardSkillPrompt(), /do not build a portal-shaped structure as a substitute/i);
 });
 
-test("surface and nearest-village travel are validated in-world capabilities", () => {
+test("surface and generated-structure travel are validated in-world capabilities", () => {
   for (const destination of ["surface", "nearest_village"]) {
     const action = { type: "local_travel", version: 1, destination };
     assert.deepEqual(allowedWizardAction(action), action);
   }
+  assert.deepEqual(allowedWizardAction({
+    type: "local_travel", version: 1, destination: "nearest_structure", structure: "mansion",
+  }), {
+    type: "local_travel", version: 1, destination: "nearest_structure",
+    structure: "mansion", dimension: "overworld", label: "woodland mansion",
+  });
+  assert.deepEqual(allowedWizardAction({
+    type: "local_travel", version: 1, destination: "nearest_structure",
+    structure: "fortress", dimension: "nether",
+  })?.dimension, "nether");
+  assert.equal(allowedWizardAction({
+    type: "local_travel", version: 1, destination: "nearest_structure", structure: "made_up_castle",
+  }), null);
   assert.equal(allowedWizardAction({ type: "local_travel", version: 1, destination: "nearest_city" }), null);
   assert.match(wizardSkillPrompt(), /destination=surface/i);
   assert.match(wizardSkillPrompt(), /destination=nearest_village/i);
+  assert.match(wizardSkillPrompt(), /mansion/);
+  assert.match(wizardSkillPrompt(), /trial_chambers/);
 });
 
 test("trusted-family Bedrock commands allow every Minecraft target and admin action", () => {

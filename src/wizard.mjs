@@ -415,8 +415,8 @@ function defaultGoal(question, action) {
   if (action?.type === "dimension_travel") {
     successCriteria = `The requesting player and nearby players are safely present in the ${action.destination}.`;
   } else if (action?.type === "local_travel") {
-    successCriteria = action.destination === "nearest_village"
-      ? "The requesting player and MC Wizard are safely on the surface at the nearest village."
+    successCriteria = action.destination === "nearest_village" || action.destination === "nearest_structure"
+      ? `The requesting player and MC Wizard are safely together at the nearest ${action.label || "village"}.`
       : "The requesting player and MC Wizard are safely above ground on the Overworld surface.";
   } else if (action?.type === "world_control") {
     successCriteria = "The live world time and weather match the player's request.";
@@ -1477,19 +1477,59 @@ function dimensionTravelAction(question) {
   return destination ? allowedWizardAction({ type: "dimension_travel", version: 1, destination }) : null;
 }
 
+const LOCATABLE_STRUCTURE_ALIASES = [
+  [/\bancient\s+city\b/i, "ancient_city"],
+  [/\bbastion(?:\s+remnant)?\b/i, "bastion_remnant"],
+  [/\bburied\s+treasure\b/i, "buried_treasure"],
+  [/\bend\s+city\b/i, "end_city"],
+  [/\b(?:nether\s+)?fortress\b/i, "fortress"],
+  [/\bwoodland\s+mansion\b|\bmansion\b/i, "mansion"],
+  [/\b(?:abandoned\s+)?mineshaft\b/i, "mineshaft"],
+  [/\bocean\s+monument\b|\bmonument\b/i, "monument"],
+  [/\bpillager\s+outpost\b|\boutpost\b/i, "pillager_outpost"],
+  [/\bruined\s+portal\b/i, "ruined_portal"],
+  [/\bocean\s+ruins?\b/i, "ruins"],
+  [/\bshipwreck\b/i, "shipwreck"],
+  [/\bstronghold\b/i, "stronghold"],
+  [/\btemple\b/i, "temple"],
+  [/\btrail\s+ruins?\b/i, "trail_ruins"],
+  [/\btrial\s+chambers?\b/i, "trial_chambers"],
+  [/\bvillage\b/i, "village"],
+];
+const INVALID_LOCAL_TRAVEL = Symbol("invalid-local-travel");
+
 function localTravelAction(question) {
   const direct = String(question).trim()
     .replace(/^(?:(?:hey|hi|okay|ok)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "")
     .replace(/^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?/i, "");
-  const travelVerb = /\b(?:bring|find|go|move|send|take|teleport|transport|tp)\b/i.test(direct);
-  const requestsVillage = /\b(?:nearest|closest)\s+village\b/i.test(direct)
-    && (travelVerb || /\b(?:get|lead)\s+(?:me|us)\b/i.test(direct));
-  if (requestsVillage) {
-    return allowedWizardAction({ type: "local_travel", version: 1, destination: "nearest_village" });
+  const requestsDirections = /\b(?:tell|show|explain)\s+(?:me\s+)?how\s+to\b|\bhow\s+(?:do|can|could|would|should)\b|\bhow\s+to\b/i.test(direct);
+  const requestsTravel = !requestsDirections
+    && (/(?:^|[.!?]\s*)(?:please\s+)?(?:bring|find(?!\s+out\b)|go|move|send|take|teleport|transport|tp)\b/i.test(direct)
+      || /(?:^|[.!?]\s*)(?:please\s+)?(?:get|lead)\s+(?:me|us)\b/i.test(direct));
+  const requestsStructure = /\b(?:nearest|closest)\b/i.test(direct)
+    && requestsTravel;
+  if (requestsStructure) {
+    if (/\b(?:desert|jungle)\s+temple\b|\bwitch\s+hut\b|\bigloo\b/i.test(direct)) {
+      return INVALID_LOCAL_TRAVEL;
+    }
+    const structure = LOCATABLE_STRUCTURE_ALIASES.find(([pattern]) => pattern.test(direct))?.[1];
+    const dimension = /\bnether\b/i.test(direct) ? "nether"
+      : /\b(?:the\s+)?end\b/i.test(direct) ? "the_end"
+      : /\boverworld\b/i.test(direct) ? "overworld" : undefined;
+    if (structure === "village") {
+      if (dimension && dimension !== "overworld") return INVALID_LOCAL_TRAVEL;
+      return allowedWizardAction({ type: "local_travel", version: 1, destination: "nearest_village" });
+    }
+    if (structure) {
+      const action = allowedWizardAction({
+        type: "local_travel", version: 1, destination: "nearest_structure", structure, dimension,
+      });
+      return action || (dimension ? INVALID_LOCAL_TRAVEL : null);
+    }
   }
   const requestsSurface = /\b(?:surface|above\s*ground|top\s+of\s+(?:the\s+)?(?:ground|land)|topside)\b/i.test(direct)
     || /\b(?:up|out)\s+(?:on|onto|to)\s+(?:the\s+)?(?:ground|land)\b/i.test(direct);
-  if (requestsSurface && (travelVerb || /\b(?:get|lead)\s+(?:me|us)\b/i.test(direct))) {
+  if (requestsSurface && requestsTravel) {
     return allowedWizardAction({ type: "local_travel", version: 1, destination: "surface" });
   }
   return null;
@@ -1768,13 +1808,15 @@ function primaryBuildSubject(question) {
 export function classifyAction(question, history = []) {
   question = normalizeActionRequest(question);
   const refusesBuild = /\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
-    || /\bjust\s+(?:explain|describe|tell)\b/i.test(question);
+    || /\bjust\s+(?:explain|describe|tell)\b/i.test(question)
+    || /\b(?:make|give|show)\s+me\s+(?:an?\s+)?(?:map|guide|instructions?)\s+(?:to|for|about)\b/i.test(question);
   if (isPotionRainRequest(question)) {
     return allowedWizardAction({ type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 });
   }
   const admin = trustedAdminAction(question);
   if (admin) return admin;
   const localTravel = localTravelAction(question);
+  if (localTravel === INVALID_LOCAL_TRAVEL) return null;
   if (localTravel) return localTravel;
   const command = commandAction(question);
   if (command) return command;
@@ -1929,7 +1971,8 @@ function localAnswer(question, hits, action) {
     return `Stay close—I'll take you and the nearby players safely to ${destination} now.`;
   }
   if (action?.type === "local_travel") {
-    const destination = action.destination === "nearest_village" ? "the nearest village" : "the surface";
+    const destination = action.destination === "nearest_structure" ? `the nearest ${action.label}`
+      : action.destination === "nearest_village" ? "the nearest village" : "the surface";
     return `Follow my wand—I’ll find safe ground and take us to ${destination} now.`;
   }
   if (action?.type === "potion_rain") {
@@ -3112,7 +3155,11 @@ function providerActionMatchesRequest(action, question, history = [], {
   }
   if (!classified || classified.type !== action.type) return false;
   if (action.type === "dimension_travel") return action.destination === classified.destination;
-  if (action.type === "local_travel") return action.destination === classified.destination;
+  if (action.type === "local_travel") {
+    return action.destination === classified.destination
+      && action.structure === classified.structure
+      && action.dimension === classified.dimension;
+  }
   if (action.type === "world_control") return JSON.stringify(action) === JSON.stringify(classified);
   if (action.type === "potion_rain") return true;
   return JSON.stringify(action) === JSON.stringify(classified);

@@ -780,13 +780,13 @@ async function runDimensionTravelRollbackAcceptance(kid) {
   }
 }
 
-function generatedVillageNear(dimension, location) {
+function generatedStructureNear(dimension, location, structure) {
   if (typeof dimension.getGeneratedStructures !== "function") return false;
   const y = Math.floor(location.y);
   for (let x = Math.floor(location.x) - 24; x <= Math.floor(location.x) + 24; x += 4) {
     for (let z = Math.floor(location.z) - 24; z <= Math.floor(location.z) + 24; z += 4) {
       try {
-        if (dimension.getGeneratedStructures({ x, y, z }).some((type) => /village/i.test(String(type)))) {
+        if (dimension.getGeneratedStructures({ x, y, z }).some((type) => String(type).includes(structure))) {
           return true;
         }
       } catch {}
@@ -834,9 +834,53 @@ async function runLocalTravelAcceptance(kid) {
     }, 1_200, "Test Kid and MC Wizard to reach the located village together");
     const top = dimension.getTopmostBlock({ x: Math.floor(kid.location.x), z: Math.floor(kid.location.z) });
     if (!top || kid.location.y < top.y + 1) throw new Error("village arrival was not on its open surface");
-    if (!generatedVillageNear(dimension, kid.location)) throw new Error("arrival was not inside or beside a generated village");
+    if (!generatedStructureNear(dimension, kid.location, "village")) throw new Error("arrival was not inside or beside a generated village");
     report("CHECK", "nearest-village-travel", `request via ${villageTransport}; generated village reached on its surface`);
-    report("PASS", check, "the production Wizard rescued a simulated child from underground and then took the child and visible Wizard to the nearest village");
+
+    const villageLocation = { x: kid.location.x, z: kid.location.z };
+    currentRequest = "take us to the nearest woodland mansion";
+    const mansionTransport = await routeWizardRequest(kid, `wizard, ${currentRequest}`, "nearest-mansion-travel");
+    await waitFor(() => {
+      const wizardPlayer = world.getAllPlayers().find((player) => player.name === "MC Wizard");
+      return kid.dimension.id === "minecraft:overworld"
+        && wizardPlayer?.dimension.id === "minecraft:overworld"
+        && Math.hypot(kid.location.x - villageLocation.x, kid.location.z - villageLocation.z) > 8
+        && Math.hypot(kid.location.x - wizardPlayer.location.x, kid.location.z - wizardPlayer.location.z) <= 8;
+    }, 2_400, "Test Kid and MC Wizard to reach the located woodland mansion together");
+    const mansionTop = dimension.getTopmostBlock({ x: Math.floor(kid.location.x), z: Math.floor(kid.location.z) });
+    if (!mansionTop || kid.location.y < mansionTop.y + 1) throw new Error("mansion arrival was not on its open surface");
+    if (!generatedStructureNear(dimension, kid.location, "mansion")) {
+      throw new Error("arrival was not inside or beside a generated woodland mansion");
+    }
+    report("CHECK", "nearest-mansion-travel", `request via ${mansionTransport}; generated woodland mansion reached on its surface`);
+
+    currentRequest = "take us to the nearest nether fortress";
+    const fortressTransport = await routeWizardRequest(kid, `wizard, ${currentRequest}`, "nearest-fortress-travel");
+    const nether = world.getDimension("nether");
+    await waitFor(() => {
+      const wizardPlayer = world.getAllPlayers().find((player) => player.name === "MC Wizard");
+      return kid.dimension.id === "minecraft:nether"
+        && wizardPlayer?.dimension.id === "minecraft:nether"
+        && Math.hypot(kid.location.x - wizardPlayer.location.x, kid.location.z - wizardPlayer.location.z) <= 8;
+    }, 2_400, "Test Kid and MC Wizard to reach the located Nether fortress together");
+    if (!generatedStructureNear(nether, kid.location, "fortress")) {
+      throw new Error("arrival was not inside or beside a generated Nether fortress");
+    }
+    report("CHECK", "nearest-fortress-travel", `request via ${fortressTransport}; generated Nether fortress reached with the whole party`);
+
+    currentRequest = "take us to the nearest ancient city";
+    const ancientCityTransport = await routeWizardRequest(kid, `wizard, ${currentRequest}`, "nearest-ancient-city-travel");
+    await waitFor(() => {
+      const wizardPlayer = world.getAllPlayers().find((player) => player.name === "MC Wizard");
+      return kid.dimension.id === "minecraft:overworld"
+        && wizardPlayer?.dimension.id === "minecraft:overworld"
+        && Math.hypot(kid.location.x - wizardPlayer.location.x, kid.location.z - wizardPlayer.location.z) <= 8;
+    }, 2_400, "Test Kid and MC Wizard to reach the located ancient city together");
+    if (!generatedStructureNear(dimension, kid.location, "ancient_city")) {
+      throw new Error("arrival was not safely inside or beside a generated ancient city");
+    }
+    report("CHECK", "nearest-ancient-city-travel", `request via ${ancientCityTransport}; generated underground ancient city reached with the whole party`);
+    report("PASS", check, "the production Wizard used one dimension-aware structure hand for surface, Overworld, Nether, and underground generated destinations while keeping the child and visible Wizard together");
   } catch (error) {
     report("FAIL", check, `${currentRequest}: ${String(error)}`);
   } finally {

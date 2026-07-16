@@ -70,19 +70,38 @@ test("nearest-village adapter parses only the fixed BDS locate output", async ()
   assert.deepEqual(await located, { x: -264, z: -392 });
   await queuedCommand;
   assert.ok(calls.some(([, args]) => args.includes("isolated-bedrock")));
-  assert.ok(calls.some(([, args]) => args.includes("execute positioned 12 80 -8 run locate structure village")));
-  const locateIndex = calls.findIndex(([, args]) => args.includes("execute positioned 12 80 -8 run locate structure village"));
+  assert.ok(calls.some(([, args]) => args.includes("execute in overworld positioned 12 80 -8 run locate structure village")));
+  const locateIndex = calls.findIndex(([, args]) => args.includes("execute in overworld positioned 12 80 -8 run locate structure village"));
   const generalIndex = calls.findIndex(([, args]) => args.includes("say after-locate"));
   assert.ok(generalIndex > locateIndex, "all bridge commands must wait for the correlated locate poll");
 });
 
-test("nearest-village endpoint accepts only bounded fixed requests", () => {
+test("structure locator accepts a repeated identical report as newly appended output", async () => {
+  const line = "The nearest minecraft:village is at block -264, (y?), -392 (472 blocks away)";
+  let logReads = 0;
+  const execute = async (_command, args) => {
+    if (args[0] !== "logs") return { code: 0, output: "" };
+    logReads += 1;
+    return { code: 0, output: logReads === 1 ? `${line}\n` : `${line}\n${line}\n` };
+  };
+  assert.deepEqual(await locateBedrockStructure(execute, {
+    x: 12.8, z: -7.2, containerName: "isolated-bedrock", timeoutMs: 1_000,
+  }), { x: -264, z: -392 });
+});
+
+test("generated-structure endpoint accepts only bounded Bedrock structure requests", () => {
   assert.deepEqual(validateLocateBody({
     player: "Kid", origin: { x: 12, z: -7 }, structure: "village",
-  }), { player: "Kid", origin: { x: 12, z: -7 }, structure: "village" });
+  }), { player: "Kid", origin: { x: 12, z: -7 }, structure: "village", dimension: "overworld" });
+  assert.deepEqual(validateLocateBody({
+    player: "Kid", origin: { x: 12, z: -7 }, structure: "fortress", dimension: "nether",
+  }), { player: "Kid", origin: { x: 12, z: -7 }, structure: "fortress", dimension: "nether" });
   assert.throws(() => validateLocateBody({
-    player: "Kid", origin: { x: 12, z: -7 }, structure: "fortress",
-  }), /structure must be village/);
+    player: "Kid", origin: { x: 12, z: -7 }, structure: "made_up_castle",
+  }), /supported Bedrock locate structure/);
+  assert.throws(() => validateLocateBody({
+    player: "Kid", origin: { x: 12, z: -7 }, structure: "fortress", dimension: "overworld",
+  }), /dimension/);
   assert.throws(() => validateLocateBody({
     player: "Kid", origin: { x: 31_000_000, z: 0 }, structure: "village",
   }), /origin/);
