@@ -133,6 +133,8 @@ test("bootstraps every E2E run in an isolated disposable world", () => {
 
 test("offers a focused live machine E2E with functional world-state checks", () => {
   assert.match(e2eScript, /mc_wizard_e2e_scope/);
+  assert.match(e2eScript, /child-remote-gift/);
+  assert.match(e2eScript, /the remote gift was also duplicated at the requester/);
   assert.match(e2eScript, /machine-piston-door/);
   assert.match(e2eScript, /pistonDoorIsClosed/);
   assert.match(e2eScript, /chatCallbacks\.hasCommittedBuild\(kid\.id\) && pistonDoorIsOpen/);
@@ -1930,6 +1932,23 @@ test("accepts a rich large delivery to an exact named connected player", async (
   });
   assert.deepEqual(result.action, action);
   assert.match(result.answer, /enti1ty303/i);
+
+  const punctuatedAction = {
+    ...action,
+    items: [{ ...action.items[0], nameTag: "Mr. Jones" }],
+  };
+  const punctuated = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "I’ll deliver Mr. Jones.", action: punctuatedAction,
+      goal: { objective: "Deliver Mr. Jones", successCriteria: "The named sword reaches enti1ty303", status: "active" },
+    }) } }] }), { status: 200 }),
+  });
+  assert.equal((await punctuated.ask({
+    player: "alt3rname",
+    question: "Give enti1ty303 256 enchanted diamond swords named \"Mr. Jones\"",
+  })).action.items[0].nameTag, "Mr. Jones");
 });
 
 test("keeps the wrong gift rejected unless one bounded repair returns the requested item", async () => {
@@ -2402,6 +2421,36 @@ test("binds model-authored furniture revisions to the existing project", async (
   assert.equal(furnished.action.type, "execute_program");
   assert.equal(furnished.action.program.site, "active_project");
   assert.equal(request.max_tokens, 3000);
+
+  await sessions.updateAction("FurnitureKid", "wizard", {
+    requestId: furnished.requestId, status: "completed", detail: "furniture verified",
+  });
+  const windowBlock = {
+    itemId: "minecraft:glass_pane", target: [2, 2, 0], support: [2, 1, 0], expectedType: "minecraft:glass_pane",
+  };
+  const detailWizard = createWizard({
+    corpus: { search: () => [] }, sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "I’ll add that one window to the mansion.",
+      goal: { objective: "Add one window", successCriteria: "One glass pane is verified in the mansion", status: "active" },
+      action: { type: "execute_program", version: 1, program: {
+        title: "Mansion window",
+        steps: [{
+          id: "place_window", capability: "player.place-blocks", arguments: { blocks: [windowBlock] },
+          expect: "One mansion window is in place.",
+        }, {
+          id: "verify_window", capability: "verify.blocks",
+          arguments: { blocks: [{ target: windowBlock.target, typeId: windowBlock.expectedType }] },
+          expect: "The mansion window remains in place.",
+        }],
+      } },
+    }) } }] }), { status: 200 }),
+  });
+  const window = await detailWizard.ask({ player: "FurnitureKid", question: "add one window to my mansion" });
+  assert.equal(window.action.type, "execute_program");
+  assert.equal(window.action.program.site, "active_project");
+  assert.equal(window.action.program.steps[0].arguments.blocks.length, 1);
 });
 
 test("keeps short child continuations and nearby playground requests actionable", async () => {
@@ -2422,6 +2471,7 @@ test("keeps short child continuations and nearby playground requests actionable"
   const chest = classifyAction("place a chest here");
   assert.equal(chest.type, "execute_program");
   assert.equal(chest.program.steps[0].arguments.blocks[0].itemId, "minecraft:chest");
+  assert.equal(classifyAction("Place a Crafting Table").program.steps[0].arguments.blocks[0].itemId, "minecraft:crafting_table");
 });
 
 test("tells the model whether prior actions are planned, active, completed, failed, or unknown", async () => {

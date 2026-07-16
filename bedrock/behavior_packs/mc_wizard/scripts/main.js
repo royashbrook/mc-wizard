@@ -5046,7 +5046,7 @@ async function giveItemsAsWizard(player, items, report, recipient) {
       endImmediateAction(activeReport, "failed", `exact recipient ${recipient} is not connected`);
       return;
     }
-    const bot = bringWizardTo(player, true, true);
+    const bot = bringWizardTo(target, true, true);
     if (!bot) {
       queueBuild(player, (current) => giveItemsAsWizard(current, items, report, recipient), 40, "I’m gathering those items and will bring them over as soon as I reappear.");
       return;
@@ -5883,6 +5883,9 @@ world.afterEvents.worldLoad.subscribe(() => {
         label: "E2E",
         answer: "# Redstone guide\n\n" + "Use repeaters to control timing, comparators to measure signals, and lamps to make output easy to read. ".repeat(12),
       }, "redstone guide"),
+      deliverTestGift: (player, recipient) => giveItemsAsWizard(player, [{
+        itemId: "minecraft:diamond", amount: 7, nameTag: "Seven Stars",
+      }], undefined, recipient),
     }), 20);
   }
 });

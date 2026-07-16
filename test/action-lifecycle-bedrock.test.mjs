@@ -167,10 +167,12 @@ test("chat and item delivery cannot steal the Wizard body from an active build",
     3,
   );
   const start = packScript.indexOf("async function giveItemsAsWizard");
-  const end = packScript.indexOf("function applyResponse", start);
+  const end = packScript.indexOf("function capabilityProgramFrame", start);
   const delivery = packScript.slice(start, end);
   assert.match(delivery, /if \(buildInProgress \|\| buildPreparing\)/);
   assert.match(delivery, /const reservation = beginBuildPreparation\(\)/);
+  assert.match(delivery, /const target = giftRecipient\(player, recipient\)[\s\S]*bringWizardTo\(target, true, true\)/);
+  assert.doesNotMatch(delivery, /bringWizardTo\(player, true, true\)/);
   assert.match(delivery, /endImmediateAction\(activeReport, "failed", "item delivery was interrupted before completion"\)/);
   assert.match(delivery, /finally \{\n\s+endBuildPreparation\(reservation\)/);
 });

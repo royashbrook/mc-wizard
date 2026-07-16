@@ -1741,6 +1741,20 @@ function playerAndDroppedItemIds(kid) {
   return ids;
 }
 
+function playerAndDroppedItemAmount(player, itemId) {
+  let amount = 0;
+  const inventory = player.getComponent("minecraft:inventory")?.container;
+  for (let slot = 0; inventory && slot < inventory.size; slot += 1) {
+    const item = inventory.getItem(slot);
+    if (item?.typeId === itemId) amount += item.amount;
+  }
+  for (const entity of player.dimension.getEntities({ type: "minecraft:item", location: player.location, maxDistance: 8 })) {
+    const item = entity.getComponent("minecraft:item")?.itemStack;
+    if (item?.typeId === itemId) amount += item.amount;
+  }
+  return amount;
+}
+
 function recipeDisplayIsComplete(kid, station) {
   const min = { x: station.x - 16, y: station.y, z: station.z - 16 };
   const max = { x: station.x + 16, y: station.y + 5, z: station.z + 16 };
@@ -2172,6 +2186,28 @@ async function runChildRequestAcceptance(kid) {
     );
     report("CHECK", "child-iron-tools", `request via ${toolsTransport}; all five physical items verified`);
 
+    currentRequest = "deliver seven named diamonds to another connected child";
+    const friendName = `WizPal-${runId.slice(0, 8)}`;
+    const friend = spawnSimulatedPlayer(
+      { x: recipeStation.x + 0.5, y: recipeStation.y, z: recipeStation.z + 0.5 },
+      friendName,
+      GameMode.Creative,
+    );
+    try {
+      await chatCallbacks.deliverTestGift(kid, friendName);
+      await waitFor(
+        () => playerAndDroppedItemAmount(friend, "minecraft:diamond") === 7,
+        400,
+        "all seven named diamonds at the connected recipient",
+      );
+      if (playerAndDroppedItemAmount(kid, "minecraft:diamond") !== 0) {
+        throw new Error("the remote gift was also duplicated at the requester");
+      }
+      report("CHECK", "child-remote-gift", "visible Wizard delivered exactly seven named items to the recipient and none to the requester");
+    } finally {
+      try { friend.disconnect(); } catch {}
+    }
+
     currentRequest = "show me how to craft a hopper";
     await teleportToStation(kid, recipeStation);
     const recipeTransport = await routeWizardRequest(kid, "wizard, show me how to craft a hopper", "hopper-recipe");
@@ -2184,7 +2220,7 @@ async function runChildRequestAcceptance(kid) {
     report(
       "PASS",
       "child-action-pipeline",
-      "exact child requests produced sized and in-place-upgraded structures, working chicken, wool, and kelp farms, potion rain, world changes, gifted tools, and an in-world recipe",
+      "exact child requests produced sized and in-place-upgraded structures, working chicken, wool, and kelp farms, potion rain, world changes, local and remote gifts, and an in-world recipe",
     );
     try { kid.disconnect(); } catch {}
   } catch (error) {
@@ -3068,7 +3104,8 @@ export async function startE2E(callbacks) {
     || typeof callbacks?.hasCommittedBuild !== "function"
     || typeof callbacks?.buildValidatedPlan !== "function"
     || typeof callbacks?.prepareBuildWorkshop !== "function"
-    || typeof callbacks?.deliverTestBook !== "function") {
+    || typeof callbacks?.deliverTestBook !== "function"
+    || typeof callbacks?.deliverTestGift !== "function") {
     report("FAIL", "configuration", "shared chat router callbacks are required");
     return;
   }

@@ -18,6 +18,7 @@ const CAPABILITIES = new Set(RUNTIME_CAPABILITIES);
 const ITEM_ID = /^minecraft:[a-z0-9_]+$/;
 const EFFECT_ID = /^(?:minecraft:)?[a-z0-9_]+$/;
 const REQUESTER_SELECTOR = "@s(?:\\[[^\\]\\r\\n]{1,120}\\])?";
+const COORDINATE = "(?:~[-+]?\\d*(?:\\.\\d+)?|[-+]?\\d+(?:\\.\\d+)?)";
 const REQUESTER_COMMAND_PATTERNS = [
   new RegExp(`^ability\\s+${REQUESTER_SELECTOR}\\s+\\S+(?:\\s+\\S+)?$`, "i"),
   new RegExp(`^clear\\s+${REQUESTER_SELECTOR}(?:\\s+\\S+){0,3}$`, "i"),
@@ -25,8 +26,8 @@ const REQUESTER_COMMAND_PATTERNS = [
   new RegExp(`^enchant\\s+${REQUESTER_SELECTOR}\\s+[a-z0-9_]+(?:\\s+\\d+)?$`, "i"),
   new RegExp(`^gamemode\\s+\\S+\\s+${REQUESTER_SELECTOR}$`, "i"),
   new RegExp(`^give\\s+${REQUESTER_SELECTOR}\\s+[a-z0-9_:]+(?:\\s+\\d+){0,2}$`, "i"),
-  new RegExp(`^(?:teleport|tp)\\s+${REQUESTER_SELECTOR}\\s+(?:-?~?\\d+(?:\\.\\d+)?\\s+){2}-?~?\\d+(?:\\.\\d+)?(?:\\s+(?:true|false))?$`, "i"),
-  new RegExp(`^spawnpoint\\s+${REQUESTER_SELECTOR}(?:\\s+-?~?\\d+(?:\\.\\d+)?){0,3}$`, "i"),
+  new RegExp(`^(?:teleport|tp)\\s+${REQUESTER_SELECTOR}\\s+${COORDINATE}\\s+${COORDINATE}\\s+${COORDINATE}(?:\\s+(?:true|false))?$`, "i"),
+  new RegExp(`^spawnpoint\\s+${REQUESTER_SELECTOR}(?:\\s+${COORDINATE}\\s+${COORDINATE}\\s+${COORDINATE})?$`, "i"),
   new RegExp(`^xp\\s+[-+]?\\d+[lL]?\\s+${REQUESTER_SELECTOR}$`, "i"),
 ];
 const FORBIDDEN_SPAWN_ENTITIES = new Set([

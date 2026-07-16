@@ -1346,7 +1346,7 @@ function simpleBlockPlacementAction(question) {
   if (!clause) return null;
   const named = clause.match(/\b(?:place|put\s+down|set\s+down)\s+(?:an?|one|some)?\s*([a-z ]{2,40}?)(?:\s+(?:here|nearby|there|for me))?[.!?]*$/i)?.[1]
     ?.trim().replace(/s$/, "");
-  const itemId = SIMPLE_PLACEABLE_BLOCKS.get(named);
+  const itemId = SIMPLE_PLACEABLE_BLOCKS.get(named?.toLowerCase());
   if (!itemId || ["minecraft:arrow", "minecraft:bread"].includes(itemId)) return null;
   const label = named.replace(/\b\w/g, (letter) => letter.toUpperCase());
   return allowedWizardAction({
@@ -2454,7 +2454,7 @@ function bindProgramToActiveProject(action, projectFeedback) {
   });
 }
 
-function capabilityProgramAdvancesRequest(action, question) {
+function capabilityProgramAdvancesRequest(action, question, history = []) {
   const steps = action.program.steps;
   const work = steps.reduce((total, { capability, arguments: args }) => {
     if (capability === "player.place-blocks") return total + args.blocks.length;
@@ -2465,7 +2465,8 @@ function capabilityProgramAdvancesRequest(action, question) {
   }, 0);
   const commandBacked = steps.some(({ capability }) => capability === "world.command");
   const largeProject = /\b(?:castle|city|house|mansion|playground|school|settlement|village)\b/i.test(question);
-  if (!commandBacked && work < (largeProject ? 8 : 2)) return false;
+  const boundedDetail = Boolean(simpleBlockPlacementAction(question)) || isProjectFeedback(question, history);
+  if (!commandBacked && work < (boundedDetail ? 1 : largeProject ? 8 : 2)) return false;
   const subject = primaryBuildSubject(question);
   if (!subject) return true;
   const planWords = `${action.program.title} ${steps.map(({ expect }) => expect).join(" ")}`.toLowerCase();
@@ -2478,7 +2479,7 @@ function actionCompletesBuildRequest(action, question, history = []) {
   if (!action) return false;
   if (isStagedBuildProgress(action)) return false;
   if (action.type === "execute_program") {
-    return capabilityProgramAdvancesRequest(action, question);
+    return capabilityProgramAdvancesRequest(action, question, history);
   }
   if (isActionConfirmation(question)) {
     const pending = pendingActionTurn(history);
@@ -2644,7 +2645,10 @@ function providerGiftMatchesRequest(action, question) {
   if (!action.items.every(({ itemId }) => namedItemMatchesQuestion(itemId, clause))) return false;
   if (/\b(?:enchanted|enchant(?:ed|ment)?\s+with)\b/i.test(clause)
     && action.items.some(({ enchantments }) => !enchantments?.length)) return false;
-  const requestedName = clause.match(/\b(?:named|called)\s+["“]?([^"”.,!?]{1,80}?)(?:["”]|\s+with\b|[.,!?]|$)/i)?.[1].trim();
+  const requestedName = (
+    question.match(/\b(?:named|called)\s+["“]([^"”]{1,80})["”]/i)?.[1]
+    || clause.match(/\b(?:named|called)\s+([^,!?]{1,80}?)(?:\s+with\b|[,!?]|$)/i)?.[1]
+  )?.trim().replace(/[.]$/, "");
   if (requestedName && action.items.some(({ nameTag }) => nameTag?.toLowerCase() !== requestedName.toLowerCase())) return false;
   return true;
 }
