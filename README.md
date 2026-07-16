@@ -222,19 +222,17 @@ container system status
 Then:
 
 1. Either put an exported Beta-APIs-enabled world at `runtime/bedrock/worlds/mc-wizard`, or create a disposable fresh one headlessly with `npm run bootstrap:bds`. The bootstrap container publishes no network port, stops BDS cleanly, backs up `level.dat`, structurally enables the three official Beta API experiment bytes, and deletes only its temporary container.
-2. Choose the Mac's private LAN IPv4 first. Copy `.env.example` to `.env`, set `HOST` to that literal address (not `0.0.0.0`), replace `BRIDGE_TOKEN` with at least 24 random characters, and run `npm start`. Leave `WIZARD_SALT` blank to derive a private stable salt from that token, or set it to a different random secret of at least 24 characters. The brain refuses to bind beyond loopback with a default or short token and ignores the old public salt placeholder.
-3. Supply the Mac's private LAN IPv4:
+2. Choose the Mac's private LAN IPv4 first. Copy `.env.example` to `.env`, set both `HOST` and `MC_WIZARD_LAN_IP` to that literal address (not `0.0.0.0`), replace `BRIDGE_TOKEN` with at least 24 random characters, and run `npm start`. Leave `WIZARD_SALT` blank to derive a private stable salt from that token, or set it to a different random secret of at least 24 characters. The brain refuses to bind beyond loopback with a default or short token and ignores the old public salt placeholder.
+3. Confirm `.env` contains the Mac's private LAN IPv4:
 
    ```bash
-   export MC_WIZARD_LAN_IP=192.168.x.x
+   MC_WIZARD_LAN_IP=192.168.x.x
    ```
 
-4. Activate/configure the behavior pack while BDS is stopped, then launch the pinned image/BDS version:
+4. Activate/configure both packs and launch the pinned image/BDS version:
 
    ```bash
-   npm run install:pack -- runtime/bedrock mc-wizard \
-     "http://${MC_WIZARD_LAN_IP}:3000/v1/ask"
-   npm run container:bds
+   npm run container:start
    npm run container:logs
    ```
 

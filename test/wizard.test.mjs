@@ -53,9 +53,10 @@ let supervisorScript;
 let adminServiceScript;
 let initialPropertiesScript;
 let managedStartScript;
+let managedStopScript;
 
 before(async () => {
-  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText, adminServiceText, initialPropertiesText, managedStartText] = await Promise.all([
+  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText, adminServiceText, initialPropertiesText, managedStartText, managedStopText] = await Promise.all([
     loadCorpus(),
     readFile(new URL("../bedrock/behavior_packs/mc_wizard/manifest.json", import.meta.url), "utf8"),
     readFile(new URL("../bedrock/config/4e8790fe-18dc-46d1-aa31-ec78a924b717/permissions.json", import.meta.url), "utf8"),
@@ -71,6 +72,7 @@ before(async () => {
     readFile(new URL("../scripts/admin-service.mjs", import.meta.url), "utf8"),
     readFile(new URL("../scripts/initialize-bedrock-properties.mjs", import.meta.url), "utf8"),
     readFile(new URL("../scripts/start-bedrock-container.sh", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/stop-bedrock-container.sh", import.meta.url), "utf8"),
   ]);
   corpus = loadedCorpus;
   packManifest = JSON.parse(manifestText);
@@ -87,6 +89,7 @@ before(async () => {
   adminServiceScript = adminServiceText;
   initialPropertiesScript = initialPropertiesText;
   managedStartScript = managedStartText;
+  managedStopScript = managedStopText;
   wizard = createWizard({ corpus, env: {} });
 });
 
@@ -470,6 +473,7 @@ test("uses a private per-install HMAC for provider safety identifiers", async ()
   assert.match(serverSource, /randomBytes\(32\)/);
   assert.doesNotMatch(serverSource, /wizardSalt\s*=\s*env\.WIZARD_SALT\s*\|\|\s*token/);
   assert.match(envExample, /^WIZARD_SALT=\s*$/m);
+  assert.match(envExample, /^MC_WIZARD_LAN_IP=\s*$/m);
   assert.doesNotMatch(envExample, /WIZARD_SALT=change-me-before-sharing/);
   assert.match(wizardSource, /mc-wizard:provider-safety-identifier:v1/);
   const identifiers = [];
@@ -516,7 +520,9 @@ test("supervises Bedrock, brain, provider, and corpus without secrets in status"
   assert.match(supervisorScript, /corpusChunks/);
   assert.match(supervisorScript, /providerName/);
   assert.doesNotMatch(supervisorScript, /BRIDGE_TOKEN.*console|AI_API_KEY.*console/);
-  assert.match(supervisorScript, /container", \["stop", "--time", "60"/);
+  assert.match(supervisorScript, /start-bedrock-container\.sh/);
+  assert.match(supervisorScript, /stop-bedrock-container\.sh/);
+  assert.doesNotMatch(supervisorScript, /container", \["stop", "--time", "60"/);
 });
 
 test("navigates into player reach for every placement and verifies scaffold removal", () => {
@@ -643,6 +649,7 @@ test("pins the Apple container launch to trusted open-LAN operator mode", () => 
   assert.doesNotMatch(containerScript, /USE_BOX64/);
   assert.match(containerScript, /trusted open-LAN mode/);
   assert.match(containerScript, /RFC1918 private address/);
+  assert.match(containerScript, /MC_WIZARD_LAN_IP.*awk/);
   assert.match(containerScript, /initialize-bedrock-properties/);
   assert.match(containerScript, /install:pack/);
   assert.match(installPackScript, /"texturepack-required": true/);
@@ -651,9 +658,13 @@ test("pins the Apple container launch to trusted open-LAN operator mode", () => 
   assert.match(containerScript, /LEVEL_NAME=mc-wizard/);
   assert.match(containerScript, /--publish "\$\{LAN_IP\}:19132:19132\/udp"/);
   assert.doesNotMatch(containerScript, /VERSION=LATEST/);
-  assert.match(managedStartScript, /container delete mc-wizard-bedrock/);
+  assert.match(managedStartScript, /container delete --force mc-wizard-bedrock/);
+  assert.match(managedStartScript, /stop-bedrock-container\.sh/);
   assert.match(managedStartScript, /run-bedrock-container\.sh/);
   assert.doesNotMatch(managedStartScript, /container start/);
+  assert.match(managedStopScript, /mc-wizard stop/);
+  assert.match(managedStopScript, /bedrock_server-\*/);
+  assert.match(managedStopScript, /container delete --force mc-wizard-bedrock/);
 });
 
 test("retrieves the Bedrock T flip-flop card", () => {

@@ -26,7 +26,7 @@
     "container:start": "sh scripts/start-bedrock-container.sh",
     "container:delete": "container delete mc-wizard-bedrock",
     "container:logs": "container logs -f mc-wizard-bedrock",
-    "container:stop": "container stop --time 60 mc-wizard-bedrock",
+    "container:stop": "sh scripts/stop-bedrock-container.sh",
     "sync:docs": "node scripts/sync-docs.mjs",
     "test": "node --test test/*.test.mjs",
     "test:e2e:bds": "sh scripts/run-e2e-container.sh",
