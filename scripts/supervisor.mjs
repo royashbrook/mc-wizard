@@ -7,6 +7,7 @@ const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const RUNTIME = path.join(ROOT, "runtime", "supervisor");
 const PID_FILE = path.join(RUNTIME, "mc-wizard.pid");
 const LOG_FILE = path.join(RUNTIME, "mc-wizard.log");
+const DAEMON_PATTERN = `${path.join(ROOT, "scripts", "supervisor.mjs")} daemon`.replace("/", "[/]");
 
 function run(command, args, options = {}) {
   return new Promise((resolve) => {
@@ -16,13 +17,27 @@ function run(command, args, options = {}) {
   });
 }
 
+function daemonPids() {
+  return new Promise((resolve) => {
+    const child = spawn("pgrep", ["-f", DAEMON_PATTERN], { stdio: ["ignore", "pipe", "ignore"] });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.once("error", () => resolve([]));
+    child.once("exit", () => resolve(output.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0)));
+  });
+}
+
 async function currentPid() {
   try {
     const pid = Number(await readFile(PID_FILE, "utf8"));
     process.kill(pid, 0);
     return pid;
   } catch {
-    return undefined;
+    const [pid] = await daemonPids();
+    if (!pid) return undefined;
+    await mkdir(RUNTIME, { recursive: true });
+    await writeFile(PID_FILE, `${pid}\n`, { mode: 0o600 });
+    return pid;
   }
 }
 
@@ -36,10 +51,11 @@ async function probe(url) {
 }
 
 async function status() {
-  const [pid, brain, provider, bedrockCode] = await Promise.all([
+  const [pid, brain, provider, admin, bedrockCode] = await Promise.all([
     currentPid(),
     probe(`http://${process.env.HOST || "127.0.0.1"}:${process.env.PORT || 3000}/health`),
     probe(`http://127.0.0.1:${process.env.MTOK_PORT || 8790}/health`),
+    probe(`http://${process.env.ADMIN_HOST || "127.0.0.1"}:${process.env.ADMIN_PORT || 3001}/health`),
     run("container", ["exec", "mc-wizard-bedrock", "true"]),
   ]);
   const result = {
@@ -47,6 +63,7 @@ async function status() {
     bedrock: bedrockCode === 0,
     brain: Boolean(brain.ok),
     provider: Boolean(provider.ok),
+    admin: Boolean(admin.ok),
     corpusChunks: brain.corpusChunks || 0,
     providerName: provider.provider || brain.provider || "offline",
   };
@@ -55,6 +72,7 @@ async function status() {
 }
 
 async function daemon() {
+  if ((await daemonPids()).some((pid) => pid !== process.pid)) return;
   await mkdir(RUNTIME, { recursive: true });
   await writeFile(PID_FILE, `${process.pid}\n`, { mode: 0o600 });
   const log = await open(LOG_FILE, "a", 0o600);
@@ -87,15 +105,13 @@ async function daemon() {
     && /127\.0\.0\.1:(?:8790|\$\{?MTOK_PORT)/.test(process.env.AI_BASE_URL || "");
   supervise("provider", path.join(ROOT, "scripts", "local-ai-bridge.mjs"), localProvider);
   supervise("brain", path.join(ROOT, "src", "server.mjs"));
-  if (await run("container", ["start", "mc-wizard-bedrock"], { stdio: ["ignore", log.fd, log.fd] }) !== 0) {
-    await run("sh", [path.join(ROOT, "scripts", "run-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
-  }
+  await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
 
   const stop = async () => {
     if (stopping) return;
     stopping = true;
     for (const child of children.values()) child.kill("SIGTERM");
-    await run("container", ["stop", "--time", "60", "mc-wizard-bedrock"], { stdio: ["ignore", log.fd, log.fd] });
+    await run("sh", [path.join(ROOT, "scripts", "stop-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
     await rm(PID_FILE, { force: true });
     await log.close();
     process.exit(0);
@@ -104,12 +120,13 @@ async function daemon() {
   process.on("SIGINT", stop);
   setInterval(async () => {
     if (!stopping && await run("container", ["exec", "mc-wizard-bedrock", "true"]) !== 0) {
-      await run("container", ["start", "mc-wizard-bedrock"], { stdio: ["ignore", log.fd, log.fd] });
+      await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
     }
   }, 10_000).unref();
 }
 
 async function start() {
+  await run(process.execPath, [path.join(ROOT, "scripts", "admin-service.mjs"), "start"], { stdio: "inherit" });
   if (await currentPid()) {
     console.log("MC Wizard supervisor is already running.");
     return 0;
@@ -133,6 +150,7 @@ async function start() {
 }
 
 async function stop() {
+  await run(process.execPath, [path.join(ROOT, "scripts", "admin-service.mjs"), "stop"], { stdio: "inherit" });
   const pid = await currentPid();
   if (!pid) {
     await rm(PID_FILE, { force: true });

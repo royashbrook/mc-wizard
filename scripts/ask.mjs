@@ -4,14 +4,15 @@ if (!question) {
   process.exit(1);
 }
 
-const wizardUrl = process.env.WIZARD_URL || "http://127.0.0.1:3000/v1/ask";
+const wizardUrl = process.env.WIZARD_URL
+  || `http://${process.env.HOST || "127.0.0.1"}:${process.env.PORT || 3000}/v1/ask`;
 const response = await fetch(wizardUrl, {
   method: "POST",
   headers: {
     authorization: `Bearer ${process.env.BRIDGE_TOKEN || "dev-only-change-me"}`,
     "content-type": "application/json",
   },
-  body: JSON.stringify({ player: "local-tester", question }),
+  body: JSON.stringify({ player: process.env.ASK_PLAYER || "local-tester", question }),
 });
 
 const result = await response.json();
@@ -21,5 +22,5 @@ if (!response.ok) {
 }
 console.log(result.answer);
 console.log(`\nmode: ${result.mode}`);
-if (result.action) console.log(`\naction: ${result.action.id}`);
+if (result.action) console.log(`\naction: ${result.action.type}:${result.action.id || result.action.plan?.title || "unnamed"}`);
 for (const source of result.sources || []) console.log(`source: ${source.title} — ${source.url}`);

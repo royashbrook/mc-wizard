@@ -2,17 +2,309 @@ import { createHmac } from "node:crypto";
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
+const REQUEST_ID = /^[a-zA-Z0-9_-]{1,64}$/;
+const ACTION_STATUSES = new Set(["pending", "started", "completed", "failed", "partial", "unknown"]);
+const PREFERENCE_DEPENDENCY_KINDS = new Set(["material", "proximity", "teleport"]);
+// Bump this when persisted dialogue from an older agent contract would teach the
+// current planner false capabilities or revive invalid projects.
+const BEHAVIOR_REVISION = 3;
+const MAX_TERMINAL_RESULTS = 32;
+const safeSequence = (value) => Number.isSafeInteger(value) && value >= 1 ? value : undefined;
+
+function safeDetail(value) {
+  if (typeof value !== "string") return undefined;
+  return value.replace(/[\u0000-\u001f\u007f]+/g, " ").trim().slice(0, 500) || undefined;
+}
+
+function safeResponseMode(value) {
+  return safeDetail(value)?.slice(0, 64);
+}
+
+function safePreferenceDependencies(value) {
+  if (!Array.isArray(value)) return undefined;
+  const dependencies = [...new Set(value.filter((kind) => PREFERENCE_DEPENDENCY_KINDS.has(kind)))].slice(0, 3);
+  return dependencies.length ? dependencies : undefined;
+}
+
+function safeFeedback(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)
+    || !Number.isInteger(value.grade) || value.grade < 1 || value.grade > 5) return undefined;
+  const note = safeDetail(value.note);
+  return { grade: value.grade, ...(note && { note }) };
+}
+
+function safeTerminalResult(requestId, value) {
+  if (!REQUEST_ID.test(requestId) || !value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  try {
+    const serialized = JSON.stringify(value);
+    if (serialized.length > 150_000) return undefined;
+    const parsed = JSON.parse(serialized);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizedTerminalResults(value) {
+  const normalized = Object.create(null);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return normalized;
+  for (const [requestId, result] of Object.entries(value).slice(-MAX_TERMINAL_RESULTS)) {
+    const safe = safeTerminalResult(requestId, result);
+    if (safe) normalized[requestId] = safe;
+  }
+  return normalized;
+}
+
+function saveTerminalResult(session, requestId, result) {
+  const safe = safeTerminalResult(requestId, result);
+  if (!safe) return false;
+  session.terminalResults = normalizedTerminalResults(session.terminalResults);
+  delete session.terminalResults[requestId];
+  session.terminalResults[requestId] = safe;
+  while (Object.keys(session.terminalResults).length > MAX_TERMINAL_RESULTS) {
+    delete session.terminalResults[Object.keys(session.terminalResults)[0]];
+  }
+  return true;
+}
+
+function persistedTurn(turn) {
+  let action = null;
+  if (turn?.action && typeof turn.action === "object" && !Array.isArray(turn.action)) {
+    try {
+      const value = JSON.parse(JSON.stringify(turn.action));
+      if (value && typeof value === "object" && !Array.isArray(value)) action = value;
+    } catch {}
+  }
+  let goal = null;
+  if (turn?.goal && typeof turn.goal === "object" && !Array.isArray(turn.goal)) {
+    try {
+      const value = JSON.parse(JSON.stringify(turn.goal));
+      if (value && typeof value === "object" && !Array.isArray(value)) goal = value;
+    } catch {}
+  }
+  const requestId = typeof turn?.requestId === "string" && REQUEST_ID.test(turn.requestId)
+    ? turn.requestId : undefined;
+  const goalId = typeof turn?.goalId === "string" && REQUEST_ID.test(turn.goalId)
+    ? turn.goalId : undefined;
+  const retryOfRequestId = typeof turn?.retryOfRequestId === "string" && REQUEST_ID.test(turn.retryOfRequestId)
+    ? turn.retryOfRequestId : undefined;
+  const status = action && ACTION_STATUSES.has(turn?.status) ? turn.status : action ? "unknown" : undefined;
+  const detail = action ? safeDetail(turn?.detail) : undefined;
+  const responseMode = safeResponseMode(turn?.responseMode);
+  const feedback = safeFeedback(turn?.feedback);
+  const requestSequence = safeSequence(turn?.requestSequence);
+  const preferenceDependencies = safePreferenceDependencies(turn?.preferenceDependencies);
+  return {
+    question: turn?.question,
+    answer: turn?.answer,
+    action,
+    ...(goal && { goal }),
+    ...(requestId && { requestId }),
+    ...(goalId && { goalId }),
+    ...(retryOfRequestId && { retryOfRequestId }),
+    ...(status && { status }),
+    ...(detail && { detail }),
+    ...(responseMode && { responseMode }),
+      ...(feedback && { feedback }),
+      ...(requestSequence && { requestSequence }),
+      ...(turn?.preferenceApplied === true && { preferenceApplied: true }),
+      ...(preferenceDependencies && { preferenceDependencies }),
+  };
+}
+
+function normalizedTurns(turns, minimumSequence = 0) {
+  let next = Math.max(minimumSequence, turns.reduce((maximum, turn) => (
+    Math.max(maximum, safeSequence(turn?.requestSequence) || 0)
+  ), 0));
+  return turns.map((turn) => {
+    const saved = persistedTurn(turn);
+    return saved.requestSequence ? saved : { ...saved, requestSequence: ++next };
+  }).sort((a, b) => a.requestSequence - b.requestSequence);
+}
+
+const unresolvedAction = (turn) => turn?.action
+  && ["pending", "started"].includes(turn.status);
+
+function trimTurns(turns, maxTurns) {
+  const recentStart = Math.max(0, turns.length - maxTurns);
+  return turns.filter((turn, index) => index >= recentStart || unresolvedAction(turn));
+}
+
+const latestSequence = (turns) => (Array.isArray(turns) ? turns : [])
+  .reduce((maximum, turn) => Math.max(maximum, turn.requestSequence || 0), 0);
+
+function reserveSequence(sequences, key, turns = []) {
+  const current = Math.max(sequences.get(key) || 0, latestSequence(turns));
+  if (current >= Number.MAX_SAFE_INTEGER) throw new Error("session request sequence exhausted");
+  const sequence = current + 1;
+  sequences.set(key, sequence);
+  return sequence;
+}
+
+function appendTurn(session, turn, maxTurns) {
+  const saved = persistedTurn(turn);
+  const turns = session.turns.filter((entry) => entry.requestSequence !== saved.requestSequence);
+  turns.push(saved);
+  turns.sort((a, b) => a.requestSequence - b.requestSequence);
+  session.turns = trimTurns(turns, maxTurns);
+}
+
+function updateAction(turns, requestId, status, detail) {
+  if (!REQUEST_ID.test(requestId) || !["started", "completed", "failed", "partial"].includes(status)) {
+    return { matched: false, updated: false };
+  }
+  const index = turns.findLastIndex((turn) => turn.action && turn.requestId === requestId);
+  if (index < 0) return { matched: false, updated: false };
+  const current = turns[index].status || "unknown";
+  if (current === status) return { matched: true, updated: false, status: current };
+  if (["completed", "failed", "partial"].includes(current)) {
+    return { matched: true, updated: false, status: current };
+  }
+  turns[index] = persistedTurn({ ...turns[index], status, detail });
+  return { matched: true, updated: true, status };
+}
+
+function feedbackBinding(turn, extra = {}) {
+  const goalId = turn.goalId || (turn.goal ? turn.requestId : undefined);
+  return {
+    matched: true,
+    requestId: turn.requestId,
+    ...(goalId && { goalId }),
+    question: turn.question,
+    answer: turn.answer,
+    action: turn.action,
+    ...(turn.goal && { goal: turn.goal }),
+    ...(turn.status && { status: turn.status }),
+    ...(turn.detail && { detail: turn.detail }),
+    ...(turn.responseMode && { responseMode: turn.responseMode }),
+    ...extra,
+  };
+}
+
+function updateFeedback(turns, requestId, grade, note) {
+  if (!REQUEST_ID.test(requestId) || !Number.isInteger(grade) || grade < 1 || grade > 5) {
+    return { matched: false, recorded: false, duplicate: false };
+  }
+  const index = turns.findLastIndex((turn) => turn.requestId === requestId);
+  if (index < 0) return { matched: false, recorded: false, duplicate: false };
+  const turn = turns[index];
+  if (turn.action && ["pending", "started", "unknown"].includes(turn.status)) {
+    return feedbackBinding(turn, { recorded: false, duplicate: false, pending: true });
+  }
+  const cleanNote = safeDetail(note);
+  if (turn.feedback && (turn.feedback.note || turn.feedback.grade >= 4 || !cleanNote)) {
+    return feedbackBinding(turn, {
+      recorded: false,
+      duplicate: true,
+      grade: turn.feedback.grade,
+      ...(turn.feedback.note && { note: turn.feedback.note }),
+    });
+  }
+  const feedback = safeFeedback({ grade, note: cleanNote });
+  turns[index] = persistedTurn({ ...turn, feedback });
+  return feedbackBinding(turns[index], {
+    recorded: true,
+    duplicate: false,
+    grade: feedback.grade,
+    ...(feedback.note && { note: feedback.note }),
+  });
+}
+
 export function createMemorySessionStore({ maxTurns = 12 } = {}) {
   const sessions = new Map();
+  const sequences = new Map();
   return {
     get(player, mode) {
       return sessions.get(`${mode}:${player}`)?.turns || [];
     },
     async set(player, mode, turns) {
-      sessions.set(`${mode}:${player}`, { turns: turns.slice(-maxTurns), updatedAt: Date.now() });
+      const key = `${mode}:${player}`;
+      const normalized = trimTurns(normalizedTurns(turns, sequences.get(key) || 0), maxTurns);
+      sessions.set(key, {
+        turns: normalized,
+        terminalResults: sessions.get(key)?.terminalResults || {},
+        updatedAt: Date.now(),
+      });
+      sequences.set(key, Math.max(sequences.get(key) || 0, latestSequence(normalized)));
+    },
+    reserve(player, mode) {
+      const key = `${mode}:${player}`;
+      return reserveSequence(sequences, key, sessions.get(key)?.turns);
+    },
+    invalidate(player, mode) {
+      const key = `${mode}:${player}`;
+      const next = Math.max(sequences.get(key) || 0, latestSequence(sessions.get(key)?.turns)) + 1;
+      sequences.set(key, next);
+      return next;
+    },
+    release(player, mode, requestSequence) {
+      const key = `${mode}:${player}`;
+      if (safeSequence(requestSequence) !== sequences.get(key)) return false;
+      sequences.set(key, latestSequence(sessions.get(key)?.turns));
+      return true;
+    },
+    isCurrent(player, mode, requestSequence) {
+      return safeSequence(requestSequence) === sequences.get(`${mode}:${player}`);
+    },
+    async appendIfCurrent(player, mode, turn) {
+      const key = `${mode}:${player}`;
+      const requestSequence = safeSequence(turn?.requestSequence);
+      if (!requestSequence || requestSequence !== sequences.get(key)) return false;
+      const session = sessions.get(key) || { turns: [], updatedAt: 0 };
+      appendTurn(session, { ...turn, requestSequence }, maxTurns);
+      session.updatedAt = Date.now();
+      sessions.set(key, session);
+      return true;
+    },
+    async append(player, mode, turn) {
+      const key = `${mode}:${player}`;
+      const session = sessions.get(key) || { turns: [], updatedAt: 0 };
+      const requestSequence = safeSequence(turn?.requestSequence)
+        || reserveSequence(sequences, key, session.turns);
+      sequences.set(key, Math.max(sequences.get(key) || 0, requestSequence));
+      appendTurn(session, { ...turn, requestSequence }, maxTurns);
+      session.updatedAt = Date.now();
+      sessions.set(key, session);
+    },
+    async updateAction(player, mode, result) {
+      const session = sessions.get(`${mode}:${player}`);
+      if (!session) return { matched: false, updated: false };
+      const outcome = updateAction(session.turns, result.requestId, result.status, result.detail);
+      if (outcome.updated) session.updatedAt = Date.now();
+      return outcome;
+    },
+    getActionResult(player, mode, requestId) {
+      const terminalResults = sessions.get(`${mode}:${player}`)?.terminalResults;
+      const result = terminalResults && Object.hasOwn(terminalResults, requestId)
+        ? terminalResults[requestId] : undefined;
+      return result ? structuredClone(result) : undefined;
+    },
+    async setActionResult(player, mode, requestId, result) {
+      const session = sessions.get(`${mode}:${player}`);
+      if (!session || !saveTerminalResult(session, requestId, result)) return false;
+      session.updatedAt = Date.now();
+      return true;
+    },
+    async clearActionResults(player, mode) {
+      const session = sessions.get(`${mode}:${player}`);
+      if (!session) return false;
+      session.terminalResults = {};
+      session.updatedAt = Date.now();
+      return true;
+    },
+    async recordFeedback(player, mode, { requestId, grade, note }) {
+      const session = sessions.get(`${mode}:${player}`);
+      if (!session) return { matched: false, recorded: false, duplicate: false };
+      const outcome = updateFeedback(session.turns, requestId, grade, note);
+      if (outcome.recorded) session.updatedAt = Date.now();
+      return outcome;
     },
     async delete(player, mode) {
-      return sessions.delete(`${mode}:${player}`);
+      const key = `${mode}:${player}`;
+      // Invalidate any in-flight turn that reserved the old sequence before
+      // deleting its history; otherwise it could append after a reconnect.
+      sequences.set(key, (sequences.get(key) || latestSequence(sessions.get(key)?.turns)) + 1);
+      return sessions.delete(key);
     },
   };
 }
@@ -27,10 +319,19 @@ export async function createFileSessionStore({
 } = {}) {
   if (!filePath) throw new Error("session file path is required");
   if (!salt || salt.length < 16) throw new Error("session salt must be at least 16 characters");
-  let data = { version: 1, sessions: {} };
+  let data = { version: 1, behaviorRevision: BEHAVIOR_REVISION, sessions: {} };
   try {
     const parsed = JSON.parse(await readFile(filePath, "utf8"));
-    if (parsed?.version === 1 && parsed.sessions && typeof parsed.sessions === "object") data = parsed;
+    if (parsed?.version === 1
+      && parsed.behaviorRevision === BEHAVIOR_REVISION
+      && parsed.sessions
+      && typeof parsed.sessions === "object") {
+      data = parsed;
+      for (const session of Object.values(data.sessions)) {
+        session.turns = Array.isArray(session?.turns) ? normalizedTurns(session.turns) : [];
+        session.terminalResults = normalizedTerminalResults(session?.terminalResults);
+      }
+    }
   } catch (error) {
     if (error.code !== "ENOENT") throw error;
   }
@@ -39,6 +340,8 @@ export async function createFileSessionStore({
     const playerHash = createHmac("sha256", salt).update(String(player)).digest("hex");
     return `${mode}:${playerHash}`;
   };
+  const sequences = new Map(Object.entries(data.sessions)
+    .map(([key, session]) => [key, latestSequence(session.turns)]));
   const prune = () => {
     const cutoff = now() - ttlMs;
     const entries = Object.entries(data.sessions)
@@ -50,7 +353,7 @@ export async function createFileSessionStore({
   let pendingWrite = Promise.resolve();
   const persist = () => {
     prune();
-    pendingWrite = pendingWrite.then(async () => {
+    pendingWrite = pendingWrite.catch(() => {}).then(async () => {
       await mkdir(dirname(filePath), { recursive: true });
       const temporary = `${filePath}.tmp`;
       await writeFile(temporary, `${JSON.stringify(data)}\n`, { mode: 0o600 });
@@ -66,14 +369,109 @@ export async function createFileSessionStore({
       return data.sessions[keyFor(player, mode)]?.turns || [];
     },
     async set(player, mode, turns) {
-      data.sessions[keyFor(player, mode)] = {
+      const key = keyFor(player, mode);
+      const normalized = trimTurns(normalizedTurns(turns, sequences.get(key) || 0), maxTurns);
+      data.sessions[key] = {
         updatedAt: now(),
-        turns: turns.slice(-maxTurns).map(({ question, answer }) => ({ question, answer })),
+        turns: normalized,
+        terminalResults: data.sessions[key]?.terminalResults || {},
       };
+      sequences.set(key, Math.max(sequences.get(key) || 0, latestSequence(normalized)));
       await persist();
     },
+    reserve(player, mode) {
+      const key = keyFor(player, mode);
+      return reserveSequence(sequences, key, data.sessions[key]?.turns);
+    },
+    invalidate(player, mode) {
+      const key = keyFor(player, mode);
+      const next = Math.max(sequences.get(key) || 0, latestSequence(data.sessions[key]?.turns)) + 1;
+      sequences.set(key, next);
+      return next;
+    },
+    release(player, mode, requestSequence) {
+      const key = keyFor(player, mode);
+      if (safeSequence(requestSequence) !== sequences.get(key)) return false;
+      sequences.set(key, latestSequence(data.sessions[key]?.turns));
+      return true;
+    },
+    isCurrent(player, mode, requestSequence) {
+      return safeSequence(requestSequence) === sequences.get(keyFor(player, mode));
+    },
+    async appendIfCurrent(player, mode, turn) {
+      const key = keyFor(player, mode);
+      const requestSequence = safeSequence(turn?.requestSequence);
+      if (!requestSequence || requestSequence !== sequences.get(key)) return false;
+      const session = data.sessions[key] || { turns: [], updatedAt: 0 };
+      appendTurn(session, { ...turn, requestSequence }, maxTurns);
+      session.updatedAt = now();
+      data.sessions[key] = session;
+      await persist();
+      if (requestSequence === sequences.get(key)) return true;
+      session.turns = session.turns.filter((entry) => entry.requestSequence !== requestSequence);
+      session.updatedAt = now();
+      await persist();
+      return false;
+    },
+    async append(player, mode, turn) {
+      const key = keyFor(player, mode);
+      const session = data.sessions[key] || { turns: [], updatedAt: 0 };
+      const requestSequence = safeSequence(turn?.requestSequence)
+        || reserveSequence(sequences, key, session.turns);
+      sequences.set(key, Math.max(sequences.get(key) || 0, requestSequence));
+      appendTurn(session, { ...turn, requestSequence }, maxTurns);
+      session.updatedAt = now();
+      data.sessions[key] = session;
+      await persist();
+    },
+    async updateAction(player, mode, result) {
+      const session = data.sessions[keyFor(player, mode)];
+      if (!session) return { matched: false, updated: false };
+      const outcome = updateAction(session.turns, result.requestId, result.status, result.detail);
+      if (outcome.updated) {
+        session.updatedAt = now();
+        await persist();
+      }
+      return outcome;
+    },
+    getActionResult(player, mode, requestId) {
+      const terminalResults = data.sessions[keyFor(player, mode)]?.terminalResults;
+      const result = terminalResults && Object.hasOwn(terminalResults, requestId)
+        ? terminalResults[requestId] : undefined;
+      return result ? structuredClone(result) : undefined;
+    },
+    async setActionResult(player, mode, requestId, result) {
+      const session = data.sessions[keyFor(player, mode)];
+      if (!session || !saveTerminalResult(session, requestId, result)) return false;
+      session.updatedAt = now();
+      await persist();
+      return true;
+    },
+    async clearActionResults(player, mode) {
+      const session = data.sessions[keyFor(player, mode)];
+      if (!session) return false;
+      session.terminalResults = {};
+      session.updatedAt = now();
+      await persist();
+      return true;
+    },
+    async recordFeedback(player, mode, { requestId, grade, note }) {
+      const session = data.sessions[keyFor(player, mode)];
+      if (!session) return { matched: false, recorded: false, duplicate: false };
+      const outcome = updateFeedback(session.turns, requestId, grade, note);
+      if (outcome.recorded) {
+        session.updatedAt = now();
+        await persist();
+      }
+      return outcome;
+    },
     async delete(player, mode) {
-      const deleted = delete data.sessions[keyFor(player, mode)];
+      const key = keyFor(player, mode);
+      const sequence = sequences.get(key) || latestSequence(data.sessions[key]?.turns);
+      const deleted = delete data.sessions[key];
+      // Keep a newer in-memory sequence so an old async reply cannot recreate
+      // a session that this deletion intentionally removed.
+      sequences.set(key, sequence + 1);
       if (deleted) await persist();
       return deleted;
     },

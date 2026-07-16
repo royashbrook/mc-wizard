@@ -1,0 +1,17 @@
+{
+  "format_version": 2,
+  "header": {
+    "name": "MC Wizard Originals",
+    "description": "An original astral workshop wizard skin for MC Wizard.",
+    "uuid": "c27bdba7-704c-4dd8-bb12-320ae13289e3",
+    "version": [1, 0, 0],
+    "min_engine_version": [1, 21, 0]
+  },
+  "modules": [
+    {
+      "type": "skin_pack",
+      "uuid": "dfce3b49-1249-454d-ac62-ec77e85861a1",
+      "version": [1, 0, 0]
+    }
+  ]
+}

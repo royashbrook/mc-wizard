@@ -1,0 +1,212 @@
+[
+  {
+    "id": "live-greeting",
+    "observed": "success",
+    "question": "hey",
+    "history": [],
+    "expected": { "type": null }
+  },
+  {
+    "id": "live-cat-question",
+    "observed": "success",
+    "question": "tell me about cats",
+    "history": [],
+    "expected": { "type": null }
+  },
+  {
+    "id": "live-skeleton-damage-question",
+    "observed": "success",
+    "question": "how many hearts of damage do skeletons do to me?",
+    "history": [],
+    "expected": { "type": null }
+  },
+  {
+    "id": "exact-tapered-tower",
+    "observed": "success",
+    "question": "build a 7x7 tower around me where i'm in the center. make it tapered and 20 blocks tall at it's peak",
+    "history": [],
+    "expected": { "type": "build_structure", "kind": "tower", "mode": "new", "width": 7, "depth": 7, "height": 20 }
+  },
+  {
+    "id": "decorate-existing-tower",
+    "observed": "failure-built-a-second-tower",
+    "question": "wow that was great. can you decorate it with some more things on the inside and outside?",
+    "history": [
+      {
+        "question": "build a 7x7 tower around me where i'm in the center. make it tapered and 20 blocks tall at it's peak",
+        "answer": "7x7 tower is complete."
+      }
+    ],
+    "expected": { "type": "build_structure", "kind": "tower", "mode": "modify", "width": 7, "depth": 7, "height": 20, "feature": "decorations" }
+  },
+  {
+    "id": "splash-potion-rain",
+    "observed": "failure-treated-as-weather",
+    "question": "can you make it rain splash potions?",
+    "history": [],
+    "expected": { "type": "potion_rain" }
+  },
+  {
+    "id": "clarified-splash-potion-rain",
+    "observed": "failure-treated-as-weather-chatter",
+    "question": "yes, but i want you to simulate raining, but with splash postions falling everywhere from the sky",
+    "history": [
+      { "question": "can you make it rain splash potions?", "answer": "Done—I've changed rain weather." }
+    ],
+    "expected": { "type": "potion_rain" }
+  },
+  {
+    "id": "automatic-wool-farm",
+    "observed": "failure-built-a-wood-sculpture",
+    "question": "make me a automatic wool farm using sheep",
+    "history": [
+      { "question": "build a 7x7 tower that is 20 blocks tall", "answer": "7x7 tower is complete." }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "wool-farm-correction",
+    "observed": "failure-promised-without-action",
+    "question": "no i need a farm that makes wool. so like it would have sheep who eat grass and grow wool and automatically it would shear the sheep sometimes and pickup the wool automatically.",
+    "history": [
+      { "question": "make me an automatic wool farm using sheep", "answer": "7x7 wool farm is complete." }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "live-dispenser-wool-correction",
+    "observed": "partial-correct-plan-promised-without-action",
+    "question": "you should be able to use a dispensor or something i think to shear the sheep automatically. you can lookup online how to make it",
+    "history": [
+      { "question": "make me a automatic wool farm using sheep", "answer": "I built the wrong sculpture." },
+      { "question": "no i need a farm that makes wool. so like it would have sheep who eat grass and grow wool and automatically it would shear the sheep sometimes and pickup the wool automatically.", "answer": "I cannot automate shearing.", "action": null }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "live-ok-do-it-wool-farm",
+    "observed": "failure-repeated-promise-without-action",
+    "question": "ok do it",
+    "history": [
+      { "question": "make me a automatic wool farm using sheep", "answer": "I built the wrong sculpture." },
+      { "question": "you should be able to use a dispensor or something i think to shear the sheep automatically. you can lookup online how to make it", "answer": "I'll build the complete automatic sheep wool farm beside your tower.", "action": null }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "resume-promised-wool-farm",
+    "observed": "failure-repeated-promise-without-action",
+    "question": "ok go",
+    "history": [
+      { "question": "make me an automatic wool farm using sheep", "answer": "I made the wrong kind of farm." },
+      { "question": "use a dispenser with shears and collect the wool automatically", "answer": "I'll build the complete automatic sheep wool farm beside your tower.", "action": null }
+    ],
+    "expected": { "type": "place_blueprint", "id": "automatic_wool_farm" }
+  },
+  {
+    "id": "fancy-castle",
+    "observed": "success",
+    "question": "build a 20x20 castle right here. make it fancy",
+    "history": [],
+    "expected": { "type": "build_structure", "kind": "castle", "mode": "new", "width": 20, "depth": 20, "height": 9 }
+  },
+  {
+    "id": "upgrade-existing-castle",
+    "observed": "failure-built-a-separate-wood-structure",
+    "question": "can you give it some rooms inside, a second floor, and some guard towers on the corners. also, place some villagers inside trapped in key spots so it looks like they work/live here.",
+    "history": [
+      { "question": "build a 20x20 castle right here. make it fancy", "answer": "20x20 castle is complete." }
+    ],
+    "expected": { "type": "build_structure", "kind": "castle", "mode": "modify", "width": 20, "depth": 20, "height": 13, "features": ["rooms", "second_floor", "towers"], "entity": "minecraft:villager_v2" }
+  },
+  {
+    "id": "live-rainbow-castle",
+    "observed": "failure-built-right-size-in-wrong-colors",
+    "question": "build a 17x26 rainbow castle with 3 villagers and a goat in it",
+    "history": [],
+    "expected": { "type": "build_structure", "kind": "castle", "mode": "new", "width": 17, "depth": 26, "height": 9, "features": ["rainbow"], "entityCounts": { "minecraft:villager_v2": 3, "minecraft:goat": 1 } }
+  },
+  {
+    "id": "live-rainbow-castle-color-correction",
+    "observed": "failure-thought-forever-then-did-nothing",
+    "question": "the colors are wrong. fix the colors",
+    "replayHistory": true,
+    "history": [
+      { "question": "build a 17x26 rainbow castle with 3 villagers and a goat in it", "answer": "The castle is complete." }
+    ],
+    "expected": { "type": "build_structure", "kind": "castle", "mode": "modify", "width": 17, "depth": 26, "height": 9, "features": ["rainbow"], "blockIds": ["minecraft:red_concrete", "minecraft:orange_concrete", "minecraft:yellow_concrete", "minecraft:lime_concrete", "minecraft:light_blue_concrete", "minecraft:blue_concrete", "minecraft:purple_concrete"] }
+  },
+  {
+    "id": "live-rainbow-castle-compound-upgrade",
+    "observed": "failure-thought-three-times-then-stopped",
+    "question": "but it's not rainbow colored. make it taller, add stairs so we can get to another floor and add some rooms, a moat filled with lava, a redstone powered bridge, and several iron golem guards around.",
+    "replayHistory": true,
+    "history": [
+      { "question": "build a 17x26 rainbow castle with 3 villagers and a goat in it", "answer": "The castle is complete." }
+    ],
+    "expected": { "type": "build_structure", "kind": "castle", "mode": "modify", "width": 17, "depth": 26, "height": 13, "features": ["rainbow", "rooms", "second_floor", "walkway"], "blockIds": ["minecraft:lava", "minecraft:polished_blackstone_bricks", "minecraft:redstone_block", "minecraft:redstone_lamp"], "entityCounts": { "minecraft:villager_v2": 3, "minecraft:goat": 1, "minecraft:iron_golem": 4 } }
+  },
+  {
+    "id": "live-light-up-refined-castle",
+    "observed": "failure-thought-three-times-then-stopped",
+    "question": "it's too dark in the castle. light it up",
+    "replayHistory": true,
+    "history": [
+      { "question": "build a 17x26 rainbow castle with 3 villagers and a goat in it", "answer": "The castle is complete." },
+      { "question": "but it's not rainbow colored. make it taller, add stairs so we can get to another floor and add some rooms, a moat filled with lava, a redstone powered bridge, and several iron golem guards around.", "answer": "The castle upgrade is complete." }
+    ],
+    "expected": { "type": "build_structure", "kind": "castle", "mode": "modify", "width": 17, "depth": 26, "height": 13, "features": ["lighting"], "blockIds": ["minecraft:sea_lantern"] }
+  },
+  {
+    "id": "kid-portal-block-typo",
+    "observed": "failure-generic-active-project-response",
+    "question": "give me a portal blocl",
+    "history": [],
+    "expected": { "type": "give_items", "itemCounts": { "minecraft:obsidian": 10, "minecraft:flint_and_steel": 1 } }
+  },
+  {
+    "id": "kid-nether-portal-item",
+    "observed": "failure-generic-active-project-response",
+    "question": "give me a nether portal item",
+    "history": [],
+    "expected": { "type": "give_items", "itemCounts": { "minecraft:obsidian": 10, "minecraft:flint_and_steel": 1 } }
+  },
+  {
+    "id": "kid-default-mansion",
+    "observed": "partial-built-ordinary-9x9-house",
+    "question": "build me a mansion",
+    "history": [],
+    "expected": { "type": "build_structure", "kind": "mansion", "mode": "new", "width": 21, "depth": 17, "height": 10, "features": ["rooms", "second_floor", "decorations"] }
+  },
+  {
+    "id": "kid-explicit-mansion",
+    "observed": "partial-renamed-request-to-house",
+    "question": "build me a 20x10x20 block mansion",
+    "history": [],
+    "expected": { "type": "build_structure", "kind": "mansion", "mode": "new", "width": 20, "depth": 10, "height": 20, "features": ["rooms", "second_floor", "decorations"] }
+  },
+  {
+    "id": "live-build-unlit-portal",
+    "observed": "failure-always-lit-the-frame",
+    "question": "build another nether portal. we'll call that portal b",
+    "history": [],
+    "expected": { "type": "build_machine", "kind": "nether portal", "mode": "new", "placementCount": 14, "interactionCount": 0 }
+  },
+  {
+    "id": "live-switch-off-portal",
+    "observed": "failure-refused-to-break-one-portal-block",
+    "question": "turn off the portal",
+    "replayHistory": true,
+    "history": [
+      { "question": "build and light a nether portal", "answer": "The lit portal is complete." }
+    ],
+    "expected": { "type": "build_machine", "kind": "nether portal", "mode": "modify", "placementCount": 16, "interactionCount": 0, "lastPlacementAction": "break" }
+  },
+  {
+    "id": "live-return-to-overworld",
+    "observed": "failure-not-classified-after-nether-arrival-failed",
+    "question": "well we need to get back. so take us back to the overworld",
+    "history": [],
+    "expected": { "type": "dimension_travel", "destination": "overworld" }
+  }
+]

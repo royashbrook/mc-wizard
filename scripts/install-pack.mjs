@@ -1,12 +1,25 @@
-import { cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { updateServerProperties } from "../src/server-control.mjs";
 
 const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const PACK_ID = "48450204-0c54-4c3b-855a-c76eda67275d";
 const RESOURCE_PACK_ID = "5dd80b07-b583-4bb3-979c-41c25ce274d8";
 const MODULE_ID = "4e8790fe-18dc-46d1-aa31-ec78a924b717";
-const VERSION = [0, 1, 0];
+const manifest = JSON.parse(await readFile(
+  path.join(ROOT, "bedrock", "behavior_packs", "mc_wizard", "manifest.json"),
+  "utf8",
+));
+const VERSION = manifest.header.version;
+const resourceManifest = JSON.parse(await readFile(
+  path.join(ROOT, "bedrock", "resource_packs", "mc_wizard", "manifest.json"),
+  "utf8",
+));
+const RESOURCE_VERSION = resourceManifest.header.version;
+if (![VERSION, RESOURCE_VERSION].every((version) => Array.isArray(version) && version.length === 3)) {
+  throw new Error("Pack manifests must have three-part header versions");
+}
 
 const [serverDirectory, worldName, requestedUrl] = process.argv.slice(2);
 if (!serverDirectory || !worldName) {
@@ -17,6 +30,7 @@ if (!serverDirectory || !worldName) {
 const serverRoot = path.resolve(serverDirectory);
 const worldsRoot = path.join(serverRoot, "worlds");
 const worldRoot = path.resolve(worldsRoot, worldName);
+const configTarget = path.join(serverRoot, "config", MODULE_ID);
 if (path.basename(worldName) !== worldName || !worldRoot.startsWith(`${worldsRoot}${path.sep}`)) {
   console.error("World name must be a folder directly inside the BDS worlds directory.");
   process.exit(1);
@@ -30,14 +44,32 @@ try {
   process.exit(1);
 }
 
-const brainUrl = requestedUrl || process.env.WIZARD_URL || "http://127.0.0.1:3000/v1/ask";
+let existingBrainUrl;
+try {
+  const existingVariables = JSON.parse(await readFile(path.join(configTarget, "variables.json"), "utf8"));
+  existingBrainUrl = existingVariables.mc_wizard_url;
+} catch (error) {
+  if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+}
+const lanBrainUrl = process.env.MC_WIZARD_LAN_IP
+  ? `http://${process.env.MC_WIZARD_LAN_IP}:3000/v1/ask`
+  : undefined;
+const brainUrl = requestedUrl
+  || process.env.WIZARD_URL
+  || lanBrainUrl
+  || existingBrainUrl
+  || "http://127.0.0.1:3000/v1/ask";
 const parsedUrl = new URL(brainUrl);
 if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new Error("Brain URL must use http or https");
 const token = process.env.BRIDGE_TOKEN || "dev-only-change-me";
 const e2eEnabled = process.env.MC_WIZARD_E2E === "1";
 const e2eRun = (process.env.MC_WIZARD_E2E_RUN || "").trim();
+const e2eScope = (process.env.MC_WIZARD_E2E_SCOPE || "full").trim();
 if (e2eEnabled && !e2eRun) {
   throw new Error("MC_WIZARD_E2E_RUN is required when MC_WIZARD_E2E=1");
+}
+if (!new Set(["full", "machines", "commands", "arbitrary", "portal", "travel-rollback", "city", "child", "refinement", "feedback", "farms", "kelp", "delivery"]).has(e2eScope)) {
+  throw new Error("MC_WIZARD_E2E_SCOPE must be full, machines, commands, arbitrary, portal, travel-rollback, city, child, refinement, feedback, farms, kelp, or delivery");
 }
 const loopbackBrain = parsedUrl.hostname === "localhost"
   || parsedUrl.hostname === "[::1]"
@@ -47,7 +79,6 @@ if (!loopbackBrain && (token === "dev-only-change-me" || token.length < 24)) {
 }
 const packTarget = path.join(serverRoot, "behavior_packs", "mc_wizard");
 const resourcePackTarget = path.join(serverRoot, "resource_packs", "mc_wizard");
-const configTarget = path.join(serverRoot, "config", MODULE_ID);
 await mkdir(path.dirname(packTarget), { recursive: true });
 await mkdir(configTarget, { recursive: true });
 await cp(path.join(ROOT, "bedrock", "behavior_packs", "mc_wizard"), packTarget, {
@@ -80,13 +111,27 @@ try {
   if (error.code !== "ENOENT") throw error;
 }
 const existingResourcePack = worldResourcePacks.find((pack) => pack.pack_id === RESOURCE_PACK_ID);
-if (existingResourcePack) existingResourcePack.version = VERSION;
-else worldResourcePacks.push({ pack_id: RESOURCE_PACK_ID, version: VERSION });
+if (existingResourcePack) existingResourcePack.version = RESOURCE_VERSION;
+else worldResourcePacks.push({ pack_id: RESOURCE_PACK_ID, version: RESOURCE_VERSION });
 await writeFile(worldResourcePacksFile, `${JSON.stringify(worldResourcePacks, null, 2)}\n`);
+
+const serverPropertiesFile = path.join(serverRoot, "server.properties");
+let serverProperties = "";
+try {
+  serverProperties = await readFile(serverPropertiesFile, "utf8");
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+await writeFile(
+  serverPropertiesFile,
+  updateServerProperties(serverProperties, { "texturepack-required": true }),
+  { mode: 0o600 },
+);
 
 await writeFile(path.join(configTarget, "permissions.json"), `${JSON.stringify({
   allowed_modules: [
     "@minecraft/server",
+    "@minecraft/server-ui",
     "@minecraft/server-admin",
     "@minecraft/server-net",
     "@minecraft/server-gametest",
@@ -104,13 +149,16 @@ await writeFile(path.join(configTarget, "variables.json"), `${JSON.stringify({
   mc_wizard_url: brainUrl,
   mc_wizard_e2e: e2eEnabled,
   mc_wizard_e2e_run: e2eRun,
+  mc_wizard_e2e_scope: e2eScope,
 }, null, 2)}\n`);
-await writeFile(path.join(configTarget, "secrets.json"), `${JSON.stringify({
+const secretsFile = path.join(configTarget, "secrets.json");
+await writeFile(secretsFile, `${JSON.stringify({
   mc_wizard_authorization: `Bearer ${token}`,
-}, null, 2)}\n`);
+}, null, 2)}\n`, { mode: 0o600 });
+await chmod(secretsFile, 0o600);
 
 console.log(`Installed MC Wizard in ${serverRoot}`);
-console.log(`Activated behavior and costume resource packs for world: ${worldName}`);
+console.log(`Activated required behavior and appearance resource packs for world: ${worldName}`);
 console.log(`Brain endpoint: ${brainUrl}`);
 if (token === "dev-only-change-me") console.warn("Using the development bridge token; change it before exposing the service.");
 console.warn("The world must already have the Beta APIs experiment enabled.");

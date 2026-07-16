@@ -1,0 +1,12 @@
+{
+  "serialize_name": "mc_wizard",
+  "localization_name": "mc_wizard",
+  "skins": [
+    {
+      "localization_name": "astral_workshop_wizard",
+      "geometry": "geometry.humanoid.custom",
+      "texture": "mc_wizard.png",
+      "type": "free"
+    }
+  ]
+}

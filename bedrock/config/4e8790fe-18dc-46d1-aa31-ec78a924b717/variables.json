@@ -1,5 +1,6 @@
 {
   "mc_wizard_url": "http://host.docker.internal:3000/v1/ask",
   "mc_wizard_e2e": false,
-  "mc_wizard_e2e_run": ""
+  "mc_wizard_e2e_run": "",
+  "mc_wizard_e2e_scope": "full"
 }
