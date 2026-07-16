@@ -166,7 +166,7 @@ The embodiment does not need a second Xbox/Microsoft account. It requires a Beta
 
 Bedrock's Script API cannot pass classic PNG pixels to `SimulatedPlayer.setSkin`; its documented `PlayerSkinData` contains only Character Creator pieces, arm size, and skin color. The required world resource pack therefore uses the official player render path to map only the exact `MC Wizard` name to Astral Workshop Wizard. Every other player continues through `Texture.default`, preserving their own selected skin. The pack version is bumped when this path changes; the standalone installer and managed local starts both refresh the world's pack assignment and enforce `texturepack-required=true`, including for worlds initialized by older builds. The checked-in `player.entity.json` is based on Mojang's current Bedrock sample and must be refreshed when the pinned Bedrock minor version changes.
 
-After a server restart, reconnect from an iPad and confirm the resource-pack download, Astral Workshop skin, normal walking/holding animations, and the child's own unchanged skin. `wiz, copy my skin` remains a diagnostic for Character Creator data; it is not the classic-skin installation path.
+The iPad join/rejoin acceptance passed for the forced resource-pack download and Astral Workshop Wizard skin. `wiz, copy my skin` remains a diagnostic for Character Creator data; as expected, it did not copy a classic Steve skin and is not the classic-skin installation path.
 
 ![Astral Workshop Wizard skin preview](docs/assets/mc-wizard-skin-preview.png)
 
@@ -356,7 +356,7 @@ Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not 
 
 ## Known limits of this spike
 
-- The live iPad test verified the visible player entity, chat, AI books, and basic mechanics. The custom wand and T-flip-flop's real-client copper-bulb transition still need a quick iPad visual check. The fitted costume was removed after testing because it obscured the player model.
+- The live iPad test verified the visible player entity, Astral Workshop Wizard skin, chat, AI books, and basic mechanics. The custom wand and T-flip-flop's real-client copper-bulb transition still need a quick iPad visual check. The fitted costume was removed after testing because it obscured the player model.
 - The T flip-flop, calculator, command lessons, and validated plans are transactional and undoable. They require bounded clear areas, reject occupied/protected overlaps, and roll back on failure or disconnect.
 - The current documented Script API cannot safely program arbitrary command-block text. Prepared lesson definitions make the Wizard physically place the command block and button, then tell the child exactly what to paste; they deliberately do not `/structure load` a prebuilt result.
 - The simulated player attempts normal placement and interaction first. Large surfaces use bounded fill operations, and a rejected Bedrock placement can be repaired directly after visible player attempts; therefore the current runtime does not guarantee that every final block was accepted through the player-placement API.
@@ -370,7 +370,7 @@ MC Wizard is released under the [MIT License](./LICENSE). Microsoft Minecraft do
 
 ## Next proof points
 
-1. Complete the remaining iPad visual checks for the wand and real-client copper-bulb transition.
+1. Complete the remaining iPad visual checks for the wand and real-client copper-bulb transition; the Wizard skin itself is accepted.
 2. Add richer project-region observation—or a visual QA model—without exposing arbitrary world commands.
 3. Prefer a direct provider API for the primary runtime; keep local CLI providers as subscription-backed fallbacks.
 4. Add a scheduled world-backup restore drill for the explicitly open private-LAN server.

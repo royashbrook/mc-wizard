@@ -152,6 +152,16 @@ test("dimension travel is a validated in-world capability", () => {
   assert.match(wizardSkillPrompt(), /do not build a portal-shaped structure as a substitute/i);
 });
 
+test("surface and nearest-village travel are validated in-world capabilities", () => {
+  for (const destination of ["surface", "nearest_village"]) {
+    const action = { type: "local_travel", version: 1, destination };
+    assert.deepEqual(allowedWizardAction(action), action);
+  }
+  assert.equal(allowedWizardAction({ type: "local_travel", version: 1, destination: "nearest_city" }), null);
+  assert.match(wizardSkillPrompt(), /destination=surface/i);
+  assert.match(wizardSkillPrompt(), /destination=nearest_village/i);
+});
+
 test("trusted-family Bedrock commands allow every Minecraft target and admin action", () => {
   const action = { type: "run_commands", version: 1, commands: ["effect @s night_vision 999999 0 true"] };
   assert.deepEqual(allowedWizardAction(action), action);
@@ -228,6 +238,7 @@ test("JSON response schema exposes goal, travel, and command contracts", async (
   assert.ok(schema.properties.goal);
   const actions = schema.properties.action.anyOf;
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "dimension_travel"));
+  assert.ok(actions.some((entry) => entry.properties?.type?.const === "local_travel"));
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "run_commands"));
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "place_area_torches"));
   const program = actions.find((entry) => entry.properties?.type?.const === "execute_program");

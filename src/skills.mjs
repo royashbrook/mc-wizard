@@ -68,6 +68,11 @@ export const WIZARD_SKILLS = [
     action: { type: "dimension_travel", version: 1, destination: "nether" },
   },
   {
+    name: "travel_to_local_destination",
+    description: "Immediately move the requesting player and MC Wizard to a safe Overworld destination. Use destination=surface for requests to escape underground or reach the Overworld surface, and destination=nearest_village for requests to find or teleport to the nearest generated village. Do not substitute a command or explanation.",
+    action: { type: "local_travel", version: 1, destination: "surface" },
+  },
+  {
     name: "cast_splash_potion_rain",
     description: "Create a bounded shower of falling splash-potion projectiles around the player. Use this for imaginative requests to make splash potions rain from the sky; do not substitute ordinary weather rain.",
     action: { type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 },
@@ -182,6 +187,10 @@ export function allowedWizardAction(value) {
   if (value?.type === "dimension_travel") {
     return value.version === 1 && ["overworld", "nether", "the_end"].includes(value.destination)
       ? { type: "dimension_travel", version: 1, destination: value.destination } : null;
+  }
+  if (value?.type === "local_travel") {
+    return value.version === 1 && ["surface", "nearest_village"].includes(value.destination)
+      ? { type: "local_travel", version: 1, destination: value.destination } : null;
   }
   if (value?.type === "potion_rain" && value.version === 1) {
     const radius = Math.min(12, Math.max(3, Math.floor(Number(value.radius) || 8)));
