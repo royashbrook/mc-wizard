@@ -17,6 +17,7 @@ import { createServerControl } from "./server-control.mjs";
 import { normalizeRuntimeStep } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
 import {
   requesterCommand,
+  locateBedrockStructure,
   runProcess,
   sendBedrockCommand,
   validateMinecraftCommand,
@@ -48,6 +49,15 @@ function worldVector(value) {
     z: finiteInt(value.z, -30_000_000, 30_000_000),
   };
   return Object.values(vector).every(Number.isInteger) ? vector : undefined;
+}
+
+export function validateLocateBody(body) {
+  const player = typeof body?.player === "string" ? body.player.trim() : "";
+  const origin = worldVector({ x: body?.origin?.x, y: 80, z: body?.origin?.z });
+  if (!player || player.length > 32) throw Object.assign(new Error("player must be 1-32 characters"), { status: 400 });
+  if (!origin) throw Object.assign(new Error("origin must contain bounded integer x and z coordinates"), { status: 400 });
+  if (body.structure !== "village") throw Object.assign(new Error("structure must be village"), { status: 400 });
+  return { player, origin: { x: origin.x, z: origin.z }, structure: "village" };
 }
 
 function structurePoint(value, dimensions) {
@@ -487,6 +497,7 @@ export function createHttpServer({
   maxConcurrent = 4,
   cooldownMs = 1_500,
   executeServerCommand,
+  locateStructure,
   serverControl,
   logger = console,
 }) {
@@ -548,6 +559,32 @@ export function createHttpServer({
       } catch (error) {
         if (!error.status || error.status >= 500) logger.error(`[server-console] ${error.stack || error}`);
         sendJson(response, error.status || 500, { error: error.status ? error.message : "server command failed" });
+      }
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/v1/locate") {
+      if (!authorized(request, token)) {
+        sendJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!locateStructure) {
+        sendJson(response, 503, { error: "structure locator is unavailable" });
+        return;
+      }
+      try {
+        const { origin, structure } = validateLocateBody(await readJson(request));
+        const location = await locateStructure({ ...origin, structure });
+        logger.log(`[mc-wizard] located ${structure} for local travel`);
+        sendJson(response, 200, { structure, location });
+      } catch (error) {
+        if (error.code !== "STRUCTURE_NOT_FOUND" && (!error.status || error.status >= 500)) {
+          logger.error(`[server-locate] ${error.stack || error}`);
+        }
+        if (error.code === "STRUCTURE_NOT_FOUND") {
+          sendJson(response, 404, { error: error.message, code: "not_found" });
+        } else {
+          sendJson(response, error.status || 503, { error: error.status ? error.message : "structure locate failed" });
+        }
       }
       return;
     }
@@ -757,7 +794,10 @@ export async function startServer({ env = process.env, logger = console } = {}) 
   const cooldownMs = Math.min(Math.max(Number(env.REQUEST_COOLDOWN_MS) || 1_500, 0), 60_000);
   const server = createHttpServer({
     wizard, corpus, token, interactionLog, cooldownMs, logger,
-    executeServerCommand: (command) => sendBedrockCommand(runProcess, command),
+    executeServerCommand: (command) => sendBedrockCommand(runProcess, command, env.BEDROCK_CONTAINER_NAME),
+    locateStructure: (request) => locateBedrockStructure(runProcess, {
+      ...request, containerName: env.BEDROCK_CONTAINER_NAME,
+    }),
     serverControl: createServerControl({ logger }),
   });
   await new Promise((resolve, reject) => {

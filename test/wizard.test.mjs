@@ -2800,7 +2800,8 @@ test("serves a loopback admin desk and sends console text without a shell", asyn
   const consoleScript = await readFile(new URL("../src/bedrock-console.mjs", import.meta.url), "utf8");
   assert.match(adminScript, /MC Wizard Operator Desk/);
   assert.match(adminScript, /import \{ runProcess as run, sendBedrockCommand, validateMinecraftCommand \} from "\.\/bedrock-console\.mjs"/);
-  assert.match(consoleScript, /\["exec", "mc-wizard-bedrock", "send-command", command\]/);
+  assert.match(consoleScript, /containerName = "mc-wizard-bedrock"/);
+  assert.match(consoleScript, /\["exec", containerName, "send-command", command\]/);
   assert.match(consoleScript, /ROSETTA_SEND_SCRIPT/);
   assert.match(adminScript, /Admin panel is loopback-only/);
   assert.match(adminScript, /setInterval\(loadLogs,4000\)/);

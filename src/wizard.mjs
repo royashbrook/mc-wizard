@@ -414,6 +414,10 @@ function defaultGoal(question, action) {
   let successCriteria = "The requested result exists nearby, works as requested, and the player is satisfied with it.";
   if (action?.type === "dimension_travel") {
     successCriteria = `The requesting player and nearby players are safely present in the ${action.destination}.`;
+  } else if (action?.type === "local_travel") {
+    successCriteria = action.destination === "nearest_village"
+      ? "The requesting player and MC Wizard are safely on the surface at the nearest village."
+      : "The requesting player and MC Wizard are safely above ground on the Overworld surface.";
   } else if (action?.type === "world_control") {
     successCriteria = "The live world time and weather match the player's request.";
   } else if (action?.type === "give_items") {
@@ -1473,6 +1477,24 @@ function dimensionTravelAction(question) {
   return destination ? allowedWizardAction({ type: "dimension_travel", version: 1, destination }) : null;
 }
 
+function localTravelAction(question) {
+  const direct = String(question).trim()
+    .replace(/^(?:(?:hey|hi|okay|ok)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "")
+    .replace(/^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?/i, "");
+  const travelVerb = /\b(?:bring|find|go|move|send|take|teleport|transport|tp)\b/i.test(direct);
+  const requestsVillage = /\b(?:nearest|closest)\s+village\b/i.test(direct)
+    && (travelVerb || /\b(?:get|lead)\s+(?:me|us)\b/i.test(direct));
+  if (requestsVillage) {
+    return allowedWizardAction({ type: "local_travel", version: 1, destination: "nearest_village" });
+  }
+  const requestsSurface = /\b(?:surface|above\s*ground|top\s+of\s+(?:the\s+)?(?:ground|land)|topside)\b/i.test(direct)
+    || /\b(?:up|out)\s+(?:on|onto|to)\s+(?:the\s+)?(?:ground|land)\b/i.test(direct);
+  if (requestsSurface && (travelVerb || /\b(?:get|lead)\s+(?:me|us)\b/i.test(direct))) {
+    return allowedWizardAction({ type: "local_travel", version: 1, destination: "surface" });
+  }
+  return null;
+}
+
 const LOCAL_EFFECTS = [
   [/\bnight\s*vision\b/i, "night_vision"],
   [/\bfire\s+resistance\b/i, "fire_resistance"],
@@ -1752,6 +1774,8 @@ export function classifyAction(question, history = []) {
   }
   const admin = trustedAdminAction(question);
   if (admin) return admin;
+  const localTravel = localTravelAction(question);
+  if (localTravel) return localTravel;
   const command = commandAction(question);
   if (command) return command;
   const portal = netherPortalAction(question, history);
@@ -1903,6 +1927,10 @@ function localAnswer(question, hits, action) {
   if (action?.type === "dimension_travel") {
     const destination = action.destination === "the_end" ? "the End" : `the ${action.destination}`;
     return `Stay close—I'll take you and the nearby players safely to ${destination} now.`;
+  }
+  if (action?.type === "local_travel") {
+    const destination = action.destination === "nearest_village" ? "the nearest village" : "the surface";
+    return `Follow my wand—I’ll find safe ground and take us to ${destination} now.`;
   }
   if (action?.type === "potion_rain") {
     return `Wands up! I’ll shower this area with splash potions for ${action.durationSeconds} seconds—stand back and look skyward.`;
@@ -3084,6 +3112,7 @@ function providerActionMatchesRequest(action, question, history = [], {
   }
   if (!classified || classified.type !== action.type) return false;
   if (action.type === "dimension_travel") return action.destination === classified.destination;
+  if (action.type === "local_travel") return action.destination === classified.destination;
   if (action.type === "world_control") return JSON.stringify(action) === JSON.stringify(classified);
   if (action.type === "potion_rain") return true;
   return JSON.stringify(action) === JSON.stringify(classified);
@@ -3091,13 +3120,13 @@ function providerActionMatchesRequest(action, question, history = [], {
 
 const MAX_AUTOMATIC_GOAL_ACTIONS = 6;
 const EXECUTOR_VERIFIED_ACTION_TYPES = new Set([
-  "dimension_travel", "give_items", "place_area_torches",
+  "dimension_travel", "local_travel", "give_items", "place_area_torches",
   "potion_rain", "run_commands", "world_control",
 ]);
 const GOAL_REVIEW_FEEDBACK = "Fix this same active build so every success criterion is observable in the world.";
 const RETRYABLE_ACTION_TYPES = new Set([
   "place_blueprint", "build_machine", "build_structure", "build_plan",
-  "dimension_travel", "world_control", "potion_rain", "give_items",
+  "dimension_travel", "local_travel", "world_control", "potion_rain", "give_items",
   "run_commands", "place_area_torches", "show_recipe", "command_lesson", "execute_program",
 ]);
 

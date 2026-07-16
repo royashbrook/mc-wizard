@@ -57,6 +57,16 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "version", "destination"],
+          "properties": {
+            "type": { "type": "string", "const": "local_travel" },
+            "version": { "type": "integer", "const": 1 },
+            "destination": { "type": "string", "enum": ["surface", "nearest_village"] }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "version", "plan"],
           "properties": {
             "type": { "type": "string", "const": "build_machine" },

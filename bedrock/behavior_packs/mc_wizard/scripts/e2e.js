@@ -780,6 +780,70 @@ async function runDimensionTravelRollbackAcceptance(kid) {
   }
 }
 
+function generatedVillageNear(dimension, location) {
+  if (typeof dimension.getGeneratedStructures !== "function") return false;
+  const y = Math.floor(location.y);
+  for (let x = Math.floor(location.x) - 24; x <= Math.floor(location.x) + 24; x += 4) {
+    for (let z = Math.floor(location.z) - 24; z <= Math.floor(location.z) + 24; z += 4) {
+      try {
+        if (dimension.getGeneratedStructures({ x, y, z }).some((type) => /village/i.test(String(type)))) {
+          return true;
+        }
+      } catch {}
+    }
+  }
+  return false;
+}
+
+async function runLocalTravelAcceptance(kid) {
+  const check = "local-travel-pipeline";
+  let currentRequest = "fixture preparation";
+  try {
+    const dimension = world.getDimension("overworld");
+    const x = Math.floor(kid.location.x);
+    const z = Math.floor(kid.location.z);
+    const undergroundY = Math.max(-40, Math.floor(kid.location.y) - 24);
+    dimension.runCommand(`fill ${x - 2} ${undergroundY - 1} ${z - 2} ${x + 2} ${undergroundY + 2} ${z + 2} stone`);
+    dimension.runCommand(`fill ${x - 1} ${undergroundY} ${z - 1} ${x + 1} ${undergroundY + 1} ${z + 1} air`);
+    kid.teleport({ x: x + 0.5, y: undergroundY, z: z + 0.5 }, { dimension });
+    await system.waitTicks(4);
+
+    currentRequest = "take us up on top of land";
+    const surfaceTransport = await routeWizardRequest(kid, `wizard, ${currentRequest}`, "local-surface-travel");
+    await waitFor(() => {
+      if (kid.dimension.id !== "minecraft:overworld") return false;
+      const blockX = Math.floor(kid.location.x);
+      const blockZ = Math.floor(kid.location.z);
+      const top = dimension.getTopmostBlock({ x: blockX, z: blockZ });
+      const wizardPlayer = world.getAllPlayers().find((player) => player.name === "MC Wizard");
+      return Boolean(top)
+        && kid.location.y >= top.y + 1
+        && wizardPlayer?.dimension.id === "minecraft:overworld";
+    }, 900, "Test Kid and MC Wizard to reach the open Overworld surface");
+    report("CHECK", "local-surface-travel", `request via ${surfaceTransport}; child and visible Wizard reached open sky`);
+
+    const origin = { x: kid.location.x, z: kid.location.z };
+    currentRequest = "teleport me to the nearest village";
+    const villageTransport = await routeWizardRequest(kid, `wizard, ${currentRequest}`, "nearest-village-travel");
+    await waitFor(() => {
+      const wizardPlayer = world.getAllPlayers().find((player) => player.name === "MC Wizard");
+      return kid.dimension.id === "minecraft:overworld"
+        && wizardPlayer?.dimension.id === "minecraft:overworld"
+        && Math.hypot(kid.location.x - origin.x, kid.location.z - origin.z) > 8
+        && Math.hypot(kid.location.x - wizardPlayer.location.x, kid.location.z - wizardPlayer.location.z) <= 8;
+    }, 1_200, "Test Kid and MC Wizard to reach the located village together");
+    const top = dimension.getTopmostBlock({ x: Math.floor(kid.location.x), z: Math.floor(kid.location.z) });
+    if (!top || kid.location.y < top.y + 1) throw new Error("village arrival was not on its open surface");
+    if (!generatedVillageNear(dimension, kid.location)) throw new Error("arrival was not inside or beside a generated village");
+    report("CHECK", "nearest-village-travel", `request via ${villageTransport}; generated village reached on its surface`);
+    report("PASS", check, "the production Wizard rescued a simulated child from underground and then took the child and visible Wizard to the nearest village");
+  } catch (error) {
+    report("FAIL", check, `${currentRequest}: ${String(error)}`);
+  } finally {
+    try { kid.disconnect(); } catch {}
+  }
+}
+
 function analyzeCityGeometry(kid, station, expectedHeight) {
   const blocks = [];
   for (let x = station.x - 20; x <= station.x + 20; x += 1) {
@@ -3141,7 +3205,7 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "mc_wizard_e2e_run is required");
     return;
   }
-  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp" && scope !== "delivery") {
+  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "local-travel" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp" && scope !== "delivery") {
     report("FAIL", "configuration", `unsupported mc_wizard_e2e_scope: ${scope}`);
     return;
   }
@@ -3167,6 +3231,7 @@ export async function startE2E(callbacks) {
       : scope === "arbitrary" ? "arbitrary-exact-structure"
       : scope === "portal" ? "portal-travel-pipeline"
         : scope === "travel-rollback" ? "dimension-travel-rollback"
+        : scope === "local-travel" ? "local-travel-pipeline"
         : scope === "city" ? "city-goal-pipeline"
         : scope === "child" ? "child-action-pipeline"
         : scope === "refinement" ? "castle-refinement"
@@ -3218,6 +3283,10 @@ export async function startE2E(callbacks) {
     }
     if (scope === "travel-rollback") {
       system.runTimeout(() => void runDimensionTravelRollbackAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "local-travel") {
+      system.runTimeout(() => void runLocalTravelAcceptance(kid), 80);
       return;
     }
     if (scope === "city") {
