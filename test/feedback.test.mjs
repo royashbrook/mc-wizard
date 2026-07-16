@@ -181,6 +181,23 @@ test("a high grade with praise closes cleanly instead of inventing corrective wo
   assert.equal(result.followUp, undefined);
 });
 
+test("a high grade still applies short concrete corrections to the active project", async () => {
+  for (const feedback of ["more windows", "taller", "not enough light", "windows"]) {
+    const player = `CorrectionKid-${feedback}`;
+    const sessions = createMemorySessionStore();
+    const wizard = createWizard({ corpus, sessions, env: {}, logger: quiet });
+    const initial = await wizard.ask({ player, question: "Build a house", requestId: `house-${feedback}` });
+    await sessions.updateAction(player, "wizard", {
+      requestId: initial.requestId, status: "completed", detail: "house placed",
+    });
+    const result = await wizard.recordFeedback({
+      player, requestId: initial.requestId, grade: 5, feedback,
+    });
+    assert.match(result.message, /next instruction|improving/i, feedback);
+    assert.ok(result.followUp, feedback);
+  }
+});
+
 test("informational feedback regenerates an answer without a world action", async () => {
   const sessions = createMemorySessionStore();
   let calls = 0;

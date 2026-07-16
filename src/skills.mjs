@@ -4,10 +4,15 @@ import { machinePlanSchemaPrompt, validateMachinePlan } from "../bedrock/behavio
 import { COMMAND_LESSONS, commandLessonPrompt } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import { recipeItemIds } from "../bedrock/behavior_packs/mc_wizard/scripts/recipe-display.js";
 import {
+  capabilityProgramRequiredAuthority,
   capabilityProgramPrompt,
   validateCapabilityProgram,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-program.js";
-import { capabilityRuntimePrompt } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
+import {
+  capabilityRuntimePrompt,
+  normalizeRuntimeStep,
+  runtimeProgramHasEvidence,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
 
 const RECIPE_ITEM_IDS = new Set(recipeItemIds());
 
@@ -108,7 +113,11 @@ const FORBIDDEN_COMMAND_ROOTS = new Set([
   "allowlist", "ban", "ban-ip", "banlist", "changesetting", "deop", "kick", "op",
   "pardon", "pardon-ip", "permissions", "reload", "reloadconfig",
   "reloadpacketlimitconfig", "save", "script", "sendshowstoreoffer", "setmaxplayers",
-  "stop", "whitelist",
+  "stop", "whitelist", "execute", "kill",
+]);
+const REQUESTER_TARGET_COMMANDS = new Set([
+  "ability", "clear", "effect", "enchant", "gamemode", "give", "inputpermission",
+  "permission", "playanimation", "recipe", "replaceitem", "spawnpoint", "teleport", "tp", "xp",
 ]);
 
 function allowedCommand(value) {
@@ -120,13 +129,18 @@ function allowedCommand(value) {
   if (FORBIDDEN_COMMAND_ROOTS.has(root)) return null;
   // Every player selector must stay requester-scoped. World-coordinate commands need no selector.
   if (/@(?:a|e|p|r)(?:\b|\[)/i.test(command)) return null;
+  if (REQUESTER_TARGET_COMMANDS.has(root) && !/(?:^|\s)@s(?:\b|\[)/i.test(command)) return null;
   return command;
 }
 
 export function allowedWizardAction(value) {
   if (value?.type === "execute_program" && value.version === 1) {
     try {
-      return { type: "execute_program", version: 1, program: validateCapabilityProgram(value.program) };
+      const program = validateCapabilityProgram(value.program);
+      if (capabilityProgramRequiredAuthority(program) !== "player") return null;
+      const steps = program.steps.map(normalizeRuntimeStep);
+      if (!runtimeProgramHasEvidence(steps)) return null;
+      return { type: "execute_program", version: 1, program: { ...program, steps } };
     } catch {
       return null;
     }
@@ -206,7 +220,12 @@ export function wizardActionRejection(value) {
     if (value.type === "build_structure") validateBuildStructurePlan(value.plan);
     else if (value.type === "build_machine") validateMachinePlan(value.plan);
     else if (value.type === "build_plan") validateBuildPlan(value.plan);
-    else if (value.type === "execute_program") validateCapabilityProgram(value.program);
+    else if (value.type === "execute_program") {
+      const program = validateCapabilityProgram(value.program);
+      if (capabilityProgramRequiredAuthority(program) !== "player") throw new Error("program requires unavailable authority");
+      const steps = program.steps.map(normalizeRuntimeStep);
+      if (!runtimeProgramHasEvidence(steps)) throw new Error("program lacks executable evidence for its mutations");
+    }
     else return allowedWizardAction(value) ? null : "action is not registered or its arguments are invalid";
     return null;
   } catch (error) {

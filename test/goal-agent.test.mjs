@@ -1309,6 +1309,45 @@ test("executor-verified actions complete once without semantic retry loops", asy
   assert.equal(providerCalls, 0);
 });
 
+test("a capability program completion does not close its whole goal without world review", async () => {
+  const sessions = createMemorySessionStore();
+  await sessions.set("ProgramKid", "wizard", [{
+    question: "Build a whole playground",
+    answer: "I’ll build and check it.",
+    action: {
+      type: "execute_program", version: 1, program: {
+        title: "Playground start",
+        steps: [{
+          id: "place_block", capability: "player.place-blocks",
+          arguments: { blocks: [{
+            itemId: "minecraft:stone", target: [0, 0, 0], support: [0, -1, 0],
+            expectedType: "minecraft:stone", expectedStates: {},
+          }] },
+          expect: "One foundation block exists.", onFailure: "replan",
+        }, {
+          id: "verify_block", capability: "verify.blocks",
+          arguments: { blocks: [{ target: [0, 0, 0], typeId: "minecraft:stone" }] },
+          expect: "The foundation block is present.", onFailure: "replan",
+        }],
+      },
+    },
+    goal: {
+      objective: "Build a whole playground",
+      successCriteria: "A complete playground with several usable activities exists.",
+      status: "active",
+    },
+    goalId: "playground-goal", requestId: "playground-program", status: "pending",
+  }]);
+  const wizard = createWizard({ corpus, sessions, env: {} });
+  const outcome = await wizard.recordActionResult({
+    player: "ProgramKid", requestId: "playground-program", status: "completed",
+    detail: "completed 2/2 steps with explicit checks passed",
+  });
+  assert.equal(outcome.review, undefined);
+  assert.equal(outcome.reviewDeferred, true);
+  assert.equal(sessions.get("ProgramKid", "wizard")[0].goal.status, "active");
+});
+
 test("failed travel and fixed blueprints retry the exact child contract on the same goal", async () => {
   const sessions = createMemorySessionStore();
   const wizard = createWizard({ corpus, sessions, env: {} });

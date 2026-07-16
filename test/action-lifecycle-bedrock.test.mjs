@@ -43,7 +43,14 @@ test("immediate world actions also report their observed result", () => {
   assert.match(packScript, /function applyWorldControl\(player, action, report = beginImmediateAction\(player\)\)/);
   assert.match(packScript, /endImmediateAction\(report, "completed", `changed/);
   assert.match(packScript, /activeReport \|\|= beginImmediateAction\(player\)/);
-  assert.match(packScript, /dropped > 0 \? "completed" : "failed"/);
+  assert.match(packScript, /const complete = dropped === requested/);
+  assert.match(packScript, /complete \? "completed" : "failed"/);
+});
+
+test("partial item delivery stays failed and feedback speech waits for the brain decision", () => {
+  assert.match(packScript, /delivered \$\{dropped\} of \$\{requested\} requested items/);
+  assert.doesNotMatch(packScript, /saving that and using your note as the next instruction/);
+  assert.match(packScript, /if \(message\) speak\(current, message\)/);
 });
 
 test("an explicit no-action continuation stays visible and retries through the guarded brain path", () => {

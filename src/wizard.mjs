@@ -1469,7 +1469,8 @@ function groundedQuickAnswer(question, hits) {
 }
 
 function unusableWizardAnswer(answer, question) {
-  if (/^[\s{}\[\]",:]+$/.test(String(answer || ""))) return true;
+  const text = String(answer || "").trim();
+  if (!/[a-z0-9]/i.test(text) || /^[{[]/.test(text) || /^(?:null|undefined|n\/a)$/i.test(text)) return true;
   if (/\b(?:my|our|the) (?:Bedrock )?(?:notes|sources|documentation|corpus)\b/i.test(answer)) return true;
   const ordinaryQuestion = !/\b(?:delete|destroy|irreversible|shared world|another player|ban|kick|kill)\b/i.test(question);
   return ordinaryQuestion && /\bask (?:an? )?adult\b/i.test(answer);
@@ -2642,7 +2643,7 @@ function providerActionMatchesRequest(action, question, history = [], {
 
 const MAX_AUTOMATIC_GOAL_ACTIONS = 6;
 const EXECUTOR_VERIFIED_ACTION_TYPES = new Set([
-  "dimension_travel", "execute_program", "give_items", "place_area_torches",
+  "dimension_travel", "give_items", "place_area_torches",
   "potion_rain", "run_commands", "world_control",
 ]);
 const GOAL_REVIEW_FEEDBACK = "Fix this same active build so every success criterion is observable in the world.";
@@ -3248,8 +3249,9 @@ export function createWizard({
         return { ...result, message: "Thanks for the grade! I saved it with this request." };
       }
 
-      const requestsChange = /\b(?:but|however|please|should|need|want|fix|repair|redo|change|add|remove|replace|make|build|place|give|teleport|move|light|decorate|furnish|improve|bigger|smaller|shorter|longer|clearer|easier|wrong|broken|missing|too\s+(?:dark|small|big|plain))\b/i
-        .test(note);
+      const requestsChange = /\b(?:but|however|please|should|need|want|fix|repair|redo|change|add|remove|replace|make|build|place|give|teleport|move|light|decorate|furnish|improve|bigger|smaller|shorter|longer|taller|wider|clearer|easier|wrong|broken|missing|not\s+enough|too\s+(?:dark|small|big|plain))\b/i
+        .test(note)
+        || Boolean(binding.goalId && /^(?:more\s+)?(?:windows?|doors?|rooms?|towers?|lights?|lighting|decorations?|furniture|stairs?|floors?|roofs?|walls?)[!.]*$/i.test(note));
       if (grade >= 4 && !requestsChange) {
         return { ...result, message: "Thanks! I saved your grade and I’m glad that worked." };
       }

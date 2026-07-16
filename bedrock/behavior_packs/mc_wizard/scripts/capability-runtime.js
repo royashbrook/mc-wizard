@@ -11,7 +11,6 @@ export const RUNTIME_CAPABILITIES = Object.freeze([
   "script.teleport",
   "verify.blocks",
   "verify.entities",
-  "verify.snapshot",
   "world.command",
 ]);
 
@@ -22,7 +21,11 @@ const FORBIDDEN_COMMAND_ROOTS = new Set([
   "allowlist", "ban", "ban-ip", "banlist", "changesetting", "deop", "kick", "op",
   "pardon", "pardon-ip", "permissions", "reload", "reloadconfig",
   "reloadpacketlimitconfig", "save", "script", "sendshowstoreoffer", "setmaxplayers",
-  "stop", "whitelist",
+  "stop", "whitelist", "execute", "kill",
+]);
+const REQUESTER_TARGET_COMMANDS = new Set([
+  "ability", "clear", "effect", "enchant", "gamemode", "give", "inputpermission",
+  "permission", "playanimation", "recipe", "replaceitem", "spawnpoint", "teleport", "tp", "xp",
 ]);
 
 function exactKeys(value, allowed, name) {
@@ -73,6 +76,9 @@ function requesterCommand(value, name) {
   const root = command.split(/\s+/, 1)[0].toLowerCase();
   if (FORBIDDEN_COMMAND_ROOTS.has(root)) throw new Error(`${name} requires server authority`);
   if (/@(?:a|e|p|r)(?:\b|\[)/i.test(command)) throw new Error(`${name} contains a broad player selector`);
+  if (REQUESTER_TARGET_COMMANDS.has(root) && !/(?:^|\s)@s(?:\b|\[)/i.test(command)) {
+    throw new Error(`${name} must target only the requesting player with @s`);
+  }
   return command;
 }
 
@@ -169,7 +175,7 @@ function normalizeArguments(capability, value) {
       author: value.author ? text(value.author, `${name}.author`, 24) : "MC Wizard",
     };
   }
-  if (capability === "observe.snapshot" || capability === "verify.snapshot") {
+  if (capability === "observe.snapshot") {
     exactKeys(value, [], name);
     return {};
   }
@@ -222,6 +228,34 @@ export function normalizeRuntimeStep(step) {
   return { ...step, arguments: normalizeArguments(step.capability, step.arguments) };
 }
 
+export function runtimeProgramHasEvidence(steps) {
+  const verifiers = steps.filter(({ capability }) => capability === "verify.blocks");
+  const expectedBlocks = new Map(verifiers.flatMap(({ arguments: args }) => (
+    args.blocks.map(({ target, typeId }) => [target.join(","), typeId])
+  )));
+  const blockChanges = steps.flatMap(({ capability, arguments: args }) => {
+    if (capability === "player.place-blocks") {
+      return args.blocks.map(({ target, expectedType }) => [target.join(","), expectedType]);
+    }
+    if (capability === "player.break-blocks") {
+      return args.targets.map((target) => [target.join(","), "minecraft:air"]);
+    }
+    return [];
+  });
+  if (blockChanges.length && blockChanges.some(([target, typeId]) => expectedBlocks.get(target) !== typeId)) return false;
+  const spawned = steps.filter(({ capability }) => capability === "script.spawn-entity");
+  const entityChecks = steps.filter(({ capability }) => capability === "verify.entities");
+  if (spawned.some(({ arguments: spawn }) => !entityChecks.some(({ arguments: check }) => (
+    check.typeId === spawn.typeId && check.minimum >= spawn.count
+  )))) return false;
+  const mutatesWorld = steps.some(({ capability }) => /^(?:artifact\.|player\.(?:break|place|use)|script\.|world\.)/.test(capability));
+  const hasExplicitVerifier = steps.some(({ capability }) => capability.startsWith("verify."));
+  const selfCheckingMutation = steps.some(({ capability }) => [
+    "artifact.book", "player.use-item", "script.effect", "script.teleport", "world.command",
+  ].includes(capability));
+  return mutatesWorld && (hasExplicitVerifier || selfCheckingMutation);
+}
+
 export function capabilityRuntimePrompt() {
   return `Runtime capability manifest (relative vectors are [right, up, forward] from a nearby origin):\n`
     + `- player.move arguments={"target":[x,y,z],"mode":"walk|fly"}\n`
@@ -235,5 +269,5 @@ export function capabilityRuntimePrompt() {
     + `- artifact.book arguments={"title":"short title","text":"complete book text","author":"MC Wizard"}\n`
     + `- observe.snapshot arguments={}\n- verify.blocks arguments={"blocks":[{"target":[x,y,z],"typeId":"minecraft:stone"}]}\n`
     + `- verify.entities arguments={"typeId":"minecraft:horse","minimum":1,"maxDistance":32}\n`
-    + `- verify.snapshot arguments={}\n- control.wait arguments={"ticks":20}`;
+    + `- control.wait arguments={"ticks":20}`;
 }

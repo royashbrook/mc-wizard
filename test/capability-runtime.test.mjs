@@ -5,6 +5,7 @@ import test from "node:test";
 import {
   normalizeRuntimeStep,
   RUNTIME_CAPABILITIES,
+  runtimeProgramHasEvidence,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
 import { wizardSkillPrompt } from "../src/skills.mjs";
 
@@ -26,7 +27,7 @@ test("runtime manifest exposes composable player, script, command, artifact, obs
     "artifact.book", "control.wait", "observe.snapshot", "player.break-blocks",
     "player.move", "player.place-blocks", "player.use-item", "script.effect",
     "script.spawn-entity", "script.teleport", "verify.blocks", "verify.entities",
-    "verify.snapshot", "world.command",
+    "world.command",
   ]));
   const prompt = wizardSkillPrompt();
   for (const capability of RUNTIME_CAPABILITIES) assert.match(prompt, new RegExp(capability.replace(".", "\\.")));
@@ -54,10 +55,29 @@ test("runtime keeps ordinary commands requester-scoped and rejects server author
   assert.deepEqual(normalizeRuntimeStep(step("world.command", {
     commands: ["effect @s night_vision 1200 0 true"],
   })).arguments.commands, ["effect @s night_vision 1200 0 true"]);
-  for (const command of ["kick OtherKid", "effect @a night_vision 20", "/say nope"]) {
-    assert.throws(() => normalizeRuntimeStep(step("world.command", { commands: [command] })), /authority|broad|safe command/);
+  for (const command of [
+    "kick OtherKid", "kill OtherKid", "effect @a night_vision 20", "effect OtherKid night_vision 20",
+    "execute as @s run op @s", "/say nope",
+  ]) {
+    assert.throws(() => normalizeRuntimeStep(step("world.command", { commands: [command] })), /authority|broad|safe command|requesting player/);
   }
   assert.throws(() => normalizeRuntimeStep(step("knowledge.research", { query: "cake" })), /not installed/);
+});
+
+test("runtime evidence covers every physical mutation instead of trusting prose expectations", () => {
+  const placement = normalizeRuntimeStep(step("player.place-blocks", { blocks: [{
+    itemId: "minecraft:cake", target: [0, 0, 1], support: [0, -1, 1], expectedType: "minecraft:cake",
+  }] }));
+  const matching = normalizeRuntimeStep(step("verify.blocks", {
+    blocks: [{ target: [0, 0, 1], typeId: "minecraft:cake" }],
+  }));
+  const wrong = normalizeRuntimeStep(step("verify.blocks", {
+    blocks: [{ target: [0, 0, 1], typeId: "minecraft:stone" }],
+  }));
+  assert.equal(runtimeProgramHasEvidence([placement]), false);
+  assert.equal(runtimeProgramHasEvidence([placement, wrong]), false);
+  assert.equal(runtimeProgramHasEvidence([placement, matching]), true);
+  assert.equal(runtimeProgramHasEvidence([normalizeRuntimeStep(step("observe.snapshot", {}))]), false);
 });
 
 test("Bedrock executes programs sequentially and reports failed steps with a fresh snapshot", () => {

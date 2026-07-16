@@ -41,10 +41,36 @@ test("capability programs compose novel actions without extending the response u
     ...program,
     steps: program.steps.map((step) => ({ ...step, onFailure: "replan" })),
   });
-  assert.deepEqual(allowedWizardAction({ type: "execute_program", version: 1, program }), {
+  assert.equal(allowedWizardAction({ type: "execute_program", version: 1, program }), null);
+  const executable = {
+    title: "Cake step",
+    steps: [{
+      id: "build_step",
+      capability: "player.place-blocks",
+      arguments: { blocks: [{
+        itemId: "minecraft:cake", target: [0, 0, 1], support: [0, -1, 1], expectedType: "minecraft:cake",
+      }] },
+      expect: "The cake step exists.",
+    }, {
+      id: "verify_step",
+      capability: "verify.blocks",
+      arguments: { blocks: [{ target: [0, 0, 1], typeId: "minecraft:cake" }] },
+      expect: "The cake block is present.",
+    }],
+  };
+  const validated = validateCapabilityProgram(executable);
+  assert.deepEqual(allowedWizardAction({ type: "execute_program", version: 1, program: executable }), {
     type: "execute_program",
     version: 1,
-    program: validateCapabilityProgram(program),
+    program: {
+      ...validated,
+      steps: validated.steps.map((entry, index) => ({
+        ...entry,
+        arguments: index === 0
+          ? { blocks: [{ ...entry.arguments.blocks[0], expectedStates: {} }] }
+          : entry.arguments,
+      })),
+    },
   });
 });
 
@@ -59,6 +85,7 @@ test("capability programs derive admin authority and reject unsafe or ambiguous 
     }],
   });
   assert.equal(capabilityProgramRequiredAuthority(ownerProgram), "owner");
+  assert.equal(allowedWizardAction({ type: "execute_program", version: 1, program: ownerProgram }), null);
   assert.equal(capabilityProgramRequiredAuthority(validateCapabilityProgram({
     title: "Operator action",
     steps: [{
@@ -99,7 +126,10 @@ test("requester-scoped Bedrock commands are executable but admin and broad selec
   const action = { type: "run_commands", version: 1, commands: ["effect @s night_vision 999999 0 true"] };
   assert.deepEqual(allowedWizardAction(action), action);
   assert.equal(allowedWizardAction({ ...action, commands: ["effect @a night_vision 60"] }), null);
+  assert.equal(allowedWizardAction({ ...action, commands: ["effect OtherKid night_vision 60"] }), null);
   assert.equal(allowedWizardAction({ ...action, commands: ["op @s"] }), null);
+  assert.equal(allowedWizardAction({ ...action, commands: ["execute as @s run op @s"] }), null);
+  assert.equal(allowedWizardAction({ ...action, commands: ["kill OtherKid"] }), null);
   assert.equal(allowedWizardAction({ ...action, commands: ["/effect @s night_vision 60"] }), null);
   assert.match(wizardSkillPrompt(), /use @s for the requesting child/i);
 });

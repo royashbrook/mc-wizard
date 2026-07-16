@@ -962,9 +962,7 @@ async function submitFeedback(prompt, grade, feedback) {
   const player = playerById(prompt.playerId);
   if (!player) return;
   prompt.submitting = true;
-  speak(player, feedback
-    ? "Thanks—I’m saving that and using your note as the next instruction."
-    : "Thanks—I’m saving your grade.");
+  speak(player, feedback ? "Thanks—I’m saving your grade and note." : "Thanks—I’m saving your grade.");
   try {
     const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/feedback"))
       .setMethod(HttpRequestMethod.Post)
@@ -994,6 +992,7 @@ async function submitFeedback(prompt, grade, feedback) {
         return;
       }
       completeFeedbackPrompt(prompt);
+      if (message) speak(current, message);
       if (feedback) {
         if (followUp && typeof followUp === "object") applyResponse(current.id, followUp, feedback);
       }
@@ -5028,6 +5027,7 @@ async function giveItemsAsWizard(player, items, report) {
       await system.waitTicks(2);
     }
     let dropped = 0;
+    const requested = items.reduce((total, { amount }) => total + amount, 0);
     for (const { itemId, amount } of items) {
       try {
         const probe = new ItemStack(itemId, 1);
@@ -5058,13 +5058,17 @@ async function giveItemsAsWizard(player, items, report) {
       }
     }
     equipWizard();
-    speak(player, dropped > 0
+    const complete = dropped === requested;
+    speak(player, complete
       ? `There you are—I brought ${dropped} item${dropped === 1 ? "" : "s"} and dropped them at your feet.`
-      : "Those item names were smudged. Tell me what they look like and I’ll try a matching item next.");
+      : dropped > 0
+        ? `I brought ${dropped} of ${requested} items. I’m keeping this request active so I can retry the missing ones.`
+        : "Those item names were smudged. Tell me what they look like and I’ll try a matching item next.");
     endImmediateAction(
       activeReport,
-      dropped > 0 ? "completed" : "failed",
-      dropped > 0 ? `delivered ${dropped} requested items` : "no requested items were delivered",
+      complete ? "completed" : "failed",
+      complete ? `delivered all ${requested} requested items`
+        : `delivered ${dropped} of ${requested} requested items`,
     );
   } catch (error) {
     console.warn(`[MC Wizard] item delivery was interrupted: ${error}`);
@@ -5194,7 +5198,7 @@ async function executeCapabilityStep(player, step, frame) {
     return `executed ${result.succeeded} requester-scoped command${result.succeeded === 1 ? "" : "s"}`;
   }
   if (step.capability === "artifact.book") return dropCapabilityBook(player, args);
-  if (step.capability === "observe.snapshot" || step.capability === "verify.snapshot") {
+  if (step.capability === "observe.snapshot") {
     const snapshot = liveWorldSnapshot(player);
     return `captured ${snapshot.nearbyBlocks.length} block types and ${snapshot.nearbyEntities.length} nearby entities`;
   }
@@ -5336,8 +5340,8 @@ async function executeCapabilityProgram(player, program) {
       speak(player, `I completed ${results.length} step${results.length === 1 ? "" : "s"}, but “${first.id}” needs another approach. I’m checking the world and replanning it now.`);
       endBuildAction(token, "failed", `program ${program.title}: ${results.length}/${steps.length} steps; ${first.id}: ${first.detail}`);
     } else {
-      speak(player, `Done—“${program.title}” completed all ${results.length} step${results.length === 1 ? "" : "s"}. I’m checking the result against your whole goal now.`);
-      endBuildAction(token, "completed", `program ${program.title}: completed and verified ${results.length}/${steps.length} steps`);
+      speak(player, `Done—“${program.title}” completed all ${results.length} step${results.length === 1 ? "" : "s"}. Its explicit checks passed; I’m comparing that result with your whole request now.`);
+      endBuildAction(token, "completed", `program ${program.title}: completed ${results.length}/${steps.length} steps with explicit checks passed`);
     }
   } catch (error) {
     if (transactionStarted) {

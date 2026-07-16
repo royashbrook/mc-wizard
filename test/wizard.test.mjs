@@ -2265,10 +2265,20 @@ test("lets the model compose and retain a novel executable capability program", 
         id: "place_cakes",
         capability: "player.place-blocks",
         arguments: { blocks: [
-          { itemId: "minecraft:cake", target: [0, 0, 2], support: [0, -1, 2], expectedType: "minecraft:cake" },
-          { itemId: "minecraft:cake", target: [0, 1, 3], support: [0, 0, 3], expectedType: "minecraft:cake" },
+          { itemId: "minecraft:cake", target: [0, 0, 2], support: [0, -1, 2], expectedType: "minecraft:cake", expectedStates: {} },
+          { itemId: "minecraft:cake", target: [0, 1, 3], support: [0, 0, 3], expectedType: "minecraft:cake", expectedStates: {} },
         ] },
         expect: "A cake staircase exists nearby.",
+        onFailure: "replan",
+      },
+      {
+        id: "verify_cakes",
+        capability: "verify.blocks",
+        arguments: { blocks: [
+          { target: [0, 0, 2], typeId: "minecraft:cake" },
+          { target: [0, 1, 3], typeId: "minecraft:cake" },
+        ] },
+        expect: "Both cake blocks remain in place.",
         onFailure: "replan",
       },
       {
