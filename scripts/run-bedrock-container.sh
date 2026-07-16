@@ -19,6 +19,10 @@ if [ ! -f "$WORLD" ]; then
   echo "Export a Bedrock world with Beta APIs enabled and put it there before starting BDS." >&2
   exit 1
 fi
+if [ -z "${MC_WIZARD_LAN_IP:-}" ] && [ -f "$ROOT/.env" ]; then
+  MC_WIZARD_LAN_IP=$(awk -F= '$1 == "MC_WIZARD_LAN_IP" { print $2; exit }' "$ROOT/.env")
+  export MC_WIZARD_LAN_IP
+fi
 LAN_IP=${MC_WIZARD_LAN_IP:-}
 case "$LAN_IP" in
   *[!0-9.]*|"")

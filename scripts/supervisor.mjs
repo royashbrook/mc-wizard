@@ -105,15 +105,13 @@ async function daemon() {
     && /127\.0\.0\.1:(?:8790|\$\{?MTOK_PORT)/.test(process.env.AI_BASE_URL || "");
   supervise("provider", path.join(ROOT, "scripts", "local-ai-bridge.mjs"), localProvider);
   supervise("brain", path.join(ROOT, "src", "server.mjs"));
-  if (await run("container", ["start", "mc-wizard-bedrock"], { stdio: ["ignore", log.fd, log.fd] }) !== 0) {
-    await run("sh", [path.join(ROOT, "scripts", "run-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
-  }
+  await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
 
   const stop = async () => {
     if (stopping) return;
     stopping = true;
     for (const child of children.values()) child.kill("SIGTERM");
-    await run("container", ["stop", "--time", "60", "mc-wizard-bedrock"], { stdio: ["ignore", log.fd, log.fd] });
+    await run("sh", [path.join(ROOT, "scripts", "stop-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
     await rm(PID_FILE, { force: true });
     await log.close();
     process.exit(0);
@@ -122,7 +120,7 @@ async function daemon() {
   process.on("SIGINT", stop);
   setInterval(async () => {
     if (!stopping && await run("container", ["exec", "mc-wizard-bedrock", "true"]) !== 0) {
-      await run("container", ["start", "mc-wizard-bedrock"], { stdio: ["ignore", log.fd, log.fd] });
+      await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
     }
   }, 10_000).unref();
 }
