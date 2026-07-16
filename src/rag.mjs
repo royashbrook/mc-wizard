@@ -1,6 +1,8 @@
 import { readFile, readdir, realpath } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { classifyEdition, normalizeChannel } from "./edition.mjs";
+import { buildKnowledgeGraph, createKnowledgeGraph, validateKnowledgeGraph } from "./knowledge-graph.mjs";
 
 const PROJECT_ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const STOP_WORDS = new Set([
@@ -18,7 +20,7 @@ const BASE_ROOTS = [
   [".cache/minecraft-creator/creator/Reference", "official-doc"],
   [".cache/minecraft-creator/creator/ScriptAPI", "official-doc"],
   [".cache/patch-notes", "patch-note"],
-].map(([relative, kind]) => ({ dir: path.join(PROJECT_ROOT, relative), kind }));
+].map(([relative, kind]) => ({ dir: path.join(PROJECT_ROOT, relative), kind, id: relative }));
 
 async function defaultRoots() {
   try {
@@ -26,16 +28,40 @@ async function defaultRoots() {
     if (!/^[a-zA-Z0-9._/-]+$/.test(active.release) || active.release.includes("..")) throw new Error("invalid active release path");
     const release = path.join(PROJECT_ROOT, ".cache", active.release);
     return [
-      { dir: path.join(PROJECT_ROOT, "knowledge"), kind: "mechanic-card" },
+      { dir: path.join(PROJECT_ROOT, "knowledge"), kind: "mechanic-card", id: "knowledge" },
       ...["Documents", "Commands", "Reference", "ScriptAPI"].map((folder) => ({
         dir: path.join(release, "minecraft-creator", "creator", folder),
         kind: "official-doc",
+        id: `minecraft-creator/creator/${folder}`,
       })),
-      { dir: path.join(release, "patch-notes"), kind: "patch-note" },
+      { dir: path.join(release, "patch-notes"), kind: "patch-note", id: "patch-notes" },
     ];
   } catch (error) {
     if (error.code !== "ENOENT" && !/invalid active release/.test(error.message)) throw error;
     return BASE_ROOTS;
+  }
+}
+
+async function activeGraphFile() {
+  try {
+    const active = JSON.parse(await readFile(path.join(PROJECT_ROOT, ".cache", "active-release.json"), "utf8"));
+    if (!/^[a-zA-Z0-9._/-]+$/.test(active.release) || active.release.includes("..")) return undefined;
+    return path.join(PROJECT_ROOT, ".cache", active.release, "knowledge-graph.json");
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }
+}
+
+async function activeCreatorRef() {
+  try {
+    const active = JSON.parse(await readFile(path.join(PROJECT_ROOT, ".cache", "active-release.json"), "utf8"));
+    if (!/^[a-zA-Z0-9._/-]+$/.test(active.release) || active.release.includes("..")) return undefined;
+    const manifest = JSON.parse(await readFile(path.join(PROJECT_ROOT, ".cache", active.release, "manifest.json"), "utf8"));
+    return /^[0-9a-f]{40}$/i.test(manifest.creatorCommit) ? manifest.creatorCommit : undefined;
+  } catch (error) {
+    if (error.code === "ENOENT" || error.name === "SyntaxError") return undefined;
+    throw error;
   }
 }
 
@@ -70,6 +96,15 @@ function parseFrontmatter(markdown) {
 
 function titleFrom(markdown, file) {
   return markdown.match(/^#\s+(.+)$/m)?.[1]?.trim() || path.basename(file, path.extname(file));
+}
+
+function sourcePolicy(metadata, kind) {
+  if (typeof metadata.source_policy === "string" && metadata.source_policy.length <= 120) {
+    return metadata.source_policy;
+  }
+  if (kind === "official-doc") return "creator-docs-cc-by-4.0";
+  if (kind === "patch-note") return "private-reference-cache";
+  return "authored-local";
 }
 
 function sourceFor(file, metadata, creatorRef) {
@@ -158,16 +193,21 @@ async function markdownFiles(root) {
   return files;
 }
 
-export async function loadCorpus({ roots } = {}) {
+export async function loadCorpus({ roots, graphArtifact, graphFile, creatorRef: suppliedCreatorRef } = {}) {
+  const usingDefaultRoots = !roots;
   roots ||= await defaultRoots();
   const chunks = [];
-  let creatorRef = "main";
-  try {
-    const manifest = JSON.parse(await readFile(path.join(PROJECT_ROOT, ".cache", "sync-manifest.json"), "utf8"));
-    if (/^[0-9a-f]{40}$/i.test(manifest.creatorCommit)) creatorRef = manifest.creatorCommit;
-  } catch (error) {
-    if (error.code !== "ENOENT") throw error;
+  let creatorRef = /^[0-9a-f]{40}$/i.test(suppliedCreatorRef || "") ? suppliedCreatorRef : undefined;
+  if (!creatorRef && usingDefaultRoots) creatorRef = await activeCreatorRef();
+  if (!creatorRef) {
+    try {
+      const manifest = JSON.parse(await readFile(path.join(PROJECT_ROOT, ".cache", "sync-manifest.json"), "utf8"));
+      if (/^[0-9a-f]{40}$/i.test(manifest.creatorCommit)) creatorRef = manifest.creatorCommit;
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.name !== "SyntaxError") throw error;
+    }
   }
+  creatorRef ||= "main";
   for (const root of roots) {
     const files = await markdownFiles(root.dir);
     if (!files.length) continue;
@@ -181,16 +221,27 @@ export async function loadCorpus({ roots } = {}) {
         const words = tokenize(`${title} ${text}`);
         const frequencies = new Map();
         for (const word of words) frequencies.set(word, (frequencies.get(word) || 0) + 1);
+        const fileId = root.id
+          ? `${root.id}/${path.relative(root.dir, file)}`
+          : path.relative(PROJECT_ROOT, file);
         chunks.push({
-          id: `${path.relative(PROJECT_ROOT, file)}#${part}`,
+          id: `${fileId.split(path.sep).join("/")}#${part}`,
           title,
           text,
           source: sourceFor(file, metadata, creatorRef),
-          edition: /\bjava edition\b/i.test(title) ? "java" : (metadata.edition || "bedrock"),
-          channel: metadata.channel || "stable",
+          edition: classifyEdition({
+            title,
+            body: markdown,
+            url: metadata.source,
+            channel: metadata.channel,
+            kind: metadata.kind || root.kind,
+            declared: metadata.edition,
+          }),
+          channel: normalizeChannel(metadata.channel),
           version: metadata.version || "current",
           updated: metadata.updated || null,
           kind: metadata.kind || root.kind,
+          sourcePolicy: sourcePolicy(metadata, root.kind),
           quickAnswer: metadata.quick_answer || null,
           quickQuestions: String(metadata.quick_questions || "").split("|").map((value) => value.trim()).filter(Boolean),
           frequencies,
@@ -206,13 +257,27 @@ export async function loadCorpus({ roots } = {}) {
     }
   }
 
+  let artifact = graphArtifact;
+  if (!artifact && (graphFile || usingDefaultRoots)) {
+    try {
+      const file = graphFile || await activeGraphFile();
+      if (file) artifact = JSON.parse(await readFile(file, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.name !== "SyntaxError") throw error;
+    }
+  }
+  artifact = validateKnowledgeGraph(artifact, chunks) || buildKnowledgeGraph(chunks);
+  const graph = createKnowledgeGraph(artifact);
+
   function search(query, { limit = 4, includePreview = false } = {}) {
     const queryWords = [...new Set(tokenize(query))];
     const normalizedQuery = query.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
     const wantsHistory = /\b(changelog|changed|fixed|patch|release|version|update)\b/i.test(query);
+    const graphMatches = new Map(graph.search(query, { limit: Math.max(limit * 4, 12), includePreview })
+      .map((entry) => [entry.id, entry]));
     return chunks
-      .filter((chunk) => includePreview || chunk.channel !== "preview")
-      .filter((chunk) => chunk.edition !== "java")
+      .filter((chunk) => chunk.edition === "bedrock")
+      .filter((chunk) => chunk.channel === "stable" || (includePreview && chunk.channel === "preview"))
       .map((chunk) => {
         let score = 0;
         let matchedWords = 0;
@@ -229,7 +294,9 @@ export async function loadCorpus({ roots } = {}) {
         if (chunk.kind === "mechanic-card") score *= 1.35;
         if (chunk.kind === "official-doc") score *= 1.15;
         if (chunk.kind === "patch-note") score *= wantsHistory ? 1.2 : 0.75;
-        return { chunk, score, matchedWords };
+        const graphMatch = graphMatches.get(chunk.id);
+        const graphScore = graphMatch?.score || 0;
+        return { chunk, score: score + graphScore, matchedWords, graphScore, graphEntities: graphMatch?.entities || [] };
       })
       .filter(({ score, matchedWords }) => {
         const requiredMatches = queryWords.length <= 1
@@ -237,11 +304,12 @@ export async function loadCorpus({ roots } = {}) {
           : queryWords.length <= 4
             ? 2
           : Math.min(3, Math.ceil(queryWords.length * 0.3));
+        // Graph evidence ranks lexical matches; it never turns an unrelated mention into an answer.
         return score > 0 && matchedWords >= requiredMatches;
       })
       .sort((a, b) => b.score - a.score)
       .slice(0, limit)
-      .map(({ chunk, score }) => ({
+      .map(({ chunk, score, graphScore, graphEntities }) => ({
         id: chunk.id,
         title: chunk.title,
         text: chunk.text,
@@ -254,11 +322,14 @@ export async function loadCorpus({ roots } = {}) {
         quickAnswer: chunk.quickAnswer,
         quickQuestions: chunk.quickQuestions,
         score: Number(score.toFixed(3)),
+        ...(graphScore && { graphScore: Number(graphScore.toFixed(3)), graphEntities }),
       }));
   }
 
   return {
     size: chunks.length,
     search,
+    graph: { revision: graph.revision, ...graph.stats },
+    graphArtifact: artifact,
   };
 }

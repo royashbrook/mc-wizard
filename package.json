@@ -28,6 +28,7 @@
     "container:logs": "container logs -f mc-wizard-bedrock",
     "container:stop": "sh scripts/stop-bedrock-container.sh",
     "sync:docs": "node scripts/sync-docs.mjs",
+    "graph:build": "node scripts/build-knowledge-graph.mjs",
     "test": "node --test test/*.test.mjs",
     "test:e2e:bds": "sh scripts/run-e2e-container.sh",
     "test:e2e:machines": "MC_WIZARD_E2E_SCOPE=machines sh scripts/run-e2e-container.sh",

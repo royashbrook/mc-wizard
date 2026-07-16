@@ -69,7 +69,8 @@ test("unfamiliar furniture is researched, graded, and reused without another mod
   const first = await wizard.ask({ player: "FirstKid", question, requestId: "furniture-first" });
   assert.equal(calls, 1, first.mode);
   assert.match(researchPrompt, /MC_WIZARD_RESEARCH_REQUIRED/);
-  assert.match(researchPrompt, /video descriptions or transcripts/);
+  assert.match(researchPrompt, /cached, promoted Bedrock sources/i);
+  assert.doesNotMatch(researchPrompt, /web research|video descriptions|transcripts/i);
   assert.match(researchPrompt, /furniture and other compact decorative assemblies/);
   assert.equal(first.action.plan.kind, "furniture");
   await wizard.recordActionResult({

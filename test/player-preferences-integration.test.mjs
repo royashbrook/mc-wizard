@@ -334,7 +334,11 @@ test("bridge validates opaque player IDs, returns only the requested cache, and 
       };
     },
   };
-  const server = createHttpServer({ wizard, corpus: { size: 1 }, token: "test-token", interactionLog, cooldownMs: 0, logger: quiet });
+  const server = createHttpServer({
+    wizard,
+    corpus: { size: 1, graph: { revision: "kg-test", documents: 1, nodes: 2, edges: 1 } },
+    token: "test-token", interactionLog, cooldownMs: 0, logger: quiet,
+  });
   try {
     const ask = await dispatch(server, {
       method: "POST", url: "/v1/ask", token: "test-token",
@@ -364,6 +368,7 @@ test("bridge validates opaque player IDs, returns only the requested cache, and 
     assert.deepEqual(other.body.preferences, []);
     const health = await dispatch(server, { method: "GET", url: "/health" });
     assert.deepEqual(health.body.preferences, { players: 2, preferences: 3 });
+    assert.deepEqual(health.body.graph, { revision: "kg-test", documents: 1, nodes: 2, edges: 1 });
     const raw = await readFile(filePath, "utf8");
     assert.doesNotMatch(raw, /mushroom build rule|red_mushroom_block/);
     assert.match(raw, /private player preference applied/);
