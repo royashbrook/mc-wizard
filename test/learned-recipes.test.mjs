@@ -177,7 +177,9 @@ test("web-researched build plans cannot smuggle server administration", async ()
   });
   const result = await wizard.ask({ player: "ResearchSafetyKid", question: "research and build furniture" });
   assert.equal(calls, 2);
-  assert.notEqual(result.action?.program?.steps?.[0]?.capability, "server.console");
+  assert.ok(result.action, "the rejected research plan must still make safe build progress");
+  assert.equal(reusableLearnedAction(result.action), true);
+  assert.doesNotMatch(JSON.stringify(result.action), /server\.console|server\.configure|world\.command|op \{\{requester\}\}/);
 });
 
 test("the provider compiler repairs mechanical placement support and evidence", async () => {
