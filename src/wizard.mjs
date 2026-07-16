@@ -1469,6 +1469,7 @@ function groundedQuickAnswer(question, hits) {
 }
 
 function unusableWizardAnswer(answer, question) {
+  if (/^[\s{}\[\]",:]+$/.test(String(answer || ""))) return true;
   if (/\b(?:my|our|the) (?:Bedrock )?(?:notes|sources|documentation|corpus)\b/i.test(answer)) return true;
   const ordinaryQuestion = !/\b(?:delete|destroy|irreversible|shared world|another player|ban|kick|kill)\b/i.test(question);
   return ordinaryQuestion && /\bask (?:an? )?adult\b/i.test(answer);
@@ -2640,6 +2641,10 @@ function providerActionMatchesRequest(action, question, history = [], {
 }
 
 const MAX_AUTOMATIC_GOAL_ACTIONS = 6;
+const EXECUTOR_VERIFIED_ACTION_TYPES = new Set([
+  "dimension_travel", "execute_program", "give_items", "place_area_torches",
+  "potion_rain", "run_commands", "world_control",
+]);
 const GOAL_REVIEW_FEEDBACK = "Fix this same active build so every success criterion is observable in the world.";
 const RETRYABLE_ACTION_TYPES = new Set([
   "place_blueprint", "build_machine", "build_structure", "build_plan",
@@ -3243,6 +3248,12 @@ export function createWizard({
         return { ...result, message: "Thanks for the grade! I saved it with this request." };
       }
 
+      const requestsChange = /\b(?:but|however|please|should|need|want|fix|repair|redo|change|add|remove|replace|make|build|place|give|teleport|move|light|decorate|furnish|improve|bigger|smaller|shorter|longer|clearer|easier|wrong|broken|missing|too\s+(?:dark|small|big|plain))\b/i
+        .test(note);
+      if (grade >= 4 && !requestsChange) {
+        return { ...result, message: "Thanks! I saved your grade and I’m glad that worked." };
+      }
+
       const correctiveAction = classifyAction(note, sessions.get(player, "wizard"));
       const immediateCorrection = correctiveAction && !BUILD_ACTION_TYPES.has(correctiveAction.type);
       if (binding.goalId && immediateCorrection) {
@@ -3334,20 +3345,22 @@ export function createWizard({
       if (!goal) return outcome;
       const goalId = actionTurn.goalId || actionTurn.requestId;
       if (status === "completed") {
+        const executorVerified = EXECUTOR_VERIFIED_ACTION_TYPES.has(actionTurn.action.type);
         const completedActions = history.filter((turn) => turn.status === "completed"
           && (turn.goalId || turn.requestId) === goalId).length;
-        if (completedActions >= MAX_AUTOMATIC_GOAL_ACTIONS) {
+        if (!executorVerified && completedActions >= MAX_AUTOMATIC_GOAL_ACTIONS) {
           return { ...outcome, reviewLimitReached: true };
         }
-        if (!context) return { ...outcome, reviewDeferred: true };
-        if (observedStructureSatisfiesAction(context, actionTurn)) {
+        if (executorVerified || (context && observedStructureSatisfiesAction(context, actionTurn))) {
           const completedGoal = { ...goal, status: "complete" };
           const review = {
-            answer: "I checked the finished structure against its full plan and the fresh world result. Goal complete.",
+            answer: executorVerified
+              ? "The action’s own checks passed. Goal complete."
+              : "I checked the finished structure against its full plan and the fresh world result. Goal complete.",
             action: null,
             goal: completedGoal,
             sources: [],
-            mode: "local-world-verification",
+            mode: executorVerified ? "local-executor-verification" : "local-world-verification",
             kind: "wizard",
             label: provider.label,
             requestId: randomUUID(),
@@ -3364,6 +3377,7 @@ export function createWizard({
           else await sessions.set(player, "wizard", [...history, reviewTurn]);
           return { ...outcome, review };
         }
+        if (!context) return { ...outcome, reviewDeferred: true };
         const review = await api.ask({
           player,
           mode: "wizard",

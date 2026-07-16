@@ -83,6 +83,8 @@ test("automatic continuations yield to newer child work and stop visibly at brai
   assert.match(lifecycle, /result\.superseded \|\| result\.replan\?\.superseded/);
   assert.match(lifecycle, /result\.updated === false/);
   assert.match(lifecycle, /result\.reviewLimitReached \|\| result\.retryLimitReached/);
+  assert.match(lifecycle, /result\.review\?\.goal\?\.status === "complete"/);
+  assert.match(lifecycle, /result\.review\.answer \|\| "That worked\. Goal complete\."/);
   assert.match(lifecycle, /reached my automatic retry limit/);
   assert.ok(lifecycle.indexOf("result.reviewLimitReached") < lifecycle.indexOf("actionResultRetry(result.retry)"));
   assert.match(lifecycle, /const abandoned = \/\\b\(\?:superseded\|player left\|all players left\|server stopp\)/);

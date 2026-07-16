@@ -162,6 +162,25 @@ test("project feedback becomes a same-goal refinement instruction", async () => 
   assert.equal(sessions.get("ProjectKid", "wizard").at(-1).goalId, initial.goalId);
 });
 
+test("a high grade with praise closes cleanly instead of inventing corrective work", async () => {
+  const sessions = createMemorySessionStore();
+  const wizard = createWizard({ corpus, sessions, env: {}, logger: quiet });
+  const initial = await wizard.ask({
+    player: "PraiseKid", question: "give me night vision", requestId: "effect-request",
+  });
+  await sessions.updateAction("PraiseKid", "wizard", {
+    requestId: initial.requestId, status: "completed", detail: "effect applied",
+  });
+  const result = await wizard.recordFeedback({
+    player: "PraiseKid",
+    requestId: initial.requestId,
+    grade: 5,
+    feedback: "for giving me night vision because it worked",
+  });
+  assert.match(result.message, /glad that worked/i);
+  assert.equal(result.followUp, undefined);
+});
+
 test("informational feedback regenerates an answer without a world action", async () => {
   const sessions = createMemorySessionStore();
   let calls = 0;

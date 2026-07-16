@@ -89,9 +89,48 @@ test("writes bounded JSONL interactions without plaintext player names", async (
     assert.equal(entries[0].actionLabel, "[player] Moon Castle");
     assert.equal(entries[0].goalId, "castle-goal");
     assert.ok(entries[1].detail.length <= 500);
-    assert.deepEqual(entries[1].outcome, { status: "failed", matched: true, updated: true });
+    assert.deepEqual(entries[1].outcome, {
+      status: "failed", matched: true, updated: true, totalMs: 0,
+    });
     assert.equal(entries[1].actionLabel, "Moon Castle Repair");
     assert.deepEqual(await readRecentInteractions(filePath, { limit: 1 }), [entries[1]]);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("logs successful action paths and measured acknowledgement-to-completion timing", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-success-log-"));
+  const filePath = join(directory, "interactions.jsonl");
+  let clock = 1_000;
+  try {
+    const log = createInteractionLog({ filePath, salt, now: () => clock });
+    await log.recordAsk({
+      player: "SuccessKid",
+      question: "clear my effects",
+      mode: "wizard",
+      result: {
+        answer: "Casting it now.", requestId: "clear-effects", mode: "local-skill",
+        action: { type: "run_commands", version: 1, commands: ["effect @s clear"] },
+      },
+    });
+    clock = 1_100;
+    await log.recordActionResult({
+      player: "SuccessKid", requestId: "clear-effects", status: "started",
+      result: { matched: true, updated: true },
+    });
+    clock = 1_600;
+    await log.recordActionResult({
+      player: "SuccessKid", requestId: "clear-effects", status: "completed",
+      result: { matched: true, updated: true },
+    });
+    const entries = await readRecentInteractions(filePath);
+    assert.equal(entries[0].responseMode, "local-skill");
+    assert.equal(entries[0].actionType, "run_commands");
+    assert.deepEqual(entries[2].outcome, {
+      status: "completed", matched: true, updated: true, success: true,
+      totalMs: 600, actionMs: 500,
+    });
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

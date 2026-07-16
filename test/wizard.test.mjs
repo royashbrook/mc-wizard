@@ -2077,6 +2077,20 @@ test("never dumps retrieved documentation when the model is unavailable", async 
   assert.match(result.answer, /project active|concrete next move/i);
 });
 
+test("never relays a malformed provider fragment to a child", async () => {
+  const malformedWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify({ answer: "{", goal: null, action: null }) } }],
+    }), { status: 200 }),
+  });
+  const result = await malformedWizard.ask({ player: "FragmentKid", question: "give me surgery" });
+  assert.notEqual(result.answer.trim(), "{");
+  assert.equal(result.mode, "offline-fallback");
+});
+
 test("answers ordinary conversation instantly without invoking the provider", async () => {
   let providerCalled = false;
   const greetingWizard = createWizard({

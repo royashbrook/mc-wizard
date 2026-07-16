@@ -1281,6 +1281,34 @@ test("a failed build automatically replans the active goal with a bounded retry"
   assert.equal(call, 2);
 });
 
+test("executor-verified actions complete once without semantic retry loops", async () => {
+  const sessions = createMemorySessionStore();
+  let providerCalls = 0;
+  const wizard = createWizard({
+    corpus,
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalls += 1;
+      throw new Error("executor-verified completion must not call the provider");
+    },
+  });
+  const action = await wizard.ask({
+    player: "VerifiedCommandKid", question: "give me night vision", requestId: "night-vision",
+  });
+  assert.equal(action.action.type, "run_commands");
+  const outcome = await wizard.recordActionResult({
+    player: "VerifiedCommandKid",
+    requestId: action.requestId,
+    status: "completed",
+    detail: "executed 1 of 1 requester-scoped commands",
+  });
+  assert.equal(outcome.review.goal.status, "complete");
+  assert.equal(outcome.review.mode, "local-executor-verification");
+  assert.equal(outcome.replan, undefined);
+  assert.equal(providerCalls, 0);
+});
+
 test("failed travel and fixed blueprints retry the exact child contract on the same goal", async () => {
   const sessions = createMemorySessionStore();
   const wizard = createWizard({ corpus, sessions, env: {} });

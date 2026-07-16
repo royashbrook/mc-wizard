@@ -261,6 +261,14 @@ async function postActionResult(report, status, detail) {
         if (result.matched) queueFeedback(report);
         return;
       }
+      if (result.review?.goal?.status === "complete") {
+        withCurrentActionPlayer(report, (player) => speak(
+          player,
+          result.review.answer || "That worked. Goal complete.",
+        ));
+        queueFeedback(report);
+        return;
+      }
       if (result.reviewLimitReached || result.retryLimitReached) {
         withCurrentActionPlayer(report, (player) => speak(
           player,
