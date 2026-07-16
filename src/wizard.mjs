@@ -3722,6 +3722,17 @@ function sessionIdentity(player, playerId) {
   return id ? `bedrock:${id}` : String(player || "anonymous");
 }
 
+function samePlayerPreference(entry, preference) {
+  if (!entry || entry.kind !== preference?.kind) return false;
+  if (entry.kind === "material") {
+    return entry.blockId === preference.blockId
+      && entry.label === preference.label
+      && entry.exclusive === preference.exclusive;
+  }
+  if (entry.kind === "proximity") return entry.minimumDistance === preference.minimumDistance;
+  return entry.askBeforeTeleport === preference.askBeforeTeleport;
+}
+
 export function createWizard({
   corpus,
   env = process.env,
@@ -3740,22 +3751,38 @@ export function createWizard({
   const providerSafetySalt = injectedSafetySalt
     || (configuredSafetySalt.length >= 24 ? configuredSafetySalt : randomUUID());
   const terminalActionResults = new Map();
-  const clearPreferenceDerivedState = async (playerIdentity, changedKinds = []) => {
+  const invalidateInFlightPreferenceWork = (playerIdentity) => {
     const sessionPlayer = sessionIdentity(undefined, playerIdentity);
-    const prefix = `${sessionPlayer}\u0000`;
-    for (const key of terminalActionResults.keys()) if (key.startsWith(prefix)) terminalActionResults.delete(key);
+    // A preference update must stop an older Wizard reply from being published
+    // with stale instructions. Its completed conversation, project, and
+    // refinement turns remain useful history; only the active sequence is stale.
     if (typeof sessions.invalidate === "function") sessions.invalidate(sessionPlayer, "wizard");
     const history = sessions.get(sessionPlayer, "wizard");
-    const affectedKinds = new Set(Array.isArray(changedKinds) ? changedKinds : [changedKinds]);
-    const scrubbed = affectedKinds.size
-      ? history.filter((turn) => !turn.preferenceDependencies?.some((kind) => affectedKinds.has(kind)))
-      : history;
-    if (scrubbed.length !== history.length && typeof sessions.set === "function") {
-      await sessions.set(sessionPlayer, "wizard", scrubbed);
+    const staleRequestIds = new Set(history.flatMap((turn) => (
+      turn?.action && ["pending", "started"].includes(turn.status)
+        ? [turn.requestId].filter(Boolean) : []
+    )));
+    const neutralized = history.map((turn) => {
+      const staleAction = Boolean(turn?.action && ["pending", "started"].includes(turn.status));
+      const staleGoal = turn?.goal?.status === "active" && (
+        staleAction || staleRequestIds.has(turn.goalId) || staleRequestIds.has(turn.requestId)
+      );
+      if (!staleAction && !staleGoal) return turn;
+      const next = { ...turn };
+      if (staleAction) {
+        delete next.action;
+        delete next.status;
+        delete next.detail;
+      }
+      if (staleGoal) delete next.goal;
+      return next;
+    });
+    if (neutralized.some((turn, index) => turn !== history[index]) && typeof sessions.set === "function") {
+      // Call before awaiting preference persistence so a newer child turn sees
+      // neither the stale action nor its active goal.
+      return sessions.set(sessionPlayer, "wizard", neutralized);
     }
-    if (typeof sessions.clearActionResults === "function") {
-      await sessions.clearActionResults(sessionPlayer, "wizard");
-    }
+    return undefined;
   };
   const preferenceResult = async (playerIdentity, intent) => {
     const current = () => preferences.get(playerIdentity);
@@ -3774,9 +3801,9 @@ export function createWizard({
       };
     }
     if (intent.type === "clear") {
-      const removedKinds = current().map(({ kind }) => kind);
+      const cleanup = current().length ? invalidateInFlightPreferenceWork(playerIdentity) : undefined;
       const result = await preferences.clear(playerIdentity);
-      if (result.removed) await clearPreferenceDerivedState(playerIdentity, removedKinds);
+      if (cleanup) await cleanup;
       return {
         answer: result.removed
           ? "Poof—your lasting notes are gone. I won’t use them anymore."
@@ -3789,8 +3816,10 @@ export function createWizard({
     const kind = intent.type === "remove-last"
       ? [...existing].sort((left, right) => right.updatedAt - left.updatedAt)[0]?.kind : intent.kind;
     if (intent.type === "remove" || intent.type === "remove-last") {
+      const cleanup = kind && existing.some((entry) => entry.kind === kind)
+        ? invalidateInFlightPreferenceWork(playerIdentity) : undefined;
       const result = kind ? await preferences.remove(playerIdentity, kind) : { removed: false, entries: existing };
-      if (result.removed) await clearPreferenceDerivedState(playerIdentity, kind);
+      if (cleanup) await cleanup;
       return {
         answer: result.removed
           ? "Consider it forgotten. I won’t use that note anymore."
@@ -3799,8 +3828,10 @@ export function createWizard({
         preferences: result.entries,
       };
     }
+    const cleanup = !samePlayerPreference(existing.find((entry) => entry.kind === intent.preference?.kind), intent.preference)
+      ? invalidateInFlightPreferenceWork(playerIdentity) : undefined;
     const result = await preferences.set(playerIdentity, intent.preference);
-    if (result.changed) await clearPreferenceDerivedState(playerIdentity, result.entry?.kind);
+    if (cleanup) await cleanup;
     const entry = result.entry;
     const answer = entry?.kind === "proximity"
       ? `Got it—I’ll give you about ${entry.minimumDistance} blocks of space.`
