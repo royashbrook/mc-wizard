@@ -19,7 +19,7 @@ const ITEM_ID = /^minecraft:[a-z0-9_]+$/;
 const EFFECT_ID = /^(?:minecraft:)?[a-z0-9_]+$/;
 const REQUESTER_SELECTOR = "@s(?:\\[[^\\]\\r\\n]{1,120}\\])?";
 const DECIMAL = "(?:\\d+(?:\\.\\d*)?|\\.\\d+)";
-const COORDINATE = `(?:~(?:[-+]?${DECIMAL})?|[-+]?${DECIMAL})`;
+const COORDINATE = `(?:[~^](?:[-+]?${DECIMAL})?|[-+]?${DECIMAL})`;
 const REQUESTER_COMMAND_PATTERNS = [
   new RegExp(`^ability\\s+${REQUESTER_SELECTOR}\\s+\\S+(?:\\s+\\S+)?$`, "i"),
   new RegExp(`^clear\\s+${REQUESTER_SELECTOR}(?:\\s+\\S+){0,3}$`, "i"),

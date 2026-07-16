@@ -139,4 +139,13 @@ test("offers a focused live child-action acceptance scope", () => {
   );
   assert.match(pack, /scope === "child"/);
   assert.match(pack, /runChildRequestAcceptance\(kid\)/);
+  assert.match(pack, /const floorType = dimension\.getBlock\(\{ x: x \+ dx, y, z: z \+ dz \}\)/);
+  assert.match(pack, /if \(isHouseLight\(floorType\)\) lights \+= 1/);
+  assert.match(pack, /async function proveRemoteGift\(kid, station\)/);
+  assert.match(pack, /\{ dimension: kid\.dimension, x: station\.x \+ 0\.5/);
+  assert.match(pack, /friend\.addTag\(TEST_TAG\)/);
+  assert.equal(
+    packageJson.scripts["test:e2e:delivery"],
+    "MC_WIZARD_E2E_SCOPE=delivery sh scripts/run-e2e-container.sh",
+  );
 });

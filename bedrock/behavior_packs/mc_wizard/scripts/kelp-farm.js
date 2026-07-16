@@ -23,6 +23,7 @@ export function createAutomaticKelpFarmBlueprint() {
   const waterColumn = [1, 2, 3, 4, 5].map((y) => [0, y, 4]);
   const streamSource = [0, 5, 4];
   const collectionStream = [[0, 5, 3], collectionWater];
+  const refillSource = [1, 2, 4];
 
   const placements = [
     // Raise the output chest just below the collection stream.
@@ -39,8 +40,7 @@ export function createAutomaticKelpFarmBlueprint() {
 
     // Dry tank first; water and kelp are added later from the Wizard's hand.
     place("minecraft:sand", [0, 0, 4], [0, -1, 4]),
-    ...[-1, 1].flatMap((x) => [0, 1, 2, 3, 4]
-      .filter((y) => x !== -1 || y < 2)
+    ...[-1].flatMap((x) => [0, 1]
       .map((y) => place(
       "minecraft:glass",
       [x, y, 4],
@@ -53,6 +53,24 @@ export function createAutomaticKelpFarmBlueprint() {
     )),
     place("minecraft:glass", [0, 0, 5], [0, -1, 5]),
     place("minecraft:glass", [0, 1, 5], [0, 0, 5]),
+    place("minecraft:glass", [1, 0, 4], [1, -1, 4]),
+    place("minecraft:glass", [1, 1, 4], [1, 0, 4]),
+
+    // A sealed side source immediately refills the piston harvest cell. Without
+    // it, a Bedrock piston can leave air behind and strand harvested kelp below
+    // the floating collection stream.
+    ...[[2, 4]].flatMap(([x, z]) => [0, 1, 2, 3].map((y) => place(
+      "minecraft:glass",
+      [x, y, z],
+      y === 0 ? [x, -1, z] : [x, y - 1, z],
+    ))),
+    ...[[1, 3], [1, 5]].flatMap(([x, z]) => [0, 1, 2].map((y) => place(
+      "minecraft:glass",
+      [x, y, z],
+      y === 0 ? [x, -1, z] : [x, y - 1, z],
+    ))),
+    place("minecraft:glass", [1, 3, 4], [2, 3, 4]),
+    place("minecraft:glass", [1, 4, 4], [1, 3, 4]),
 
     // A side observer feeds a same-level dust path directly into the piston.
     // This avoids Java-only quasi-connectivity assumptions and works on Bedrock.
@@ -104,6 +122,13 @@ export function createAutomaticKelpFarmBlueprint() {
       ...water,
       {
         action: "use_item_on_block",
+        itemId: "minecraft:water_bucket",
+        block: [2, 2, 4],
+        faceTarget: refillSource,
+        expectedFaceType: "minecraft:water",
+      },
+      {
+        action: "use_item_on_block",
         itemId: "minecraft:kelp",
         block: [0, 0, 4],
         faceTarget: plant,
@@ -132,6 +157,7 @@ export function createAutomaticKelpFarmBlueprint() {
         streamSource,
         collectionStream,
         collectionWater,
+        refillSource,
         harvest,
         sensedGrowth,
         piston,
@@ -141,7 +167,7 @@ export function createAutomaticKelpFarmBlueprint() {
         expectedOutput: "minecraft:kelp",
       },
     ],
-    bounds: { min: [-2, -1, 1], max: [1, 5, 5] },
+    bounds: { min: [-2, -1, 1], max: [2, 5, 5] },
     success: "Automatic kelp farm ready and tested! The observer harvests new growth, and the floating kelp rides the top stream into the output chest.",
     usage: "Collect kelp from the upper front chest. Keep the glass water column closed so every harvested piece floats into the hopper.",
   };

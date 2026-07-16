@@ -56,7 +56,8 @@ test("runtime keeps ordinary commands requester-scoped and rejects server author
     commands: ["effect @s night_vision 1200 0 true"],
   })).arguments.commands, ["effect @s night_vision 1200 0 true"]);
   for (const command of [
-    "tp @s ~ ~-5 ~", "tp @s -12.5 ~+2 7", "tp @s .5 ~-.25 7.", "spawnpoint @s ~ ~ ~-1",
+    "tp @s ~ ~-5 ~", "tp @s -12.5 ~+2 7", "tp @s .5 ~-.25 7.", "tp @s ^ ^ ^5",
+    "spawnpoint @s ~ ~ ~-1",
   ]) {
     assert.deepEqual(normalizeRuntimeStep(step("world.command", { commands: [command] })).arguments.commands, [command]);
   }

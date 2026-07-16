@@ -10,7 +10,7 @@ const key = (point) => point.join(",");
 test("automatic kelp farm has a planted source-water harvester and real output path", () => {
   const farm = createAutomaticKelpFarmBlueprint();
   assert.equal(farm.id, "automatic_kelp_farm");
-  assert.deepEqual(farm.bounds, { min: [-2, -1, 1], max: [1, 5, 5] });
+  assert.deepEqual(farm.bounds, { min: [-2, -1, 1], max: [2, 5, 5] });
 
   const placed = new Map();
   for (const placement of farm.placements) {
@@ -30,10 +30,13 @@ test("automatic kelp farm has a planted source-water harvester and real output p
   for (const y of [1, 2, 3]) assert.equal(placed.get(`0,${y},3`).itemId, "minecraft:glass");
   assert.equal(placed.get("0,4,3").itemId, "minecraft:smooth_stone");
   assert.equal(placed.get("0,5,1").itemId, "minecraft:glass");
+  assert.equal(placed.has("1,2,4"), false);
+  for (const point of ["2,2,4", "1,2,3", "1,2,5"]) assert.equal(placed.get(point).itemId, "minecraft:glass");
 
   const water = farm.interactions.filter(({ itemId }) => itemId === "minecraft:water_bucket");
   assert.deepEqual(water.map(({ faceTarget }) => faceTarget), [
     ...[1, 2, 3, 4, 5].map((y) => [0, y, 4]),
+    [1, 2, 4],
   ]);
   const plantedKelp = farm.interactions.filter(({ itemId }) => itemId === "minecraft:kelp");
   assert.deepEqual(plantedKelp.map(({ faceTarget }) => faceTarget), [[0, 1, 4]]);
@@ -49,6 +52,7 @@ test("automatic kelp farm has a planted source-water harvester and real output p
   assert.deepEqual(pipeline.streamSource, [0, 5, 4]);
   assert.deepEqual(pipeline.collectionStream, [[0, 5, 3], [0, 5, 2]]);
   assert.deepEqual(pipeline.collectionWater, [0, 5, 2]);
+  assert.deepEqual(pipeline.refillSource, [1, 2, 4]);
   assert.deepEqual(pipeline.output, [0, 4, 1]);
   assert.equal(pipeline.expectedOutput, "minecraft:kelp");
   assert.match(farm.success, /floating kelp.+output chest/i);
