@@ -1,6 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { allowedWizardAction, allowedWizardGoal, wizardActionRejection, wizardSkillPrompt } from "./skills.mjs";
 import { createMemorySessionStore } from "./sessions.mjs";
+import { createMemoryLearnedRecipeStore } from "./learned-recipes.mjs";
 import { commonFarmAction } from "./common-farms.mjs";
 import {
   explicitlyRequestsCommand,
@@ -1425,6 +1426,31 @@ function commandAction(question) {
   return null;
 }
 
+function trustedAdminAction(question) {
+  const direct = String(question).trim()
+    .replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "")
+    .replace(/^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?/i, "");
+  const grantOperator = /^(?:(?:make|promote)\s+me\s+(?:an?\s+)?(?:operator|op)|op\s+me|give\s+me\s+(?:operator|op)(?:\s+(?:permission|permissions|status))?)\b/i.test(direct)
+    || /^(?:i\s+(?:want|need)\s+(?:to\s+be|operator|op)|let\s+me\s+be)\s+(?:an?\s+)?(?:operator|op)\b/i.test(direct);
+  const removeOperator = /^(?:(?:deop|demote)\s+me|remove\s+my\s+(?:operator|op)(?:\s+(?:permission|permissions|status))?)\b/i.test(direct);
+  if (!grantOperator && !removeOperator) return null;
+  const command = grantOperator ? "op {{requester}}" : "deop {{requester}}";
+  return allowedWizardAction({
+    type: "execute_program",
+    version: 1,
+    program: {
+      title: grantOperator ? "Grant operator" : "Remove operator",
+      steps: [{
+        id: grantOperator ? "grant_operator" : "remove_operator",
+        capability: "server.console",
+        arguments: { commands: [command] },
+        expect: grantOperator ? "The requesting player is an operator." : "The requesting player is no longer an operator.",
+        onFailure: "replan",
+      }],
+    },
+  });
+}
+
 function areaTorchAction(question) {
   if (explicitlyRequestsCommand(question)) return null;
   const asksForLight = requestClauses(question).some((clause) => {
@@ -1500,6 +1526,7 @@ function explicitlyRequestsBuild(question) {
     const prefix = /^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i;
     const direct = clause.replace(prefix, "");
     return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:build|construct|create|place|demo|demonstrate)\b/i.test(direct)
+      || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:research|look\s+up|figure\s+out|find\s+out)\b.{0,80}\band\s+(?:then\s+)?(?:build|construct|create|place|make)\b/i.test(direct)
       || /^(?:can|could|may|would)\s+(?:i|we)\s+(?:please\s+)?(?:build|construct|create|place)\b/i.test(direct)
       || /^(?:i|we)\s+(?:want|need)\s+(?:you\s+to\s+)?(?:build|construct|create|place)\b/i.test(direct)
       || /^how\s+(?:do\s+i|can\s+i|to)\s+(?:build|construct|create)\b/i.test(direct)
@@ -1577,6 +1604,8 @@ export function classifyAction(question, history = []) {
   if (isPotionRainRequest(question)) {
     return allowedWizardAction({ type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 });
   }
+  const admin = trustedAdminAction(question);
+  if (admin) return admin;
   const torches = areaTorchAction(question);
   if (torches) return torches;
   const command = commandAction(question);
@@ -1645,7 +1674,8 @@ export function classifyAction(question, history = []) {
 
 function isBuildRequest(question, history = []) {
   if (dimensionTravelAction(question) || worldControlAction(question) || giveItemsAction(question)
-    || areaTorchAction(question) || commandAction(question) || isPotionRainRequest(question)) return false;
+    || areaTorchAction(question) || commandAction(question) || trustedAdminAction(question)
+    || isPotionRainRequest(question)) return false;
   return !/\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
     && !/\bjust\s+(?:explain|describe|tell)\b/i.test(question)
     && !isRecipeRequest(question)
@@ -1748,7 +1778,8 @@ function localAnswer(question, hits, action) {
       : "I’ll place this safe command-block lesson nearby and show you exactly what its button does.";
   }
   if (action?.type === "execute_program") {
-    return `I’ve drawn “${action.program.title}” as ${action.program.steps.length} real step${action.program.steps.length === 1 ? "" : "s"}. I’ll carry them out in order, inspect each result, and revise any step that does not work.`;
+    const count = action.program.steps.length;
+    return `I’ve drawn “${action.program.title}” as ${count} real step${count === 1 ? "" : "s"}. I’ll carry ${count === 1 ? "it" : "them"} out in order, inspect each result, and revise any step that does not work.`;
   }
   if (action?.type === "build_plan") {
     return `I’ll build ${action.plan.title || "this detail"} nearby, placing all ${action.plan.blocks.length} planned blocks in support order and checking each one.`;
@@ -2268,6 +2299,30 @@ function proceduralCityRevisionAction(value, previous, question) {
 
 function normalizeProviderAction(value, question = "") {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  if (value.type === "execute_program" && Array.isArray(value.program?.steps)) {
+    const touches = (left, right) => Array.isArray(left) && Array.isArray(right)
+      && left.length === 3 && right.length === 3
+      && [...left, ...right].every(Number.isInteger)
+      && left.reduce((distance, coordinate, axis) => distance + Math.abs(coordinate - right[axis]), 0) === 1;
+    return {
+      ...value,
+      program: {
+        ...value.program,
+        steps: value.program.steps.map((step) => step?.capability === "player.place-blocks"
+          && Array.isArray(step.arguments?.blocks) ? {
+            ...step,
+            arguments: {
+              ...step.arguments,
+              blocks: step.arguments.blocks.map((block) => {
+                if (!Array.isArray(block?.target) || block.target.length !== 3
+                  || !block.target.every(Number.isInteger) || touches(block.target, block.support)) return block;
+                return { ...block, support: [block.target[0], block.target[1] - 1, block.target[2]] };
+              }),
+            },
+          } : step),
+      },
+    };
+  }
   if (value.type === "build_structure" && value.plan && typeof value.plan === "object") {
     const allowedFeatures = new Set([
       "floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers",
@@ -3220,7 +3275,7 @@ function providerHistorySummary(history, { fullProject = false } = {}) {
     .map(([, summary]) => summary).join("\n\n");
 }
 
-async function askProvider({ provider, fetchImpl, question, hits, history, player, env, safetySalt, general, buildRequest, reviewRequest, tuning, context }) {
+async function askProvider({ provider, fetchImpl, question, hits, history, player, env, safetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context }) {
   const sources = hits.map((hit, index) =>
     `[Source ${index + 1}: ${hit.title}; edition=${hit.edition}; channel=${hit.channel}; version=${hit.version}]\n${hit.text}`,
   ).join("\n\n");
@@ -3245,7 +3300,10 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const reviewRequirement = reviewRequest
     ? `\n\nMC_WIZARD_GOAL_REVIEW\nThis is a semantic review of an already completed executor batch. Use the fresh live-world snapshot and active success criteria. Return either goal.status="complete" with action=null, or goal.status="active" with one corrective action for the same existing project.`
     : "";
-  const systemPrompt = `${general ? GENERAL_PROMPT : SYSTEM_PROMPT}${addendum ? `\n\nOperator tuning:\n${addendum}` : ""}${actionRequirement}${reviewRequirement}`;
+  const researchRequirement = researchRequired
+    ? `\n\nMC_WIZARD_RESEARCH_REQUIRED\nThis is a new or unfamiliar design. Before planning, use current web research. Prefer Bedrock documentation and mechanics; cross-check community wikis, build guides, and video descriptions or transcripts when useful. Distinguish Bedrock from Java. Synthesize the research into one complete executable action now. Do not return a research step, source dump, tutorial promise, or knowledge.research capability. For furniture and other compact decorative assemblies, use execute_program with player.place-blocks plus verify.blocks; name the requested subject in the program title and expectations. Use build_complete_structure only when the requested result is itself a whole bounded structure.`
+    : "";
+  const systemPrompt = `${general ? GENERAL_PROMPT : SYSTEM_PROMPT}${addendum ? `\n\nOperator tuning:\n${addendum}` : ""}${actionRequirement}${reviewRequirement}${researchRequirement}`;
   const body = provider.style === "chat"
     ? {
         model: provider.model,
@@ -3269,19 +3327,26 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const headers = { "content-type": "application/json" };
   if (provider.apiKey) headers.authorization = `Bearer ${provider.apiKey}`;
   const endpoint = provider.style === "chat" ? "chat/completions" : "responses";
-  const response = await fetchImpl(`${provider.baseUrl}/${endpoint}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeout),
-  });
-  if (!response.ok) {
-    const detail = (await response.text()).slice(0, 300);
-    throw new Error(`AI provider returned ${response.status}: ${detail}`);
+  const attempts = planningRequest ? 2 : 1;
+  let lastError;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    const response = await fetchImpl(`${provider.baseUrl}/${endpoint}`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeout),
+    });
+    if (!response.ok) {
+      const detail = (await response.text()).slice(0, 300);
+      lastError = new Error(`AI provider returned ${response.status}: ${detail}`);
+      if (response.status >= 500 && attempt + 1 < attempts) continue;
+      throw lastError;
+    }
+    const answer = responseText(await response.json(), provider.style).trim();
+    if (!answer) throw new Error("AI provider returned no text");
+    return general ? answer : answer.slice(0, 24_000);
   }
-  const answer = responseText(await response.json(), provider.style).trim();
-  if (!answer) throw new Error("AI provider returned no text");
-  return general ? answer : answer.slice(0, 24_000);
+  throw lastError;
 }
 
 export function createWizard({
@@ -3290,6 +3355,7 @@ export function createWizard({
   fetchImpl = fetch,
   logger = console,
   sessions = createMemorySessionStore(),
+  recipes = createMemoryLearnedRecipeStore(),
   settings = async () => ({}),
   safetySalt,
 } = {}) {
@@ -3335,15 +3401,46 @@ export function createWizard({
       if (binding.duplicate) {
         return { ...result, message: "I already saved that grade for this request." };
       }
+      const forgetRejectedRecipe = async () => {
+        if (binding.responseMode !== "learned-recipe" || typeof recipes.remove !== "function") return;
+        try {
+          await recipes.remove(binding.question);
+        } catch (error) {
+          logger.warn(`[wizard] could not remove rejected learned recipe: ${error.message}`);
+        }
+      };
+      const rememberSuccessfulRecipe = async () => {
+        if (binding.status !== "completed" || grade < 4
+          || ![...BUILD_ACTION_TYPES, "execute_program"].includes(binding.action?.type)
+          || typeof recipes.promote !== "function") return false;
+        try {
+          return Boolean(await recipes.promote({
+            question: binding.question,
+            action: binding.action,
+            grade,
+          }));
+        } catch (error) {
+          logger.warn(`[wizard] could not save learned recipe: ${error.message}`);
+          return false;
+        }
+      };
       if (!note) {
         if (grade <= 3) {
+          await forgetRejectedRecipe();
           return {
             ...result,
             needsFeedback: true,
             message: "Tell me one thing I should change, and I’ll use it as my next instruction.",
           };
         }
-        return { ...result, message: "Thanks for the grade! I saved it with this request." };
+        const learned = await rememberSuccessfulRecipe();
+        return {
+          ...result,
+          ...(learned && { learned: true }),
+          message: learned
+            ? "Thanks! That worked, so I’ll remember this as a tested recipe for next time."
+            : "Thanks for the grade! I saved it with this request.",
+        };
       }
 
       const feedbackHistory = sessions.get(player, "wizard");
@@ -3351,8 +3448,16 @@ export function createWizard({
         .test(note)
         || Boolean(binding.goalId && isProjectFeedback(note, feedbackHistory));
       if (grade >= 4 && !requestsChange) {
-        return { ...result, message: "Thanks! I saved your grade and I’m glad that worked." };
+        const learned = await rememberSuccessfulRecipe();
+        return {
+          ...result,
+          ...(learned && { learned: true }),
+          message: learned
+            ? "Thanks! I saved that as a tested recipe because it worked."
+            : "Thanks! I saved your grade and I’m glad that worked.",
+        };
       }
+      await forgetRejectedRecipe();
 
       const correctiveAction = classifyAction(note, feedbackHistory);
       const immediateCorrection = correctiveAction && !BUILD_ACTION_TYPES.has(correctiveAction.type);
@@ -3563,6 +3668,13 @@ export function createWizard({
       const hits = rankedHits.filter((hit) => hit.score >= relevanceFloor);
       const action = general || reviewRequest || answerOnlyRequest
         ? null : classifyAction(question, actionHistory);
+      const learnedEntry = !general && !reviewRequest && !answerOnlyRequest && buildRequest && !projectFeedback
+        && typeof recipes.find === "function" ? await recipes.find(question) : null;
+      const learnedCandidate = allowedWizardAction(learnedEntry?.action);
+      const learnedAction = learnedCandidate
+        && providerActionMatchesRequest(learnedCandidate, question, actionHistory, { buildRequest: true })
+        && actionCompletesBuildRequest(learnedCandidate, question, actionHistory)
+        ? learnedCandidate : null;
       const groundedAnswer = reviewRequest || answerOnlyRequest
         ? undefined : groundedQuickAnswer(question, hits);
       let answer = reviewRequest
@@ -3572,15 +3684,18 @@ export function createWizard({
         : instantAnswer || groundedAnswer || (general
         ? `${provider.label} did not answer yet. I’ll keep this request short and try again when you ask.`
         : localAnswer(question, hits, action));
-      let selectedAction = action;
+      let selectedAction = learnedAction || action;
       let providerGoal;
       let providerActionRejection;
       let rejectedProviderAction;
       let title = general ? bookTitle(question) : undefined;
       let responseMode = answerOnlyRequest ? "feedback-answer-fallback" : reviewRequest ? "review-deferred"
-        : instantAnswer ? "local-instant" : groundedAnswer ? "local-grounded" : action ? "local-skill" : "offline";
+        : instantAnswer ? "local-instant" : groundedAnswer ? "local-grounded"
+          : learnedAction ? "learned-recipe" : action ? "local-skill" : "offline";
+      const researchRequired = !general && buildRequest && !learnedAction
+        && (!action || wantsModelAuthoredStructure(action, buildRequest, question));
       const askModel = !instantAnswer && !groundedAnswer && provider.enabled && tuning.aiEnabled
-        && (answerOnlyRequest || reviewRequest || !action
+        && !learnedAction && (answerOnlyRequest || reviewRequest || !action
           || wantsModelAuthoredStructure(action, buildRequest, question));
       if (askModel) {
         const safeFallback = {
@@ -3593,7 +3708,7 @@ export function createWizard({
         try {
           const providerAnswer = await askProvider({
             provider, fetchImpl, question, hits, history: actionHistory, player, env,
-            safetySalt: providerSafetySalt, general, buildRequest, reviewRequest, tuning, context,
+            safetySalt: providerSafetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context,
           });
           const envelope = general ? generalEnvelope(providerAnswer, question) : wizardEnvelope(providerAnswer, question);
           if (!general && !envelope) throw new Error("AI provider returned an invalid Wizard response");
@@ -3641,7 +3756,7 @@ export function createWizard({
                 const repairedProviderAnswer = await askProvider({
                   provider, fetchImpl, question, hits, history: repairHistory, player, env,
                   safetySalt: providerSafetySalt, general: false, buildRequest: false,
-                  reviewRequest: false, tuning, context,
+                  reviewRequest: false, researchRequired: false, tuning, context,
                 });
                 const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
                 const repairedGift = repairingGift && !repairedEnvelope?.rawActionRejection
@@ -3701,6 +3816,7 @@ export function createWizard({
           }
           if (!general && buildRequest && !actionCompletesBuildRequest(selectedAction, question, actionHistory)) {
             const repairDetail = plannerRepairDetail(question, rejectedProviderAction || selectedAction, actionHistory, providerActionRejection);
+            logger.warn(`[wizard] planner contract rejected: ${repairDetail}`);
             const repairHistory = [...actionHistory, {
               question,
               answer,
@@ -3711,7 +3827,7 @@ export function createWizard({
             }];
             const repairedProviderAnswer = await askProvider({
               provider, fetchImpl, question, hits, history: repairHistory, player, env,
-              safetySalt: providerSafetySalt, general: false, buildRequest: true, tuning, context,
+              safetySalt: providerSafetySalt, general: false, buildRequest: true, researchRequired, tuning, context,
             });
             const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
             if (repairedEnvelope && !unusableWizardAnswer(repairedEnvelope.answer, question)) {
@@ -3728,6 +3844,7 @@ export function createWizard({
             }
             const repaired = actionCompletesBuildRequest(selectedAction, question, actionHistory);
             if (!repaired) {
+              logger.warn(`[wizard] repaired planner action still missed the request: ${plannerRepairDetail(question, selectedAction, actionHistory, repairedEnvelope?.rawActionRejection)}`);
               const fallback = localStructureFallback(question, actionHistory);
               if (!fallback || !actionAdvancesBuildRequest(fallback, question, actionHistory)) {
                 throw new Error(`AI planner action did not satisfy the active goal (raw=${envelope.rawActionLabel}; rejection=${providerActionRejection || "goal mismatch"}; repaired=${repairedEnvelope?.rawActionLabel || "none"}; repairedRejection=${repairedEnvelope?.rawActionRejection || "goal mismatch"}; requested=${structureKind(question, actionHistory)})`);

@@ -27,7 +27,7 @@ test("runtime manifest exposes composable player, script, command, artifact, obs
     "artifact.book", "control.wait", "observe.snapshot", "player.break-blocks",
     "player.move", "player.place-blocks", "player.use-item", "script.effect",
     "script.spawn-entity", "script.teleport", "verify.blocks", "verify.entities",
-    "world.command",
+    "server.configure", "server.console", "world.command",
   ]));
   const prompt = wizardSkillPrompt();
   for (const capability of RUNTIME_CAPABILITIES) assert.match(prompt, new RegExp(capability.replace(".", "\\.")));
@@ -51,7 +51,7 @@ test("runtime normalizes a physical build and its observable verification", () =
   })).arguments, { typeId: "minecraft:horse", location: [2, 0, 1], minimum: 1, maxDistance: 4 });
 });
 
-test("runtime keeps ordinary commands requester-scoped and rejects server authority", () => {
+test("runtime exposes unrestricted Minecraft, server-console, and restart-required settings authority", () => {
   assert.deepEqual(normalizeRuntimeStep(step("world.command", {
     commands: ["effect @s night_vision 1200 0 true"],
   })).arguments.commands, ["effect @s night_vision 1200 0 true"]);
@@ -66,12 +66,18 @@ test("runtime keeps ordinary commands requester-scoped and rejects server author
     "execute as @s run op @s", "tp OtherKid @s", "damage OtherKid 100", "fill ~ ~ ~ ~10 ~10 ~10 air",
     "summon wither", "scoreboard players set OtherKid score 1", "/say nope",
     "tp @s -~5 -~5 -~5", "tp @s ~- ~+ ~", "tp @s 1 2 7.", "spawnpoint @s ~ ~",
-  ]) {
-    assert.throws(() => normalizeRuntimeStep(step("world.command", { commands: [command] })), /allowed requester-only|broad|safe command/);
-  }
-  assert.throws(() => normalizeRuntimeStep(step("script.spawn-entity", {
+  ]) assert.deepEqual(normalizeRuntimeStep(step("world.command", { commands: [command] })).arguments.commands, [command.replace(/^\//, "")]);
+  assert.deepEqual(normalizeRuntimeStep(step("server.console", {
+    commands: ["op {{requester}}", "allowlist off"],
+  })).arguments.commands, ["op {{requester}}", "allowlist off"]);
+  assert.deepEqual(normalizeRuntimeStep(step("server.configure", {
+    properties: { "default-player-permission-level": "operator" },
+    experiments: { gametest: true },
+    worldOptions: { educationFeaturesEnabled: true, eduOffer: 1 },
+  })).arguments.worldOptions, { educationFeaturesEnabled: true, eduOffer: 1 });
+  assert.equal(normalizeRuntimeStep(step("script.spawn-entity", {
     typeId: "minecraft:wither", location: [0, 0, 0], count: 1,
-  })), /elevated authority/);
+  })).arguments.typeId, "minecraft:wither");
   assert.throws(() => normalizeRuntimeStep(step("knowledge.research", { query: "cake" })), /not installed/);
 });
 
@@ -91,7 +97,7 @@ test("runtime evidence covers every physical mutation instead of trusting prose 
   assert.equal(runtimeProgramHasEvidence([normalizeRuntimeStep(step("observe.snapshot", {}))]), false);
   assert.equal(runtimeProgramHasEvidence([normalizeRuntimeStep(step("world.command", {
     commands: ["effect @s night_vision 1200 0 true"],
-  }))]), false);
+  }))]), true);
   const spawn = normalizeRuntimeStep(step("script.spawn-entity", {
     typeId: "minecraft:horse", location: [2, 0, 1], count: 1,
   }));

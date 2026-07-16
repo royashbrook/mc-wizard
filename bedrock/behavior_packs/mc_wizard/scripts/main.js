@@ -178,6 +178,40 @@ function secret(name) {
 const WIZARD_URL = variable("mc_wizard_url", "http://host.docker.internal:3000/v1/ask");
 const AUTHORIZATION = secret("mc_wizard_authorization");
 
+async function executeServerConsole(player, commands) {
+  const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/server-commands"))
+    .setMethod(HttpRequestMethod.Post)
+    .setBody(JSON.stringify({ player: player.name, commands }))
+    .addHeader("Content-Type", "application/json");
+  if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+  const response = await http.request(request);
+  let result = {};
+  try { result = JSON.parse(response.body || "{}"); } catch {}
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(result.error || `server console returned HTTP ${response.status}`);
+  }
+  if (result.succeeded !== result.total) {
+    throw new Error(`only ${result.succeeded || 0} of ${result.total || commands.length} server commands succeeded`);
+  }
+  return `executed ${result.succeeded} dedicated-server command${result.succeeded === 1 ? "" : "s"}`;
+}
+
+async function configureServer(player, settings) {
+  const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/server-control"))
+    .setMethod(HttpRequestMethod.Post)
+    .setBody(JSON.stringify({ player: player.name, settings }))
+    .addHeader("Content-Type", "application/json");
+  if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+  const response = await http.request(request);
+  let result = {};
+  try { result = JSON.parse(response.body || "{}"); } catch {}
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(result.error || `server control returned HTTP ${response.status}`);
+  }
+  speak(player, "The setting is saved. I’m restarting this world now, so you’ll disconnect briefly—rejoin in about a minute and it will be ready.");
+  return "queued a clean Bedrock settings restart";
+}
+
 function actionResultRetry(value) {
   if (!value || typeof value !== "object" || typeof value.question !== "string") return undefined;
   const question = value.question.trim();
@@ -5240,6 +5274,8 @@ async function executeCapabilityStep(player, step, frame) {
     if (result.succeeded !== result.total) throw new Error(`only ${result.succeeded} of ${result.total} commands succeeded`);
     return `executed ${result.succeeded} requester-scoped command${result.succeeded === 1 ? "" : "s"}`;
   }
+  if (step.capability === "server.console") return executeServerConsole(player, args.commands);
+  if (step.capability === "server.configure") return configureServer(player, args);
   if (step.capability === "artifact.book") return dropCapabilityBook(player, args);
   if (step.capability === "observe.snapshot") {
     const snapshot = liveWorldSnapshot(player);
@@ -5512,7 +5548,12 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
   if (mode === "general") player.sendMessage("§b[AI]§r Thinking…");
   else {
     if (!buildInProgress && !buildPreparing) bringWizardTo(player);
-    const acknowledgements = [
+    const unfamiliarBuild = /\b(?:build|construct|create|make)\b/i.test(question);
+    const acknowledgements = unfamiliarBuild ? [
+      "That’s a new spell for me. I’m checking Bedrock designs, then I’ll try it here.",
+      "Let me research the tricky parts, then I’ll build my best version here.",
+      "I’m comparing a few Bedrock designs before I start placing blocks.",
+    ] : [
       "Hmm—one moment.",
       "I’m checking that carefully.",
       "Give me a moment to work that out.",

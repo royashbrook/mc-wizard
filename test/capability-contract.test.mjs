@@ -6,12 +6,13 @@ import {
   capabilityProgramRequiredAuthority,
   validateCapabilityProgram,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-program.js";
+import { runtimeProgramHasEvidence } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
 import {
   allowedWizardAction,
   allowedWizardGoal,
   wizardSkillPrompt,
 } from "../src/skills.mjs";
-import { classifyAction } from "../src/wizard.mjs";
+import { classifyAction, createWizard } from "../src/wizard.mjs";
 
 test("capability programs compose novel actions without extending the response union", () => {
   const program = {
@@ -75,6 +76,33 @@ test("capability programs compose novel actions without extending the response u
   });
 });
 
+test("the compiler derives exact final block evidence from validated placements", () => {
+  const action = allowedWizardAction({
+    type: "execute_program",
+    version: 1,
+    program: {
+      title: "Furniture table",
+      steps: [{
+        id: "place_table",
+        capability: "player.place-blocks",
+        arguments: { blocks: [{
+          itemId: "minecraft:oak_planks",
+          target: [0, 1, 0],
+          support: [0, 0, 0],
+          expectedType: "minecraft:oak_planks",
+        }] },
+        expect: "The furniture table is placed.",
+      }],
+    },
+  });
+  assert.equal(action.type, "execute_program");
+  assert.equal(action.program.steps.at(-1).capability, "verify.blocks");
+  assert.deepEqual(action.program.steps.at(-1).arguments.blocks, [{
+    target: [0, 1, 0], typeId: "minecraft:oak_planks",
+  }]);
+  assert.equal(runtimeProgramHasEvidence(action.program.steps), true);
+});
+
 test("capability programs derive admin authority and reject unsafe or ambiguous data", () => {
   const ownerProgram = validateCapabilityProgram({
     title: "Private family server",
@@ -123,19 +151,34 @@ test("dimension travel is a validated in-world capability", () => {
   assert.match(wizardSkillPrompt(), /do not build a portal-shaped structure as a substitute/i);
 });
 
-test("requester-scoped Bedrock commands are executable but admin and broad selectors are rejected", () => {
+test("trusted-family Bedrock commands allow every Minecraft target and admin action", () => {
   const action = { type: "run_commands", version: 1, commands: ["effect @s night_vision 999999 0 true"] };
   assert.deepEqual(allowedWizardAction(action), action);
-  assert.equal(allowedWizardAction({ ...action, commands: ["effect @a night_vision 60"] }), null);
-  assert.equal(allowedWizardAction({ ...action, commands: ["effect OtherKid night_vision 60"] }), null);
-  assert.equal(allowedWizardAction({ ...action, commands: ["op @s"] }), null);
-  assert.equal(allowedWizardAction({ ...action, commands: ["execute as @s run op @s"] }), null);
-  assert.equal(allowedWizardAction({ ...action, commands: ["kill OtherKid"] }), null);
-  assert.equal(allowedWizardAction({ ...action, commands: ["tp OtherKid @s"] }), null);
-  assert.equal(allowedWizardAction({ ...action, commands: ["damage OtherKid 100"] }), null);
-  assert.equal(allowedWizardAction({ ...action, commands: ["fill ~ ~ ~ ~10 ~10 ~10 air"] }), null);
-  assert.equal(allowedWizardAction({ ...action, commands: ["/effect @s night_vision 60"] }), null);
-  assert.match(wizardSkillPrompt(), /use @s for the requesting child/i);
+  for (const command of [
+    "effect @a night_vision 60", "effect OtherKid night_vision 60", "op @s",
+    "execute as @s run op @s", "kill OtherKid", "tp OtherKid @s", "damage OtherKid 100",
+    "fill ~ ~ ~ ~10 ~10 ~10 air", "/effect @s night_vision 60",
+  ]) assert.ok(allowedWizardAction({ ...action, commands: [command] }));
+  assert.match(wizardSkillPrompt(), /broad selectors are allowed/i);
+  assert.match(wizardSkillPrompt(), /trusted private family sandbox/i);
+});
+
+test("operator requests route to the dedicated-server hand instead of a structure", () => {
+  for (const question of ["wiz, make me an operator", "op me please", "give me operator permissions"]) {
+    const action = classifyAction(question);
+    assert.equal(action.type, "execute_program", question);
+    assert.equal(action.program.steps[0].capability, "server.console", question);
+    assert.deepEqual(action.program.steps[0].arguments.commands, ["op {{requester}}"], question);
+  }
+  assert.deepEqual(classifyAction("deop me").program.steps[0].arguments.commands, ["deop {{requester}}"]);
+});
+
+test("the full Wizard turn keeps operator intent out of generic build fallback", async () => {
+  const wizard = createWizard({ corpus: { search: () => [] }, env: {} });
+  const result = await wizard.ask({ player: "OperatorKid", question: "wiz, make me an operator" });
+  assert.equal(result.action.type, "execute_program");
+  assert.equal(result.action.program.steps[0].capability, "server.console");
+  assert.doesNotMatch(result.answer, /first-pass|size guide/i);
 });
 
 test("rich item delivery supports exact connected recipients, names, enchantments, and large amounts", () => {

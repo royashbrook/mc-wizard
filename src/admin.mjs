@@ -1,12 +1,10 @@
-import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { fileURLToPath } from "node:url";
+import { runProcess as run, sendBedrockCommand, validateMinecraftCommand } from "./bedrock-console.mjs";
 import { readRecentInteractions } from "./interaction-log.mjs";
 import { readRuntimeSettings, writeRuntimeSettings } from "./runtime-settings.mjs";
 
 const MAX_BODY_BYTES = 20 * 1024;
-const ROSETTA_SEND_SCRIPT = 'for p in /proc/[0-9]*; do cmd=$(tr "\\000" " " < "$p/cmdline" 2>/dev/null) || continue; case "$cmd" in ./bedrock_server-*) printf "%s\\n" "$1" > "$p/fd/0"; exit $?;; esac; done; echo "ERROR: Bedrock process not found" >&2; exit 2';
-
 function send(response, status, body, type = "application/json; charset=utf-8") {
   const value = type.startsWith("application/json") ? JSON.stringify(body) : body;
   response.writeHead(status, {
@@ -50,32 +48,7 @@ async function readJson(request) {
 }
 
 export function validateConsoleCommand(value) {
-  const command = typeof value === "string" ? value.trim() : "";
-  if (!command || command.length > 500 || /[\r\n\0]/.test(command)) {
-    throw Object.assign(new Error("command must be one line with 1-500 characters"), { status: 400 });
-  }
-  return command.replace(/^\//, "");
-}
-
-function run(command, args, timeout = 8_000) {
-  return new Promise((resolve) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
-    const output = [];
-    const collect = (chunk) => {
-      if (output.reduce((size, item) => size + item.length, 0) < 128 * 1024) output.push(chunk);
-    };
-    child.stdout.on("data", collect);
-    child.stderr.on("data", collect);
-    const timer = setTimeout(() => child.kill("SIGTERM"), timeout);
-    child.once("error", (error) => {
-      clearTimeout(timer);
-      resolve({ code: 127, output: error.message });
-    });
-    child.once("exit", (code) => {
-      clearTimeout(timer);
-      resolve({ code: code ?? 1, output: Buffer.concat(output).toString("utf8").trim() });
-    });
-  });
+  return validateMinecraftCommand(value);
 }
 
 async function probe(url, fetchImpl) {
@@ -85,14 +58,6 @@ async function probe(url, fetchImpl) {
   } catch {
     return { ok: false };
   }
-}
-
-async function sendBedrockCommand(execute, command) {
-  let result = await execute("container", ["exec", "mc-wizard-bedrock", "send-command", command]);
-  if (result.code !== 0 && /unable to find bedrock server process/i.test(result.output)) {
-    result = await execute("container", ["exec", "mc-wizard-bedrock", "sh", "-c", ROSETTA_SEND_SCRIPT, "mc-wizard", command]);
-  }
-  return result;
 }
 
 const PAGE = `<!doctype html>

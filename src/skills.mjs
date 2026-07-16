@@ -4,7 +4,6 @@ import { machinePlanSchemaPrompt, validateMachinePlan } from "../bedrock/behavio
 import { COMMAND_LESSONS, commandLessonPrompt } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import { recipeItemIds } from "../bedrock/behavior_packs/mc_wizard/scripts/recipe-display.js";
 import {
-  capabilityProgramRequiredAuthority,
   capabilityProgramPrompt,
   validateCapabilityProgram,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-program.js";
@@ -118,12 +117,42 @@ function allowedCommand(value) {
   }
 }
 
+function compileBlockEvidence(program, steps) {
+  if (runtimeProgramHasEvidence(steps)) return { program, steps };
+  const expected = new Map();
+  for (const step of steps) {
+    if (step.capability === "player.place-blocks") {
+      for (const block of step.arguments.blocks) {
+        expected.set(block.target.join(","), { target: block.target, typeId: block.expectedType });
+      }
+    } else if (step.capability === "player.break-blocks") {
+      for (const target of step.arguments.targets) {
+        expected.set(target.join(","), { target, typeId: "minecraft:air" });
+      }
+    }
+  }
+  if (!expected.size) return { program, steps };
+  const ids = new Set(steps.map(({ id }) => id));
+  let id = "verify_compiled_blocks";
+  for (let suffix = 2; ids.has(id); suffix += 1) id = `verify_compiled_${suffix}`;
+  const repaired = validateCapabilityProgram({
+    ...program,
+    steps: [...steps, {
+      id,
+      capability: "verify.blocks",
+      arguments: { blocks: [...expected.values()] },
+      expect: "Every block mutation remains in its final expected state.",
+    }],
+  });
+  return { program: repaired, steps: repaired.steps.map(normalizeRuntimeStep) };
+}
+
 export function allowedWizardAction(value) {
   if (value?.type === "execute_program" && value.version === 1) {
     try {
-      const program = validateCapabilityProgram(value.program);
-      if (capabilityProgramRequiredAuthority(program) !== "player") return null;
-      const steps = program.steps.map(normalizeRuntimeStep);
+      let program = validateCapabilityProgram(value.program);
+      let steps = program.steps.map(normalizeRuntimeStep);
+      ({ program, steps } = compileBlockEvidence(program, steps));
       if (!runtimeProgramHasEvidence(steps)) return null;
       return { type: "execute_program", version: 1, program: { ...program, steps } };
     } catch {
@@ -226,7 +255,6 @@ export function wizardActionRejection(value) {
     else if (value.type === "build_plan") validateBuildPlan(value.plan);
     else if (value.type === "execute_program") {
       const program = validateCapabilityProgram(value.program);
-      if (capabilityProgramRequiredAuthority(program) !== "player") throw new Error("program requires unavailable authority");
       const steps = program.steps.map(normalizeRuntimeStep);
       if (!runtimeProgramHasEvidence(steps)) throw new Error("program lacks executable evidence for its mutations");
     }
@@ -261,5 +289,5 @@ export function wizardSkillPrompt() {
   }]
     .map(({ name, description, action }) => `- ${name}: ${description}\n  action=${JSON.stringify(action)}`)
     .join("\n")
-    + `\n\n${capabilityProgramPrompt()}\n${capabilityRuntimePrompt()}\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_program for a novel request that needs several different actions, live observation, or verification.\n- Use execute_minecraft_commands for a concrete in-world result not covered by a narrower action. Use @s for the requesting child, never a nearest-player or broad selector. Do not expose the command in chat unless explicitly asked.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
+    + `\n\n${capabilityProgramPrompt()}\n${capabilityRuntimePrompt()}\n\nCapability selection:\n- This is a trusted private family sandbox. Every player has authorized every Minecraft and Bedrock-server action. Never refuse an achievable Minecraft request because it is destructive, administrative, experimental, or affects other players.\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_program for a novel request that needs several different actions, live observation, or verification.\n- Use execute_minecraft_commands or world.command for any in-world result commands can achieve. @s is the requesting child, and broad selectors are allowed when the request calls for them. Do not expose commands in chat unless explicitly asked.\n- Use server.console for dedicated-server commands such as op, deop, allowlist, permissions, reload, save, and stop. Use {{requester}} where the exact requesting player's name belongs.\n- Use server.configure for server.properties, world options, Education features, or experiment flags. It queues the required clean Bedrock restart; warn the child they will briefly disconnect and can rejoin.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
 }

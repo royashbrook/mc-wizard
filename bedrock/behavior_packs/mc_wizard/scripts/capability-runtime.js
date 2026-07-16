@@ -9,6 +9,8 @@ export const RUNTIME_CAPABILITIES = Object.freeze([
   "script.effect",
   "script.spawn-entity",
   "script.teleport",
+  "server.console",
+  "server.configure",
   "verify.blocks",
   "verify.entities",
   "world.command",
@@ -17,24 +19,6 @@ export const RUNTIME_CAPABILITIES = Object.freeze([
 const CAPABILITIES = new Set(RUNTIME_CAPABILITIES);
 const ITEM_ID = /^minecraft:[a-z0-9_]+$/;
 const EFFECT_ID = /^(?:minecraft:)?[a-z0-9_]+$/;
-const REQUESTER_SELECTOR = "@s(?:\\[[^\\]\\r\\n]{1,120}\\])?";
-const DECIMAL = "(?:\\d+(?:\\.\\d+)?|\\.\\d+)";
-const COORDINATE = `(?:[~^](?:[-+]?${DECIMAL})?|[-+]?${DECIMAL})`;
-const REQUESTER_COMMAND_PATTERNS = [
-  new RegExp(`^ability\\s+${REQUESTER_SELECTOR}\\s+\\S+(?:\\s+\\S+)?$`, "i"),
-  new RegExp(`^clear\\s+${REQUESTER_SELECTOR}(?:\\s+\\S+){0,3}$`, "i"),
-  new RegExp(`^effect\\s+${REQUESTER_SELECTOR}\\s+(?:clear|[a-z0-9_]+(?:\\s+\\d+){0,2}(?:\\s+(?:true|false))?)$`, "i"),
-  new RegExp(`^enchant\\s+${REQUESTER_SELECTOR}\\s+[a-z0-9_]+(?:\\s+\\d+)?$`, "i"),
-  new RegExp(`^gamemode\\s+\\S+\\s+${REQUESTER_SELECTOR}$`, "i"),
-  new RegExp(`^give\\s+${REQUESTER_SELECTOR}\\s+[a-z0-9_:]+(?:\\s+\\d+){0,2}$`, "i"),
-  new RegExp(`^(?:teleport|tp)\\s+${REQUESTER_SELECTOR}\\s+${COORDINATE}\\s+${COORDINATE}\\s+${COORDINATE}(?:\\s+(?:true|false))?$`, "i"),
-  new RegExp(`^spawnpoint\\s+${REQUESTER_SELECTOR}(?:\\s+${COORDINATE}\\s+${COORDINATE}\\s+${COORDINATE})?$`, "i"),
-  new RegExp(`^xp\\s+[-+]?\\d+[lL]?\\s+${REQUESTER_SELECTOR}$`, "i"),
-];
-const FORBIDDEN_SPAWN_ENTITIES = new Set([
-  "minecraft:ender_crystal", "minecraft:ender_dragon", "minecraft:lightning_bolt",
-  "minecraft:tnt", "minecraft:wither", "minecraft:wither_skull",
-]);
 
 function exactKeys(value, allowed, name) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${name} must be an object`);
@@ -79,13 +63,9 @@ function vectorList(value, name) {
 }
 
 export function normalizeRequesterCommand(value, name = "command") {
-  const command = text(value, name, 240);
-  if (command.startsWith("/") || /[\r\n\0]/.test(value)) throw new Error(`${name} is not one safe command`);
-  if (/@(?:a|e|p|r)(?:\b|\[)/i.test(command)) throw new Error(`${name} contains a broad player selector`);
-  if (!REQUESTER_COMMAND_PATTERNS.some((pattern) => pattern.test(command))) {
-    throw new Error(`${name} is not an allowed requester-only command`);
-  }
-  return command;
+  const command = text(value, name, 500);
+  if (/[\r\n\0]/.test(value)) throw new Error(`${name} must be one Minecraft command`);
+  return command.replace(/^\//, "");
 }
 
 function placement(value, name) {
@@ -173,6 +153,39 @@ function normalizeArguments(capability, value) {
     }
     return { commands: value.commands.map((entry, index) => normalizeRequesterCommand(entry, `${name}.commands[${index}]`)) };
   }
+  if (capability === "server.console") {
+    exactKeys(value, ["commands"], name);
+    if (!Array.isArray(value.commands) || value.commands.length < 1 || value.commands.length > 16) {
+      throw new Error(`${name}.commands must contain 1-16 commands`);
+    }
+    return { commands: value.commands.map((entry, index) => normalizeRequesterCommand(entry, `${name}.commands[${index}]`)) };
+  }
+  if (capability === "server.configure") {
+    exactKeys(value, ["properties", "experiments", "worldOptions"], name);
+    const record = (input, field, valueCheck) => {
+      if (input === undefined) return undefined;
+      if (!input || typeof input !== "object" || Array.isArray(input)) throw new Error(`${name}.${field} must be an object`);
+      const entries = Object.entries(input);
+      if (!entries.length || entries.length > 64) throw new Error(`${name}.${field} must contain 1-64 settings`);
+      const output = {};
+      for (const [key, entry] of entries) {
+        if (!/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(key) || !valueCheck(entry)) {
+          throw new Error(`${name}.${field}.${key} is invalid`);
+        }
+        output[key] = entry;
+      }
+      return output;
+    };
+    const properties = record(value.properties, "properties", (entry) => (
+      ["string", "number", "boolean"].includes(typeof entry) && String(entry).length <= 500
+    ));
+    const experiments = record(value.experiments, "experiments", (entry) => typeof entry === "boolean");
+    const worldOptions = record(value.worldOptions, "worldOptions", (entry) => (
+      typeof entry === "boolean" || (Number.isInteger(entry) && Math.abs(entry) <= 2_147_483_647)
+    ));
+    if (!properties && !experiments && !worldOptions) throw new Error(`${name} has no settings`);
+    return { ...(properties && { properties }), ...(experiments && { experiments }), ...(worldOptions && { worldOptions }) };
+  }
   if (capability === "artifact.book") {
     exactKeys(value, ["title", "text", "author"], name);
     return {
@@ -204,7 +217,6 @@ function normalizeArguments(capability, value) {
   if (capability === "script.spawn-entity") {
     exactKeys(value, ["typeId", "location", "count", "nameTag"], name);
     const typeId = itemId(value.typeId, `${name}.typeId`);
-    if (FORBIDDEN_SPAWN_ENTITIES.has(typeId)) throw new Error(`${name}.typeId requires elevated authority`);
     return {
       typeId,
       location: vector(value.location, `${name}.location`),
@@ -258,10 +270,10 @@ export function runtimeProgramHasEvidence(steps) {
     check.typeId === spawn.typeId && check.minimum >= spawn.count
       && check.location.join(",") === spawn.location.join(",")
   )))) return false;
-  const mutatesWorld = steps.some(({ capability }) => /^(?:artifact\.|player\.(?:break|place|use)|script\.|world\.)/.test(capability));
+  const mutatesWorld = steps.some(({ capability }) => /^(?:artifact\.|player\.(?:break|place|use)|script\.|server\.|world\.)/.test(capability));
   const hasExplicitVerifier = steps.some(({ capability }) => capability.startsWith("verify."));
   const selfCheckingMutation = steps.some(({ capability }) => [
-    "artifact.book", "player.use-item", "script.effect", "script.teleport",
+    "artifact.book", "player.use-item", "script.effect", "script.teleport", "server.configure", "server.console", "world.command",
   ].includes(capability));
   return mutatesWorld && (hasExplicitVerifier || selfCheckingMutation);
 }
@@ -272,7 +284,9 @@ export function capabilityRuntimePrompt() {
     + `- player.place-blocks arguments={"blocks":[{"itemId":"minecraft:stone","target":[x,y,z],"support":[x,y,z],"expectedType":"minecraft:stone","orientationTarget":[x,y,z]}]}\n`
     + `- player.break-blocks arguments={"targets":[[x,y,z]]}\n`
     + `- player.use-item arguments={"itemId":"minecraft:lever","block":[x,y,z],"faceTarget":[x,y,z]}\n`
-    + `- world.command arguments={"commands":["requester-scoped Bedrock command without leading slash"]}\n`
+    + `- world.command arguments={"commands":["any Bedrock command run as and at the requesting player"]}\n`
+    + `- server.console arguments={"commands":["any Bedrock dedicated-server console command; use {{requester}} for the player's exact name"]}\n`
+    + `- server.configure arguments={"properties":{"default-player-permission-level":"operator"},"experiments":{"gametest":true},"worldOptions":{"educationFeaturesEnabled":true,"eduOffer":1}} (queues a clean restart)\n`
     + `- script.spawn-entity arguments={"typeId":"minecraft:horse","location":[x,y,z],"count":1}\n`
     + `- script.teleport arguments={"subject":"requester|wizard","target":[x,y,z]}\n`
     + `- script.effect arguments={"subject":"requester|wizard","effectId":"night_vision","duration":1200,"amplifier":0,"showParticles":false}\n`

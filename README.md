@@ -1,6 +1,6 @@
 # MC Wizard
 
-A Bedrock-first spike for an AI Minecraft teacher that can answer questions from versioned sources and request safe, allow-listed demonstrations in a child's world.
+A Bedrock-first spike for an AI Minecraft teacher that can answer questions from versioned sources and act as an all-capable Wizard in a trusted private family world.
 
 The intended vertical slice is:
 
@@ -11,7 +11,7 @@ iPad / Bedrock chat
   → visible MC Wizard SimulatedPlayer (an official Player subclass)
   → local HTTP brain
   → Bedrock RAG + optional external model
-  → typed, allow-listed action
+  → typed Minecraft, player, world, or server action
   → MC Wizard walks, looks, chats, holds, and places the approved blocks
 ```
 
@@ -122,9 +122,11 @@ For the local subscription-backed bridge used by this spike, start this first:
 npm run start:ai
 ```
 
-`mtok-bridge` provides the OpenAI-compatible transport. Its upstream can be the authenticated local Codex, Grok, or Claude CLI. Codex runs ephemerally in a read-only sandbox with user configuration, rules, apps, multi-agent, and shell tools disabled. Grok runs single-turn with memory, subagents, web search, and tools disabled; Claude uses safe mode, an empty tool list, and no session persistence. The provider receives only the model prompt: it cannot act in Minecraft. The loopback bridge rejects browser-originated and non-JSON requests. It runs three provider jobs by default (bounded to 2–4), bounds queue waits, and terminates the active CLI immediately when a player disconnects or the request times out. Then start the brain with `npm start`.
+`mtok-bridge` provides the OpenAI-compatible transport. Its upstream can be the authenticated local Codex, Grok, or Claude CLI. Codex runs ephemerally with native web search in a read-only sandbox; user configuration, rules, apps, multi-agent, and shell tools are disabled. Grok runs single-turn with memory, subagents, web search, and tools disabled; Claude uses safe mode, an empty tool list, and no session persistence. The provider receives only the model prompt: it cannot act in Minecraft. The loopback bridge rejects browser-originated and non-JSON requests. It runs three provider jobs by default (bounded to 2–4), bounds queue waits, and terminates the active CLI immediately when a player disconnects or the request times out. Then start the brain with `npm start`.
 
 Greetings, readiness checks, thanks, jokes, calculator builds, T flip-flops, and small castle gates run as immediate local skills without an AI request. Deeper questions use the cached corpus as evidence for the configured model to synthesize; raw documentation is never used as a chat fallback. Every provider action is checked against the child's explicit intent before it can reach Bedrock, and an unrelated provider goal cannot attach itself to ordinary conversation. Build requests create a persisted goal with observable success criteria. If an unusual shape cannot be planned after the bounded repair attempt, the Wizard places a clearly described footprint-and-height layout as useful progress and automatically continues the same goal; it never labels that layout as the finished object. A completed placement batch is only an observation: Bedrock returns a fresh world snapshot, the goal reviewer either marks the goal complete or issues the next related correction, and at most six automatic actions can run before the Wizard explicitly asks the child to inspect the still-active project. New child requests supersede older planning and late provider replies atomically. The Bedrock log message `Running AutoCompaction...` is database maintenance, not an AI request; the operator desk hides those routine lines and reports that they use zero AI tokens.
+
+Unfamiliar build requests explicitly require the Codex planner to research current Bedrock mechanics before returning one executable action. It may cross-check official documentation, community guides, and accessible video descriptions or transcripts, but it must synthesize rather than dump sources and must distinguish Bedrock from Java. When a completed build receives a grade of 4 or 5 without a requested correction, its validated relative action is stored in ignored `runtime/brain/learned-recipes.json` and can be reused for equivalent wording without another model call. A low grade or correction removes a reused recipe and enters the existing same-project refinement loop; only the later successful version can be promoted. Recipe records contain no player identity and are bounded by `LEARNED_RECIPES_MAX` (default 100).
 
 In game, `ai <question>` always means this general model route. It requires the `ai` keyword even when the player is alone or beside the Wizard, skips Minecraft RAG and Wizard actions, and prefixes short replies with the configured provider label, such as `[ChatGPT]`. Replies over 700 characters are placed in a signed book at the player's feet. Ordinary chat and `wiz`/`wizard` continue through the Minecraft-specialist route.
 
@@ -172,7 +174,7 @@ Address the character in chat:
 - `wizard, come here` asks MC Wizard to walk to the speaker and face them.
 - `wizard, stay` stops its current movement.
 
-The movement commands control only the embodied character. Build requests still cross the typed allow-list: the model cannot invent commands, arbitrary JavaScript, block coordinates, or unbounded builds.
+The movement commands control only the embodied character. In trusted-family mode the model can also compose physical builds, any Minecraft command, dedicated-server console commands, server properties, experiments, and world options. It still cannot execute arbitrary host JavaScript or shell commands.
 
 Addressed chat is the reliable interaction in this slice. Bedrock may not show a touch `Interact` action for another Player, even a simulated one, so tapping the body is an explicit iPad acceptance test rather than a promised control path.
 
@@ -219,11 +221,10 @@ Then:
 
 1. Either put an exported Beta-APIs-enabled world at `runtime/bedrock/worlds/mc-wizard`, or create a disposable fresh one headlessly with `npm run bootstrap:bds`. The bootstrap container publishes no network port, stops BDS cleanly, backs up `level.dat`, structurally enables the three official Beta API experiment bytes, and deletes only its temporary container.
 2. Choose the Mac's private LAN IPv4 first. Copy `.env.example` to `.env`, set `HOST` to that literal address (not `0.0.0.0`), replace `BRIDGE_TOKEN` with at least 24 random characters, and run `npm start`. Leave `WIZARD_SALT` blank to derive a private stable salt from that token, or set it to a different random secret of at least 24 characters. The brain refuses to bind beyond loopback with a default or short token and ignores the old public salt placeholder.
-3. Supply the Mac's private LAN IPv4 and explicitly opt into an open server on that private network:
+3. Supply the Mac's private LAN IPv4:
 
    ```bash
    export MC_WIZARD_LAN_IP=192.168.x.x
-   export MC_WIZARD_OPEN_LAN=1
    ```
 
 4. Activate/configure the behavior pack while BDS is stopped, then launch the pinned image/BDS version:
@@ -241,7 +242,7 @@ Approve the macOS Local Network/incoming-connections prompt if it appears. In th
 
 Stop BDS cleanly with `npm run container:stop`; later starts use `container start mc-wizard-bedrock`. `container start` preserves the old image, BDS version, port, and access mode. After any configuration change: stop BDS; update `.env` and restart the brain; then rerun `install:pack` while BDS is stopped. For a token-only change, run `container start mc-wizard-bedrock`. If the LAN bind, access mode, image digest, or BDS `VERSION` changed, run `npm run container:delete` and then `npm run container:bds`. Deleting the container does not delete the bind-mounted world in `runtime/bedrock`.
 
-The launcher refuses an address that is not a private IPv4 assigned to this Mac or a missing world. It requires either an explicit `MC_WIZARD_OPEN_LAN=1` opt-in or a valid allowlist; `ONLINE_MODE=true` remains enforced. It pins both the OCI image digest and BDS 1.26.33.2 so a restart cannot silently cross a beta-API boundary. `compose.yaml` remains a Docker-compatible alternative, but Apple container is the prepared macOS route.
+The launcher refuses an address that is not a private IPv4 assigned to this Mac or a missing world. This experimental family build is intentionally open to authenticated players on the private LAN and gives new players operator permission. It pins both the OCI image digest and BDS 1.26.33.2 so a restart cannot silently cross a beta-API boundary. `compose.yaml` remains a Docker-compatible alternative, but Apple container is the prepared macOS route.
 
 ### Required iPad/BDS acceptance checks
 

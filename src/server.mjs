@@ -9,8 +9,17 @@ import {
 import { loadCorpus } from "./rag.mjs";
 import { createInteractionLog } from "./interaction-log.mjs";
 import { createFileSessionStore } from "./sessions.mjs";
+import { createFileLearnedRecipeStore } from "./learned-recipes.mjs";
 import { createWizard } from "./wizard.mjs";
 import { readRuntimeSettings } from "./runtime-settings.mjs";
+import { createServerControl } from "./server-control.mjs";
+import { normalizeRuntimeStep } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
+import {
+  requesterCommand,
+  runProcess,
+  sendBedrockCommand,
+  validateMinecraftCommand,
+} from "./bedrock-console.mjs";
 
 const MAX_BODY_BYTES = 128 * 1024;
 const CONTEXT_BLOCK_ID = /^minecraft:[a-z0-9_]{1,48}$/;
@@ -339,6 +348,36 @@ export function validateActionResultBody(body) {
   };
 }
 
+export function validateServerCommandsBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
+  }
+  const player = typeof body.player === "string"
+    ? body.player.replace(/[^a-zA-Z0-9 _-]/g, "").slice(0, 64).trim() : "";
+  if (!player) throw Object.assign(new Error("player must be 1-64 safe characters"), { status: 400 });
+  if (!Array.isArray(body.commands) || body.commands.length < 1 || body.commands.length > 16) {
+    throw Object.assign(new Error("commands must contain 1-16 Minecraft commands"), { status: 400 });
+  }
+  return {
+    player,
+    commands: body.commands.map((command, index) => validateMinecraftCommand(command, `commands[${index}]`)),
+  };
+}
+
+export function validateServerConfigurationBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
+  }
+  const player = typeof body.player === "string"
+    ? body.player.replace(/[^a-zA-Z0-9 _-]/g, "").slice(0, 64).trim() : "";
+  if (!player) throw Object.assign(new Error("player must be 1-64 safe characters"), { status: 400 });
+  try {
+    return { player, settings: normalizeRuntimeStep({ capability: "server.configure", arguments: body.settings }).arguments };
+  } catch (error) {
+    throw Object.assign(new Error(String(error.message || error)), { status: 400 });
+  }
+}
+
 export function validateFeedbackBody(body) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     const error = new Error("request body must be a JSON object");
@@ -393,6 +432,8 @@ export function createHttpServer({
   interactionLog,
   maxConcurrent = 4,
   cooldownMs = 1_500,
+  executeServerCommand,
+  serverControl,
   logger = console,
 }) {
   let inFlight = 0;
@@ -406,6 +447,50 @@ export function createHttpServer({
         provider: wizard.provider,
         inFlight,
       });
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/v1/server-commands") {
+      if (!authorized(request, token)) {
+        sendJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!executeServerCommand) {
+        sendJson(response, 503, { error: "server console is unavailable" });
+        return;
+      }
+      try {
+        const { player, commands } = validateServerCommandsBody(await readJson(request));
+        const results = [];
+        for (const command of commands) {
+          const expanded = requesterCommand(command, player);
+          const result = await executeServerCommand(expanded);
+          results.push({ command: expanded.split(/\s+/, 1)[0], code: result.code, output: String(result.output || "").slice(0, 500) });
+        }
+        const succeeded = results.filter(({ code }) => code === 0).length;
+        logger.log(`[mc-wizard] server console executed ${succeeded}/${commands.length} commands for a player`);
+        sendJson(response, succeeded ? 200 : 503, { succeeded, total: commands.length, results });
+      } catch (error) {
+        if (!error.status || error.status >= 500) logger.error(`[server-console] ${error.stack || error}`);
+        sendJson(response, error.status || 500, { error: error.status ? error.message : "server command failed" });
+      }
+      return;
+    }
+    if (request.method === "POST" && url.pathname === "/v1/server-control") {
+      if (!authorized(request, token)) {
+        sendJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      if (!serverControl) {
+        sendJson(response, 503, { error: "server configuration is unavailable" });
+        return;
+      }
+      try {
+        const { settings } = validateServerConfigurationBody(await readJson(request));
+        sendJson(response, 202, serverControl.queue(settings));
+        logger.log("[mc-wizard] authenticated player queued a Bedrock settings restart");
+      } catch (error) {
+        sendJson(response, error.status || 500, { error: error.status ? error.message : "server configuration failed" });
+      }
       return;
     }
     if (request.method === "DELETE" && url.pathname === "/v1/session") {
@@ -547,6 +632,10 @@ export async function startServer({ env = process.env, logger = console } = {}) 
     maxTurns: Math.min(Math.max(Number(env.SESSION_MAX_TURNS) || 12, 1), 50),
     ttlMs: Math.min(Math.max(Number(env.SESSION_TTL_MS) || 86_400_000, 60_000), 30 * 86_400_000),
   });
+  const recipes = await createFileLearnedRecipeStore({
+    filePath: env.LEARNED_RECIPES_FILE || "runtime/brain/learned-recipes.json",
+    maxRecipes: Math.min(Math.max(Number(env.LEARNED_RECIPES_MAX) || 100, 1), 500),
+  });
   const settingsFile = env.RUNTIME_SETTINGS_FILE || "runtime/admin/settings.json";
   const wizard = createWizard({
     corpus,
@@ -554,6 +643,7 @@ export async function startServer({ env = process.env, logger = console } = {}) 
     safetySalt: wizardSalt,
     logger,
     sessions,
+    recipes,
     settings: () => readRuntimeSettings(settingsFile, logger),
   });
   const interactionLog = createInteractionLog({
@@ -562,7 +652,11 @@ export async function startServer({ env = process.env, logger = console } = {}) 
   });
   const port = Number(env.PORT) || 3000;
   const cooldownMs = Math.min(Math.max(Number(env.REQUEST_COOLDOWN_MS) || 1_500, 0), 60_000);
-  const server = createHttpServer({ wizard, corpus, token, interactionLog, cooldownMs, logger });
+  const server = createHttpServer({
+    wizard, corpus, token, interactionLog, cooldownMs, logger,
+    executeServerCommand: (command) => sendBedrockCommand(runProcess, command),
+    serverControl: createServerControl({ logger }),
+  });
   await new Promise((resolve, reject) => {
     server.once("error", reject);
     server.listen(port, host, resolve);

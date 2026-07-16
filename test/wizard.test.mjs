@@ -630,15 +630,15 @@ test("process discovery patterns cannot match their own pgrep commands", () => {
   assert.match(adminServiceScript, /pid > 0/);
 });
 
-test("pins and confines the Apple container launch to an explicit private-LAN mode", () => {
+test("pins the Apple container launch to trusted open-LAN operator mode", () => {
   assert.match(containerScript, /sha256:45c8f292b289659c0be469b2eaaebfc1fbfefdf5c060a0df5ed53fe9e2e7c563/);
   assert.match(containerScript, /VERSION=1\.26\.33\.2/);
   assert.match(containerScript, /--platform linux\/amd64/);
   assert.doesNotMatch(containerScript, /USE_BOX64/);
-  assert.match(containerScript, /MC_WIZARD_ALLOW_LIST_USERS/);
-  assert.match(containerScript, /MC_WIZARD_OPEN_LAN/);
+  assert.match(containerScript, /trusted open-LAN mode/);
   assert.match(containerScript, /RFC1918 private address/);
-  assert.match(containerScript, /ONLINE_MODE=true/);
+  assert.match(containerScript, /initialize-bedrock-properties/);
+  assert.match(containerScript, /LEVEL_NAME=mc-wizard/);
   assert.match(containerScript, /--publish "\$\{LAN_IP\}:19132:19132\/udp"/);
   assert.doesNotMatch(containerScript, /VERSION=LATEST/);
 });
@@ -2761,9 +2761,10 @@ test("serves a loopback admin desk and sends console text without a shell", asyn
   assert.equal(validateConsoleCommand("/say hello builders"), "say hello builders");
   assert.throws(() => validateConsoleCommand("say hi\nstop"), /one line/);
   const adminScript = await readFile(new URL("../src/admin.mjs", import.meta.url), "utf8");
+  const consoleScript = await readFile(new URL("../src/bedrock-console.mjs", import.meta.url), "utf8");
   assert.match(adminScript, /MC Wizard Operator Desk/);
-  assert.match(adminScript, /\["exec", "mc-wizard-bedrock", "send-command", command\]/);
-  assert.match(adminScript, /ROSETTA_SEND_SCRIPT/);
+  assert.match(consoleScript, /\["exec", "mc-wizard-bedrock", "send-command", command\]/);
+  assert.match(consoleScript, /ROSETTA_SEND_SCRIPT/);
   assert.match(adminScript, /Admin panel is loopback-only/);
   assert.match(adminScript, /setInterval\(loadLogs,4000\)/);
   assert.match(adminScript, /scrollTop=panel\.scrollHeight/);
