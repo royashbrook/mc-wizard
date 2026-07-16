@@ -3599,7 +3599,7 @@ function verifyBlueprint(dimension, blueprint, origin, forward, right) {
       ].includes(blockType(point));
       return ["minecraft:kelp", "minecraft:kelp_plant"].includes(dimension.getBlock(plant)?.typeId)
         && check.waterColumn.every(submergedKelp)
-        && water(check.refillSource)
+        && check.refillSources.every(water)
         && check.collectionStream.every(water)
         && correctBlockFacing(dimension, piston, customLocation(origin, forward, right, check.harvest))
         && correctBlockFacing(dimension, observer, customLocation(origin, forward, right, check.sensedGrowth))

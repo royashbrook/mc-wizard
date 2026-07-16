@@ -144,6 +144,8 @@ test("offers a focused live child-action acceptance scope", () => {
   assert.match(pack, /async function proveRemoteGift\(kid, station\)/);
   assert.match(pack, /\{ dimension: kid\.dimension, x: station\.x \+ 0\.5/);
   assert.match(pack, /friend\.addTag\(TEST_TAG\)/);
+  assert.match(pack, /playerAndDroppedItemAmount\(friend, "minecraft:diamond", "Seven Stars"\) === 7/);
+  assert.match(pack, /remote gift proof requires both players to start without diamonds/);
   assert.equal(
     packageJson.scripts["test:e2e:delivery"],
     "MC_WIZARD_E2E_SCOPE=delivery sh scripts/run-e2e-container.sh",

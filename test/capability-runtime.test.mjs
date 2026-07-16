@@ -56,7 +56,7 @@ test("runtime keeps ordinary commands requester-scoped and rejects server author
     commands: ["effect @s night_vision 1200 0 true"],
   })).arguments.commands, ["effect @s night_vision 1200 0 true"]);
   for (const command of [
-    "tp @s ~ ~-5 ~", "tp @s -12.5 ~+2 7", "tp @s .5 ~-.25 7.", "tp @s ^ ^ ^5",
+    "tp @s ~ ~-5 ~", "tp @s -12.5 ~+2 7", "tp @s .5 ~-.25 7", "tp @s ^ ^ ^5",
     "spawnpoint @s ~ ~ ~-1",
   ]) {
     assert.deepEqual(normalizeRuntimeStep(step("world.command", { commands: [command] })).arguments.commands, [command]);
@@ -65,7 +65,7 @@ test("runtime keeps ordinary commands requester-scoped and rejects server author
     "kick OtherKid", "kill OtherKid", "effect @a night_vision 20", "effect OtherKid night_vision 20",
     "execute as @s run op @s", "tp OtherKid @s", "damage OtherKid 100", "fill ~ ~ ~ ~10 ~10 ~10 air",
     "summon wither", "scoreboard players set OtherKid score 1", "/say nope",
-    "tp @s -~5 -~5 -~5", "tp @s ~- ~+ ~", "spawnpoint @s ~ ~",
+    "tp @s -~5 -~5 -~5", "tp @s ~- ~+ ~", "tp @s 1 2 7.", "spawnpoint @s ~ ~",
   ]) {
     assert.throws(() => normalizeRuntimeStep(step("world.command", { commands: [command] })), /allowed requester-only|broad|safe command/);
   }

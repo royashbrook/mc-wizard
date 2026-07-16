@@ -1174,8 +1174,8 @@ function automaticKelpFarmIsWorking(kid, station) {
   const hopper = machineLocation(origin, [0, 4, 2]);
   const plant = machineLocation(origin, [0, 1, 4]);
   const piston = machineLocation(origin, [0, 2, 5]);
-  const observer = machineLocation(origin, [-1, 2, 4]);
-  const refillSource = machineLocation(origin, [1, 2, 4]);
+  const observer = machineLocation(origin, [-1, 3, 4]);
+  const refillSources = [[1, 2, 4], [0, 2, 3]].map((point) => machineLocation(origin, point));
   const water = (location) => blockIs(dimension, location, ["minecraft:water", "minecraft:flowing_water"]);
   const submergedKelp = (location) => blockIs(dimension, location, [
     "minecraft:water",
@@ -1189,7 +1189,7 @@ function automaticKelpFarmIsWorking(kid, station) {
     && blockIs(dimension, plant, ["minecraft:kelp", "minecraft:kelp_plant"])
     && [2, 3, 4, 5].every((y) => submergedKelp(machineLocation(origin, [0, y, 4])))
     && [3, 2].every((z) => water(machineLocation(origin, [0, 5, z])))
-    && water(refillSource)
+    && refillSources.every(water)
     && blockIs(dimension, piston, "minecraft:piston")
     && blockIs(dimension, observer, "minecraft:observer")
     && containerContains(dimension, chest, "minecraft:kelp");
@@ -1220,12 +1220,30 @@ async function proveLiveKelpHarvest(kid, station) {
   dimension.runCommand("gamerule randomtickspeed 1000");
   let observerPowered = false;
   let pistonExtended = false;
+  let harvestCellRefilled = false;
+  let outputCollected = false;
   try {
     for (let tick = 0; tick < 800; tick += 1) {
-      observerPowered ||= dimension.getBlock(at([-1, 2, 4]))?.permutation.getState("powered_bit") === true;
+      observerPowered ||= dimension.getBlock(at([-1, 3, 4]))?.permutation.getState("powered_bit") === true;
       pistonExtended ||= /piston_arm/.test(dimension.getBlock(at([0, 2, 4]))?.typeId || "");
-      if (containerContains(dimension, chest, "minecraft:kelp")) return;
+      if (containerContains(dimension, chest, "minecraft:kelp")) {
+        outputCollected = true;
+        break;
+      }
       await system.waitTicks(1);
+    }
+    if (outputCollected) {
+      dimension.runCommand("gamerule randomtickspeed 1");
+      for (let tick = 0; tick < 80; tick += 1) {
+        harvestCellRefilled = blockIs(dimension, at([0, 2, 4]), [
+          "minecraft:water",
+          "minecraft:flowing_water",
+          "minecraft:kelp",
+          "minecraft:kelp_plant",
+        ]);
+        if (harvestCellRefilled) return;
+        await system.waitTicks(1);
+      }
     }
     const dropped = dimension.getEntities({ type: "minecraft:item", location: plant, maxDistance: 12 })
       .map((entity) => entity.getComponent("minecraft:item")?.itemStack?.typeId)
@@ -1240,15 +1258,16 @@ async function proveLiveKelpHarvest(kid, station) {
     };
     const column = [1, 2, 3, 4, 5].map((y) => blockSnapshot([0, y, 4]));
     const circuit = [
-      blockSnapshot([-1, 2, 4]),
-      blockSnapshot([-2, 2, 4]),
-      blockSnapshot([-2, 2, 5]),
-      blockSnapshot([-1, 2, 5]),
+      blockSnapshot([-1, 3, 4]),
+      blockSnapshot([-2, 3, 4]),
+      blockSnapshot([-2, 3, 5]),
+      blockSnapshot([-1, 3, 5]),
       blockSnapshot([0, 2, 5]),
     ];
     throw new Error(
-      `timed out waiting for naturally grown kelp to be harvested through the stream into the chest`
-        + `; observerPowered=${observerPowered}; pistonExtended=${pistonExtended}; dropped=${JSON.stringify(dropped)}`
+      `timed out waiting for naturally grown kelp to be harvested, collected, and leave a refilled harvest cell`
+        + `; observerPowered=${observerPowered}; pistonExtended=${pistonExtended}; harvestCellRefilled=${harvestCellRefilled}`
+        + `; dropped=${JSON.stringify(dropped)}`
         + `; column=${JSON.stringify(column)}; circuit=${JSON.stringify(circuit)}`,
     );
   } finally {
@@ -1749,16 +1768,16 @@ function playerAndDroppedItemIds(kid) {
   return ids;
 }
 
-function playerAndDroppedItemAmount(player, itemId) {
+function playerAndDroppedItemAmount(player, itemId, nameTag = null) {
   let amount = 0;
   const inventory = player.getComponent("minecraft:inventory")?.container;
   for (let slot = 0; inventory && slot < inventory.size; slot += 1) {
     const item = inventory.getItem(slot);
-    if (item?.typeId === itemId) amount += item.amount;
+    if (item?.typeId === itemId && (nameTag === null || item.nameTag === nameTag)) amount += item.amount;
   }
   for (const entity of player.dimension.getEntities({ type: "minecraft:item", location: player.location, maxDistance: 8 })) {
     const item = entity.getComponent("minecraft:item")?.itemStack;
-    if (item?.typeId === itemId) amount += item.amount;
+    if (item?.typeId === itemId && (nameTag === null || item.nameTag === nameTag)) amount += item.amount;
   }
   return amount;
 }
@@ -1770,11 +1789,16 @@ async function proveRemoteGift(kid, station) {
     friendName,
     GameMode.Creative,
   );
-  friend.addTag(TEST_TAG);
   try {
+    friend.addTag(TEST_TAG);
+    if (playerAndDroppedItemAmount(kid, "minecraft:diamond") !== 0
+      || playerAndDroppedItemAmount(friend, "minecraft:diamond") !== 0) {
+      throw new Error("remote gift proof requires both players to start without diamonds");
+    }
     await chatCallbacks.deliverTestGift(kid, friendName);
     await waitFor(
-      () => playerAndDroppedItemAmount(friend, "minecraft:diamond") === 7,
+      () => playerAndDroppedItemAmount(friend, "minecraft:diamond", "Seven Stars") === 7
+        && playerAndDroppedItemAmount(friend, "minecraft:diamond") === 7,
       400,
       "all seven named diamonds at the connected recipient",
     );

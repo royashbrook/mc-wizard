@@ -14,16 +14,16 @@ const place = (itemId, target, support, expectedType = itemId, extra = {}) => ({
 export function createAutomaticKelpFarmBlueprint() {
   const plant = [0, 1, 4];
   const harvest = [0, 2, 4];
-  const sensedGrowth = harvest;
+  const sensedGrowth = [0, 3, 4];
   const piston = [0, 2, 5];
-  const observer = [-1, 2, 4];
+  const observer = [-1, 3, 4];
   const output = [0, 4, 1];
   const hopper = [0, 4, 2];
   const collectionWater = [0, 5, 2];
   const waterColumn = [1, 2, 3, 4, 5].map((y) => [0, y, 4]);
   const streamSource = [0, 5, 4];
   const collectionStream = [[0, 5, 3], collectionWater];
-  const refillSource = [1, 2, 4];
+  const refillSources = [[1, 2, 4], [0, 2, 3]];
 
   const placements = [
     // Raise the output chest just below the collection stream.
@@ -40,13 +40,13 @@ export function createAutomaticKelpFarmBlueprint() {
 
     // Dry tank first; water and kelp are added later from the Wizard's hand.
     place("minecraft:sand", [0, 0, 4], [0, -1, 4]),
-    ...[-1].flatMap((x) => [0, 1]
+    ...[-1].flatMap((x) => [0, 1, 2]
       .map((y) => place(
       "minecraft:glass",
       [x, y, 4],
       y === 0 ? [x, -1, 4] : [x, y - 1, 4],
       ))),
-    ...[0, 1, 2, 3].map((y) => place(
+    ...[0, 1].map((y) => place(
       "minecraft:glass",
       [0, y, 3],
       y === 0 ? [0, -1, 3] : [0, y - 1, 3],
@@ -56,25 +56,32 @@ export function createAutomaticKelpFarmBlueprint() {
     place("minecraft:glass", [1, 0, 4], [1, -1, 4]),
     place("minecraft:glass", [1, 1, 4], [1, 0, 4]),
 
-    // A sealed side source immediately refills the piston harvest cell. Without
-    // it, a Bedrock piston can leave air behind and strand harvested kelp below
-    // the floating collection stream.
+    // Two sealed sources meet at the piston harvest cell. Bedrock can leave air
+    // after one source drains into a retracted piston, while two adjacent source
+    // blocks recreate the water cell and keep the kelp column renewable.
     ...[[2, 4]].flatMap(([x, z]) => [0, 1, 2, 3].map((y) => place(
       "minecraft:glass",
       [x, y, z],
       y === 0 ? [x, -1, z] : [x, y - 1, z],
     ))),
-    ...[[1, 3], [1, 5]].flatMap(([x, z]) => [0, 1, 2].map((y) => place(
+    ...[[1, 3], [1, 5], [-1, 3]].flatMap(([x, z]) => [0, 1, 2].map((y) => place(
       "minecraft:glass",
       [x, y, z],
       y === 0 ? [x, -1, z] : [x, y - 1, z],
     ))),
+    place("minecraft:glass", [1, 3, 3], [1, 2, 3]),
+    place("minecraft:glass", [0, 3, 3], [1, 3, 3]),
+    ...[0, 1, 2].map((y) => place(
+      "minecraft:glass",
+      [0, y, 2],
+      y === 0 ? [0, -1, 2] : [0, y - 1, 2],
+    )),
     place("minecraft:glass", [1, 3, 4], [2, 3, 4]),
     place("minecraft:glass", [1, 4, 4], [1, 3, 4]),
 
     // A side observer feeds a same-level dust path directly into the piston.
     // This avoids Java-only quasi-connectivity assumptions and works on Bedrock.
-    ...[[-2, 4], [-2, 5], [-1, 5]].flatMap(([x, z]) => [0, 1].map((y) => place(
+    ...[[-2, 4], [-2, 5], [-1, 5]].flatMap(([x, z]) => [0, 1, 2].map((y) => place(
       "minecraft:smooth_stone",
       [x, y, z],
       y === 0 ? [x, -1, z] : [x, y - 1, z],
@@ -82,13 +89,12 @@ export function createAutomaticKelpFarmBlueprint() {
     place("minecraft:piston", piston, [0, 1, 5], "minecraft:piston", {
       orientationTarget: harvest,
     }),
-    place("minecraft:observer", observer, [-1, 1, 4], "minecraft:observer", {
+    place("minecraft:observer", observer, [-1, 2, 4], "minecraft:observer", {
       orientationTarget: sensedGrowth,
     }),
-    place("minecraft:glass", [-1, 3, 4], observer),
-    place("minecraft:glass", [-1, 4, 4], [-1, 3, 4]),
-    place("minecraft:redstone", [-2, 2, 4], [-2, 1, 4], "minecraft:redstone_wire"),
-    place("minecraft:redstone", [-2, 2, 5], [-2, 1, 5], "minecraft:redstone_wire"),
+    place("minecraft:glass", [-1, 4, 4], observer),
+    place("minecraft:redstone", [-2, 3, 4], [-2, 2, 4], "minecraft:redstone_wire"),
+    place("minecraft:redstone", [-2, 3, 5], [-2, 2, 5], "minecraft:redstone_wire"),
     place("minecraft:glass", [0, 3, 5], piston),
     place("minecraft:glass", [0, 4, 5], [0, 3, 5]),
     place("minecraft:glass", [0, 5, 5], [0, 4, 5]),
@@ -124,7 +130,14 @@ export function createAutomaticKelpFarmBlueprint() {
         action: "use_item_on_block",
         itemId: "minecraft:water_bucket",
         block: [2, 2, 4],
-        faceTarget: refillSource,
+        faceTarget: refillSources[0],
+        expectedFaceType: "minecraft:water",
+      },
+      {
+        action: "use_item_on_block",
+        itemId: "minecraft:water_bucket",
+        block: [0, 2, 2],
+        faceTarget: refillSources[1],
         expectedFaceType: "minecraft:water",
       },
       {
@@ -140,8 +153,8 @@ export function createAutomaticKelpFarmBlueprint() {
       {
         action: "use_item_on_block",
         itemId: "minecraft:redstone",
-        block: [-1, 1, 5],
-        faceTarget: [-1, 2, 5],
+        block: [-1, 2, 5],
+        faceTarget: [-1, 3, 5],
         expectedFaceType: "minecraft:redstone_wire",
       },
       { action: "wait_ticks", ticks: 160 },
@@ -157,7 +170,7 @@ export function createAutomaticKelpFarmBlueprint() {
         streamSource,
         collectionStream,
         collectionWater,
-        refillSource,
+        refillSources,
         harvest,
         sensedGrowth,
         piston,

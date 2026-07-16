@@ -22,27 +22,31 @@ test("automatic kelp farm has a planted source-water harvester and real output p
   }
   assert.equal(placed.get("0,0,4").itemId, "minecraft:sand");
   assert.deepEqual(placed.get("0,2,5").orientationTarget, [0, 2, 4]);
-  assert.deepEqual(placed.get("-1,2,4").orientationTarget, [0, 2, 4]);
-  for (const point of ["-2,2,4", "-2,2,5"]) {
+  assert.deepEqual(placed.get("-1,3,4").orientationTarget, [0, 3, 4]);
+  for (const point of ["-2,3,4", "-2,3,5"]) {
     assert.equal(placed.get(point).expectedType, "minecraft:redstone_wire");
   }
   assert.deepEqual(placed.get("0,4,2").facingTarget, [0, 4, 1]);
-  for (const y of [1, 2, 3]) assert.equal(placed.get(`0,${y},3`).itemId, "minecraft:glass");
+  for (const y of [1, 3]) assert.equal(placed.get(`0,${y},3`).itemId, "minecraft:glass");
+  assert.equal(placed.has("0,2,3"), false);
   assert.equal(placed.get("0,4,3").itemId, "minecraft:smooth_stone");
   assert.equal(placed.get("0,5,1").itemId, "minecraft:glass");
   assert.equal(placed.has("1,2,4"), false);
-  for (const point of ["2,2,4", "1,2,3", "1,2,5"]) assert.equal(placed.get(point).itemId, "minecraft:glass");
+  for (const point of ["2,2,4", "1,2,3", "1,2,5", "-1,2,3", "0,2,2"]) {
+    assert.equal(placed.get(point).itemId, "minecraft:glass");
+  }
 
   const water = farm.interactions.filter(({ itemId }) => itemId === "minecraft:water_bucket");
   assert.deepEqual(water.map(({ faceTarget }) => faceTarget), [
     ...[1, 2, 3, 4, 5].map((y) => [0, y, 4]),
     [1, 2, 4],
+    [0, 2, 3],
   ]);
   const plantedKelp = farm.interactions.filter(({ itemId }) => itemId === "minecraft:kelp");
   assert.deepEqual(plantedKelp.map(({ faceTarget }) => faceTarget), [[0, 1, 4]]);
   assert.deepEqual(
     farm.interactions.find(({ itemId }) => itemId === "minecraft:redstone")?.faceTarget,
-    [-1, 2, 5],
+    [-1, 3, 5],
   );
   assert.deepEqual(farm.interactions.filter(({ action }) => action === "wait_ticks").map(({ ticks }) => ticks), [160]);
 
@@ -52,7 +56,7 @@ test("automatic kelp farm has a planted source-water harvester and real output p
   assert.deepEqual(pipeline.streamSource, [0, 5, 4]);
   assert.deepEqual(pipeline.collectionStream, [[0, 5, 3], [0, 5, 2]]);
   assert.deepEqual(pipeline.collectionWater, [0, 5, 2]);
-  assert.deepEqual(pipeline.refillSource, [1, 2, 4]);
+  assert.deepEqual(pipeline.refillSources, [[1, 2, 4], [0, 2, 3]]);
   assert.deepEqual(pipeline.output, [0, 4, 1]);
   assert.equal(pipeline.expectedOutput, "minecraft:kelp");
   assert.match(farm.success, /floating kelp.+output chest/i);
@@ -86,6 +90,9 @@ test("kelp fixed action is allowlisted by the model schema and Bedrock executor"
   assert.match(e2e, /async function proveLiveKelpHarvest/);
   assert.match(e2e, /clearSeededOutput\(\);[\s\S]+clearSeededOutput\(\);/);
   assert.match(e2e, /gamerule randomtickspeed 1000/);
+  assert.match(e2e, /outputCollected = true/);
+  assert.match(e2e, /for \(let tick = 0; tick < 80; tick \+= 1\)/);
+  assert.match(e2e, /if \(harvestCellRefilled\) return/);
   assert.match(e2e, /await proveLiveKelpHarvest\(kid, farmStation\)/);
   assert.match(e2e, /scope === "kelp"/);
   assert.match(installer, /"kelp"/);
