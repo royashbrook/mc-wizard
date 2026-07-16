@@ -641,6 +641,9 @@ test("pins the Apple container launch to trusted open-LAN operator mode", () => 
   assert.match(containerScript, /trusted open-LAN mode/);
   assert.match(containerScript, /RFC1918 private address/);
   assert.match(containerScript, /initialize-bedrock-properties/);
+  assert.match(containerScript, /install:pack/);
+  assert.match(installPackScript, /"texturepack-required": true/);
+  assert.match(initialPropertiesScript, /"texturepack-required": true/);
   assert.match(initialPropertiesScript, /error\.code !== "ENOENT"/);
   assert.match(containerScript, /LEVEL_NAME=mc-wizard/);
   assert.match(containerScript, /--publish "\$\{LAN_IP\}:19132:19132\/udp"/);

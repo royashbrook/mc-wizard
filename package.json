@@ -23,6 +23,7 @@
     "generate:textures": "node scripts/generate-wizard-textures.mjs",
     "package:skin": "npm run generate:textures && sh scripts/package-skin-pack.sh",
     "container:bds": "sh scripts/run-bedrock-container.sh",
+    "container:start": "sh scripts/start-bedrock-container.sh",
     "container:delete": "container delete mc-wizard-bedrock",
     "container:logs": "container logs -f mc-wizard-bedrock",
     "container:stop": "container stop --time 60 mc-wizard-bedrock",
