@@ -36,6 +36,7 @@ import { createTwoByTwoPistonDoorBlueprint } from "./piston-door.js";
 import { createRecipeDisplay } from "./recipe-display.js";
 import { createAutomaticWoolFarmBlueprint } from "./wool-farm.js";
 import { splitMessage } from "./chat.js";
+import { normalizeRuntimeStep } from "./capability-runtime.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
 const WIZARD_NAME = "MC Wizard";
@@ -232,7 +233,7 @@ async function postActionResult(report, status, detail) {
   if (!report?.requestId) return;
   const actionPlayer = (report.playerId ? playerById(report.playerId) : undefined)
     || humanPlayers().find((candidate) => candidate.name === report.playerName);
-  const context = status === "completed" && actionPlayer
+  const context = ["completed", "failed", "partial"].includes(status) && actionPlayer
     ? liveWorldSnapshot(actionPlayer) : undefined;
   for (let attempt = 0; attempt < 3; attempt += 1) {
     try {
@@ -4847,7 +4848,7 @@ function applyWorldControl(player, action, report = beginImmediateAction(player)
   }
 }
 
-function runCommandsForPlayer(player, commands, report = beginImmediateAction(player)) {
+function executeRequesterCommands(player, commands) {
   const tag = `mcw_cmd_${system.currentTick}_${Math.floor(Math.random() * 1_000_000)}`;
   let succeeded = 0;
   try {
@@ -4856,21 +4857,28 @@ function runCommandsForPlayer(player, commands, report = beginImmediateAction(pl
       const result = player.dimension.runCommand(`execute as @a[tag=${tag}] at @s run ${command}`);
       if ((result?.successCount || 0) > 0) succeeded += 1;
     }
+    return { succeeded, total: commands.length };
+  } finally {
+    try { player.removeTag(tag); } catch {}
+  }
+}
+
+function runCommandsForPlayer(player, commands, report = beginImmediateAction(player)) {
+  try {
+    const { succeeded, total } = executeRequesterCommands(player, commands);
     if (succeeded === 0) throw new Error("every command reported zero successful targets");
     speak(player, succeeded === commands.length
       ? "Done—the spell worked right here."
-      : `I cast ${succeeded} of ${commands.length} parts. I’m keeping the result instead of doing nothing.`);
+      : `I cast ${succeeded} of ${total} parts. I’m keeping the result instead of doing nothing.`);
     endImmediateAction(
       report,
-      succeeded === commands.length ? "completed" : "partial",
-      `executed ${succeeded} of ${commands.length} requester-scoped commands`,
+      succeeded === total ? "completed" : "partial",
+      `executed ${succeeded} of ${total} requester-scoped commands`,
     );
   } catch (error) {
     console.warn(`[MC Wizard] requester command failed: ${error}`);
     speak(player, "That command spell misfired. I’ve kept the goal active so I can try another route.");
     endImmediateAction(report, "failed", `requester command failed: ${String(error).slice(0, 160)}`);
-  } finally {
-    try { player.removeTag(tag); } catch {}
   }
 }
 
@@ -5058,6 +5066,283 @@ async function giveItemsAsWizard(player, items, report) {
   }
 }
 
+function capabilityProgramFrame(player) {
+  const forward = cardinalDirection(player);
+  const right = { x: -forward.z, z: forward.x };
+  const base = {
+    x: Math.floor(player.location.x),
+    y: standingBlockY(player.location),
+    z: Math.floor(player.location.z),
+  };
+  return { origin: offset(base, forward, right, 3), forward, right };
+}
+
+function capabilityLocation(frame, vector) {
+  return customLocation(frame.origin, frame.forward, frame.right, vector);
+}
+
+async function finishWizardOperation(operation, label) {
+  for (let attempt = 0; attempt < 160; attempt += 1) {
+    const result = operation();
+    if (result === true) return;
+    if (result === "interaction-failed") throw new Error(`${label} could not be verified`);
+    await system.waitTicks(2);
+  }
+  throw new Error(`${label} did not finish in time`);
+}
+
+async function moveWizardForProgram(player, frame, { target, mode }) {
+  const bot = bringWizardTo(player, true, true);
+  if (!bot) throw new Error("the simulated player is unavailable");
+  const destination = capabilityLocation(frame, target);
+  const feet = {
+    x: Math.floor(destination.x),
+    y: Math.floor(destination.y),
+    z: Math.floor(destination.z),
+  };
+  if (!blockIsOpen(player.dimension, feet) || !blockIsOpen(player.dimension, { ...feet, y: feet.y + 1 })) {
+    throw new Error("the requested movement target is blocked");
+  }
+  if (mode === "fly") bot.fly();
+  else bot.stopFlying();
+  for (let attempt = 0; attempt < 60; attempt += 1) {
+    if (distanceSquared(bot.location, destination) <= 1.5 * 1.5) return `${mode} movement reached its target`;
+    if (attempt % 10 === 0) {
+      try {
+        if (mode === "walk") bot.navigateToLocation(destination, 1);
+        else bot.moveToLocation(destination, { speed: 1, faceTarget: true });
+      } catch {
+        bot.moveToLocation(destination, { speed: 0.8, faceTarget: true });
+      }
+    }
+    await system.waitTicks(2);
+  }
+  bot.teleport(destination, { dimension: player.dimension, facingLocation: player.location });
+  if (mode === "walk") bot.stopFlying();
+  return `${mode} path stalled, so Wizard completed the move with a short blink`;
+}
+
+function dropCapabilityBook(player, { title, text, author }) {
+  const book = new ItemStack("minecraft:writable_book", 1);
+  const component = book.getComponent("minecraft:book");
+  if (!component) throw new Error("book component is unavailable");
+  component.setContents(bookPages(text));
+  component.signBook(bookTitle(title), author);
+  player.dimension.spawnItem(book, {
+    x: player.location.x,
+    y: player.location.y + 0.5,
+    z: player.location.z,
+  });
+  return `dropped book “${component.title}” at the player's feet`;
+}
+
+async function executeCapabilityStep(player, step, frame) {
+  const args = step.arguments;
+  if (step.capability === "control.wait") {
+    await system.waitTicks(args.ticks);
+    return `waited ${args.ticks} ticks`;
+  }
+  if (step.capability === "player.move") return moveWizardForProgram(player, frame, args);
+  if (step.capability === "player.place-blocks") {
+    for (const placement of args.blocks) {
+      const target = capabilityLocation(frame, placement.target);
+      const support = capabilityLocation(frame, placement.support);
+      const facing = placement.orientationTarget
+        ? capabilityLocation(frame, placement.orientationTarget) : undefined;
+      await finishWizardOperation(() => placeAsWizard(
+        player.dimension,
+        placement.itemId,
+        support,
+        target,
+        placement.expectedType,
+        undefined,
+        directionFromSupport(support, target),
+        placement.expectedStates,
+        facing,
+      ), `placing ${placement.itemId} at ${placement.target.join(",")}`);
+    }
+    return `physically placed ${args.blocks.length} block${args.blocks.length === 1 ? "" : "s"}`;
+  }
+  if (step.capability === "player.break-blocks") {
+    for (const target of args.targets) {
+      const location = capabilityLocation(frame, target);
+      await finishWizardOperation(
+        () => breakAsWizard(player.dimension, location),
+        `breaking the block at ${target.join(",")}`,
+      );
+    }
+    return `physically broke ${args.targets.length} block${args.targets.length === 1 ? "" : "s"}`;
+  }
+  if (step.capability === "player.use-item") {
+    await finishWizardOperation(
+      () => useItemAsWizard(player.dimension, args, frame.origin, frame.forward, frame.right),
+      `using ${args.itemId}`,
+    );
+    return `used ${args.itemId} on the requested block`;
+  }
+  if (step.capability === "world.command") {
+    const result = executeRequesterCommands(player, args.commands);
+    if (result.succeeded !== result.total) throw new Error(`only ${result.succeeded} of ${result.total} commands succeeded`);
+    return `executed ${result.succeeded} requester-scoped command${result.succeeded === 1 ? "" : "s"}`;
+  }
+  if (step.capability === "artifact.book") return dropCapabilityBook(player, args);
+  if (step.capability === "observe.snapshot" || step.capability === "verify.snapshot") {
+    const snapshot = liveWorldSnapshot(player);
+    return `captured ${snapshot.nearbyBlocks.length} block types and ${snapshot.nearbyEntities.length} nearby entities`;
+  }
+  if (step.capability === "verify.blocks") {
+    const misses = args.blocks.filter(({ target, typeId }) => (
+      player.dimension.getBlock(capabilityLocation(frame, target))?.typeId !== typeId
+    ));
+    if (misses.length) throw new Error(`${misses.length} expected block${misses.length === 1 ? " was" : "s were"} missing`);
+    return `verified ${args.blocks.length} block${args.blocks.length === 1 ? "" : "s"}`;
+  }
+  if (step.capability === "verify.entities") {
+    const count = player.dimension.getEntities({
+      type: args.typeId,
+      location: player.location,
+      maxDistance: args.maxDistance,
+    }).length;
+    if (count < args.minimum) throw new Error(`found ${count} of ${args.minimum} required ${args.typeId}`);
+    return `verified ${count} nearby ${args.typeId}`;
+  }
+  if (step.capability === "script.spawn-entity") {
+    const location = capabilityLocation(frame, args.location);
+    for (let index = 0; index < args.count; index += 1) {
+      const entity = player.dimension.spawnEntity(args.typeId, {
+        x: location.x + 0.5,
+        y: location.y,
+        z: location.z + 0.5,
+      });
+      if (args.nameTag) entity.nameTag = args.nameTag;
+    }
+    return `spawned ${args.count} ${args.typeId}`;
+  }
+  if (step.capability === "script.teleport") {
+    const subject = args.subject === "requester" ? player : bringWizardTo(player, true, true);
+    if (!subject) throw new Error("the teleport subject is unavailable");
+    subject.teleport(capabilityLocation(frame, args.target), { dimension: player.dimension });
+    return `teleported ${args.subject}`;
+  }
+  if (step.capability === "script.effect") {
+    const subject = args.subject === "requester" ? player : bringWizardTo(player, true, true);
+    if (!subject) throw new Error("the effect subject is unavailable");
+    subject.addEffect(args.effectId, args.duration, {
+      amplifier: args.amplifier,
+      showParticles: args.showParticles,
+    });
+    return `applied ${args.effectId} to ${args.subject}`;
+  }
+  throw new Error(`capability ${step.capability} is not installed`);
+}
+
+function capabilityProjectSummary(program, steps) {
+  const placements = steps.filter(({ capability }) => capability === "player.place-blocks")
+    .flatMap(({ arguments: args }) => args.blocks.map((block) => ({
+      itemId: block.itemId,
+      expectedType: block.expectedType,
+      target: block.target,
+      support: block.support,
+      orientationTarget: block.orientationTarget || null,
+    })));
+  const interactions = steps.filter(({ capability }) => capability === "player.use-item")
+    .map(({ arguments: args }) => ({ action: "use_item_on_block", ...args }));
+  if (!placements.length && !interactions.length) return undefined;
+  return projectBlueprintSummary({
+    title: program.title,
+    kind: program.title,
+    placements,
+    interactions,
+  });
+}
+
+async function executeCapabilityProgram(player, program) {
+  if (buildInProgress || buildPreparing) {
+    queueBuild(
+      player,
+      (current) => void executeCapabilityProgram(current, program),
+      40,
+      `I’ve queued “${program.title}” and will continue it automatically when my hands are free.`,
+    );
+    return;
+  }
+  const bot = bringWizardTo(player, true, true);
+  if (!bot) {
+    queueBuild(player, (current) => void executeCapabilityProgram(current, program), 40, "I’m returning now, then I’ll carry out the whole plan.");
+    return;
+  }
+  const token = ++nextBuildToken;
+  activeBuildToken = token;
+  buildInProgress = true;
+  if (!bindBuildAction(player, token)) {
+    clearBuild(token);
+    return;
+  }
+  let transactionStarted = false;
+  let changedWorld = false;
+  try {
+    const steps = program.steps.map(normalizeRuntimeStep);
+    const frame = capabilityProgramFrame(player);
+    const expectedBlocks = steps.flatMap((step) => {
+      if (step.capability === "player.place-blocks") return step.arguments.blocks.map((block) => ({
+        location: capabilityLocation(frame, block.target),
+        typeId: block.expectedType,
+      }));
+      if (step.capability === "player.break-blocks") return step.arguments.targets.map((target) => ({
+        location: capabilityLocation(frame, target),
+        typeId: "minecraft:air",
+      }));
+      return [];
+    });
+    if (expectedBlocks.length) {
+      beginTransaction(player.id, token, player.dimension, expectedBlocks);
+      transactionStarted = true;
+    }
+    const project = capabilityProjectSummary(program, steps);
+    if (project) bindBuildProject(player, token, {
+      ...project,
+      dimensionId: player.dimension.id,
+      origin: { ...frame.origin },
+      forward: { ...frame.forward },
+      right: { ...frame.right },
+    });
+    const failures = [];
+    const results = [];
+    for (const step of steps) {
+      try {
+        if (/^(?:player\.(?:place|break|use)|world\.command|script\.)/.test(step.capability)) changedWorld = true;
+        results.push({ id: step.id, detail: await executeCapabilityStep(player, step, frame) });
+      } catch (error) {
+        const detail = String(error?.message || error).slice(0, 160);
+        failures.push({ id: step.id, detail });
+        if (step.onFailure !== "continue") break;
+      }
+    }
+    if (transactionStarted) {
+      if (changedWorld) commitTransaction(token);
+      else rollbackTransaction(token);
+    }
+    clearBuild(token);
+    if (failures.length) {
+      const first = failures[0];
+      speak(player, `I completed ${results.length} step${results.length === 1 ? "" : "s"}, but “${first.id}” needs another approach. I’m checking the world and replanning it now.`);
+      endBuildAction(token, "failed", `program ${program.title}: ${results.length}/${steps.length} steps; ${first.id}: ${first.detail}`);
+    } else {
+      speak(player, `Done—“${program.title}” completed all ${results.length} step${results.length === 1 ? "" : "s"}. I’m checking the result against your whole goal now.`);
+      endBuildAction(token, "completed", `program ${program.title}: completed and verified ${results.length}/${steps.length} steps`);
+    }
+  } catch (error) {
+    if (transactionStarted) {
+      if (changedWorld) commitTransaction(token);
+      else rollbackTransaction(token);
+    }
+    clearBuild(token);
+    console.warn(`[MC Wizard] capability program failed: ${error}`);
+    speak(player, "One part of that plan did not fit this world. I kept every useful result and I’m replanning the failed part now.");
+    endBuildAction(token, "failed", `capability program failed: ${String(error?.message || error).slice(0, 180)}`);
+  }
+}
+
 function applyResponse(playerId, payload, question) {
   const player = playerById(playerId);
   if (!player) {
@@ -5138,6 +5423,8 @@ function applyResponse(playerId, payload, question) {
     void giveItemsAsWizard(player, action.items || []);
   } else if (action?.type === "run_commands" && action.version === 1) {
     runCommandsForPlayer(player, action.commands || []);
+  } else if (action?.type === "execute_program" && action.version === 1) {
+    void executeCapabilityProgram(player, action.program);
   } else if (action?.type === "place_area_torches" && action.version === 1) {
     void placeAreaTorches(player);
   } else if (action?.type === "command_lesson" && action.version === 1) {

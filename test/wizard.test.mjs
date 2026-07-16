@@ -2242,6 +2242,65 @@ test("lets the model select only registered Wizard skills and carries session hi
   assert.match(requests[1].messages[1].content, /I’ll build Tiny Contraption nearby/);
 });
 
+test("lets the model compose and retain a novel executable capability program", async () => {
+  const requests = [];
+  const program = {
+    title: "Cake Horse Staircase",
+    steps: [
+      {
+        id: "place_cakes",
+        capability: "player.place-blocks",
+        arguments: { blocks: [
+          { itemId: "minecraft:cake", target: [0, 0, 2], support: [0, -1, 2], expectedType: "minecraft:cake" },
+          { itemId: "minecraft:cake", target: [0, 1, 3], support: [0, 0, 3], expectedType: "minecraft:cake" },
+        ] },
+        expect: "A cake staircase exists nearby.",
+        onFailure: "replan",
+      },
+      {
+        id: "spawn_horse",
+        capability: "script.spawn-entity",
+        arguments: { typeId: "minecraft:horse", location: [2, 0, 1], count: 1 },
+        expect: "A horse is available for testing.",
+        onFailure: "replan",
+      },
+      {
+        id: "verify_horse",
+        capability: "verify.entities",
+        arguments: { typeId: "minecraft:horse", minimum: 1, maxDistance: 32 },
+        expect: "The test horse remains nearby.",
+        onFailure: "replan",
+      },
+    ],
+  };
+  const programWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async (url, options) => {
+      requests.push(JSON.parse(options.body));
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "I’ll build the cake staircase, bring over a horse, and test the result.",
+        goal: {
+          objective: "Build a cake staircase for a horse",
+          successCriteria: "The cake staircase exists and a horse can test it",
+          status: "active",
+        },
+        action: { type: "execute_program", version: 1, program },
+      }) } }] }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const result = await programWizard.ask({
+    player: "HorseKid",
+    question: "build a weird cake staircase that a horse can run up",
+  });
+  assert.equal(result.action.type, "execute_program");
+  assert.deepEqual(result.action.program, program);
+  assert.equal(result.goal.status, "active");
+  assert.match(requests[0].messages[0].content, /Runtime capability manifest/);
+  assert.match(requests[0].messages[0].content, /player\.place-blocks/);
+});
+
 test("tells the model whether prior actions are planned, active, completed, failed, or unknown", async () => {
   const sessions = createMemorySessionStore();
   const castle = classifyAction("Build me a castle");

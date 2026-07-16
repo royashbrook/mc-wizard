@@ -276,8 +276,8 @@ test("ask payload validation preserves safe correlation and rejects malformed co
   assert.equal(rejected.context, undefined);
 });
 
-test("action completion accepts only a validated fresh world snapshot for goal review", () => {
-  assert.match(packScript, /status === "completed" && actionPlayer\s*\? liveWorldSnapshot\(actionPlayer\)/);
+test("terminal action results carry a validated fresh world snapshot for completion or replanning", () => {
+  assert.match(packScript, /\["completed", "failed", "partial"\]\.includes\(status\) && actionPlayer\s*\? liveWorldSnapshot\(actionPlayer\)/);
   const accepted = validateActionResultBody({
     player: "BuilderKid",
     requestId: "castle-123",

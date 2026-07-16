@@ -333,6 +333,8 @@ function defaultGoal(question, action) {
     successCriteria = "The requested items arrive in the player's inventory or at their feet.";
   } else if (action?.type === "show_recipe") {
     successCriteria = "A correct, readable in-world recipe display is present nearby.";
+  } else if (action?.type === "execute_program") {
+    successCriteria = `Every observable expectation in “${action.program.title}” succeeds and the complete result satisfies: ${objective}`.slice(0, 500);
   } else if (["place_blueprint", "build_machine", "build_structure", "build_plan"].includes(action?.type)) {
     successCriteria = `The finished nearby project visibly and functionally satisfies the player's exact request: ${objective}`.slice(0, 500);
   }
@@ -1677,6 +1679,9 @@ function localAnswer(question, hits, action) {
       ? `I’ll place the ${lesson.title.toLowerCase()} and its button nearby. Paste ${lesson.command} into it; ${lesson.explanation}`
       : "I’ll place this safe command-block lesson nearby and show you exactly what its button does.";
   }
+  if (action?.type === "execute_program") {
+    return `I’ve drawn “${action.program.title}” as ${action.program.steps.length} real step${action.program.steps.length === 1 ? "" : "s"}. I’ll carry them out in order, inspect each result, and revise any step that does not work.`;
+  }
   if (action?.type === "build_plan") {
     return `I’ll build ${action.plan.title || "this detail"} nearby, placing all ${action.plan.blocks.length} planned blocks in support order and checking each one.`;
   }
@@ -2353,7 +2358,7 @@ function normalizeProviderGoal(value) {
 
 function plannerActionLabel(action) {
   if (!action || typeof action !== "object") return "none";
-  const detail = action.plan?.kind || action.plan?.title || action.id || "unnamed";
+  const detail = action.plan?.kind || action.plan?.title || action.program?.title || action.id || "unnamed";
   return `${String(action.type || "unknown").slice(0, 32)}:${String(detail).slice(0, 64)}`;
 }
 
@@ -2376,6 +2381,14 @@ function wizardEnvelope(text, question = "") {
 function actionCompletesBuildRequest(action, question, history = []) {
   if (!action) return false;
   if (isStagedBuildProgress(action)) return false;
+  if (action.type === "execute_program") {
+    return action.program.steps.some(({ capability }) => (
+      capability === "player.place-blocks"
+      || capability === "player.break-blocks"
+      || capability === "player.use-item"
+      || capability === "world.command"
+    ));
+  }
   if (isActionConfirmation(question)) {
     const pending = pendingActionTurn(history);
     if (pending) {
@@ -2582,6 +2595,17 @@ function providerActionMatchesRequest(action, question, history = [], {
 } = {}) {
   if (!action) return true;
   if (reviewRequest) return correctiveActionContinuesGoal(action, history);
+  if (action.type === "execute_program") {
+    if (isOrdinaryConversation(question) || explicitlyRequestsCommand(question)) return false;
+    if (buildRequest) return actionCompletesBuildRequest(action, question, history);
+    if (projectFeedback) return true;
+    return requestClauses(question).some((clause) => {
+      const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wiz|wizard)[,:]?\s*)?/i, "");
+      const verb = "(?:apply|break|build|cast|change|clear|clone|construct|create|drop|effect|enchant|fill|give|grant|light|make|move|place|remove|replace|run|set|show|spawn|summon|teleport|tp|turn|use|write)";
+      return new RegExp(`^(?:(?:can|could|would|will)\\s+you\\s+)?(?:please\\s+)?${verb}\\b`, "i").test(direct)
+        || new RegExp(`^(?:i|we)\\s+(?:want|need)\\s+(?:you\\s+to\\s+)?${verb}\\b`, "i").test(direct);
+    });
+  }
   if (BUILD_ACTION_TYPES.has(action.type)) {
     return (buildRequest || projectFeedback) && actionCompletesBuildRequest(action, question, history);
   }
@@ -2620,7 +2644,7 @@ const GOAL_REVIEW_FEEDBACK = "Fix this same active build so every success criter
 const RETRYABLE_ACTION_TYPES = new Set([
   "place_blueprint", "build_machine", "build_structure", "build_plan",
   "dimension_travel", "world_control", "potion_rain", "give_items",
-  "run_commands", "place_area_torches", "show_recipe", "command_lesson",
+  "run_commands", "place_area_torches", "show_recipe", "command_lesson", "execute_program",
 ]);
 
 const isAutomaticGoalQuestion = (question) => /^(?:The last attempt failed:|Review the completed in-world attempt|Fix this same active build)/i
@@ -2652,6 +2676,7 @@ function correctiveActionContinuesGoal(action, history = []) {
   const previousTurn = latestGoalActionTurn(history)?.turn;
   const previous = allowedWizardAction(previousTurn?.action);
   if (!previous || !action) return false;
+  if (previous.type === "execute_program") return action.type === "execute_program";
   if (isStagedBuildProgress(previous)) {
     const goalId = previousTurn?.goalId || previousTurn?.requestId;
     const contract = history.findLast((turn) => (
@@ -3004,6 +3029,17 @@ function providerActionSummary(action) {
     const steps = [plan.blocks, plan.primitives, plan.placements, plan.interactions]
       .reduce((total, entries) => total + (Array.isArray(entries) ? entries.length : 0), 0);
     if (steps) summary.plan.steps = steps;
+  }
+  const program = action?.program;
+  if (program && typeof program === "object" && !Array.isArray(program)) {
+    summary.program = {
+      title: text(program.title),
+      steps: Array.isArray(program.steps) ? program.steps.slice(0, 12).map((step) => ({
+        id: text(step.id, 32),
+        capability: text(step.capability, 64),
+        expect: text(step.expect, 120),
+      })) : [],
+    };
   }
   const serialized = JSON.stringify(summary);
   if (serialized.length <= 1_600) return serialized;

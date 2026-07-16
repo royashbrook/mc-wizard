@@ -7,6 +7,7 @@ import {
   capabilityProgramPrompt,
   validateCapabilityProgram,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-program.js";
+import { capabilityRuntimePrompt } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
 
 const RECIPE_ITEM_IDS = new Set(recipeItemIds());
 
@@ -237,5 +238,5 @@ export function wizardSkillPrompt() {
   }]
     .map(({ name, description, action }) => `- ${name}: ${description}\n  action=${JSON.stringify(action)}`)
     .join("\n")
-    + `\n\n${capabilityProgramPrompt()}\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_minecraft_commands for a concrete in-world result not covered by a narrower action. Use @s for the requesting child, never a nearest-player or broad selector. Do not expose the command in chat unless explicitly asked.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
+    + `\n\n${capabilityProgramPrompt()}\n${capabilityRuntimePrompt()}\n\nCapability selection:\n- Use build_complete_structure only for buildings, sculptures, and other static geometry.\n- Use build_bounded_machine for a working farm, redstone machine, or corrective revision that needs exact blocks, directions, interactions, inputs, and outputs.\n- Use build_validated_plan only for a small decorative block-by-block detail; it is not a fallback for a complete structure or working machine.\n- Use execute_program for a novel request that needs several different actions, live observation, or verification.\n- Use execute_minecraft_commands for a concrete in-world result not covered by a narrower action. Use @s for the requesting child, never a nearest-player or broad selector. Do not expose the command in chat unless explicitly asked.\n- Treat criticism such as “too short,” “items escape,” “make it work,” or “that is not what I asked for” as a revision of the active project. Preserve its location, observe the problem, and issue the next corrective action.\n${wizardGoalPrompt()}`;
 }

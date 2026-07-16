@@ -24,7 +24,7 @@ function requestId(value, player) {
 }
 
 function actionLabel(action, player) {
-  return privateText(action?.id || action?.plan?.title || action?.title || action?.type, 120, player);
+  return privateText(action?.id || action?.plan?.title || action?.program?.title || action?.title || action?.type, 120, player);
 }
 
 function goalId(result, player) {
