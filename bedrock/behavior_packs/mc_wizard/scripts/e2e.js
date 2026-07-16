@@ -1235,13 +1235,8 @@ async function proveLiveKelpHarvest(kid, station) {
     if (outputCollected) {
       dimension.runCommand("gamerule randomtickspeed 1");
       for (let tick = 0; tick < 80; tick += 1) {
-        harvestCellRefilled = blockIs(dimension, at([0, 2, 4]), [
-          "minecraft:water",
-          "minecraft:flowing_water",
-          "minecraft:kelp",
-          "minecraft:kelp_plant",
-        ]);
-        if (harvestCellRefilled) return;
+        harvestCellRefilled = blockIs(dimension, at([0, 2, 4]), "minecraft:water");
+        if (observerPowered && pistonExtended && harvestCellRefilled) return;
         await system.waitTicks(1);
       }
     }

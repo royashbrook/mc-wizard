@@ -92,7 +92,8 @@ test("kelp fixed action is allowlisted by the model schema and Bedrock executor"
   assert.match(e2e, /gamerule randomtickspeed 1000/);
   assert.match(e2e, /outputCollected = true/);
   assert.match(e2e, /for \(let tick = 0; tick < 80; tick \+= 1\)/);
-  assert.match(e2e, /if \(harvestCellRefilled\) return/);
+  assert.match(e2e, /blockIs\(dimension, at\(\[0, 2, 4\]\), "minecraft:water"\)/);
+  assert.match(e2e, /if \(observerPowered && pistonExtended && harvestCellRefilled\) return/);
   assert.match(e2e, /await proveLiveKelpHarvest\(kid, farmStation\)/);
   assert.match(e2e, /scope === "kelp"/);
   assert.match(installer, /"kelp"/);
