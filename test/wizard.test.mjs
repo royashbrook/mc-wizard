@@ -52,9 +52,10 @@ let syncDocsScript;
 let supervisorScript;
 let adminServiceScript;
 let initialPropertiesScript;
+let managedStartScript;
 
 before(async () => {
-  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText, adminServiceText, initialPropertiesText] = await Promise.all([
+  const [loadedCorpus, manifestText, permissionsText, scriptText, e2eText, containerText, localBridgeText, e2eRunnerText, installPackText, resourceManifestText, syncDocsText, supervisorText, adminServiceText, initialPropertiesText, managedStartText] = await Promise.all([
     loadCorpus(),
     readFile(new URL("../bedrock/behavior_packs/mc_wizard/manifest.json", import.meta.url), "utf8"),
     readFile(new URL("../bedrock/config/4e8790fe-18dc-46d1-aa31-ec78a924b717/permissions.json", import.meta.url), "utf8"),
@@ -69,6 +70,7 @@ before(async () => {
     readFile(new URL("../scripts/supervisor.mjs", import.meta.url), "utf8"),
     readFile(new URL("../scripts/admin-service.mjs", import.meta.url), "utf8"),
     readFile(new URL("../scripts/initialize-bedrock-properties.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/start-bedrock-container.sh", import.meta.url), "utf8"),
   ]);
   corpus = loadedCorpus;
   packManifest = JSON.parse(manifestText);
@@ -84,6 +86,7 @@ before(async () => {
   supervisorScript = supervisorText;
   adminServiceScript = adminServiceText;
   initialPropertiesScript = initialPropertiesText;
+  managedStartScript = managedStartText;
   wizard = createWizard({ corpus, env: {} });
 });
 
@@ -648,6 +651,9 @@ test("pins the Apple container launch to trusted open-LAN operator mode", () => 
   assert.match(containerScript, /LEVEL_NAME=mc-wizard/);
   assert.match(containerScript, /--publish "\$\{LAN_IP\}:19132:19132\/udp"/);
   assert.doesNotMatch(containerScript, /VERSION=LATEST/);
+  assert.match(managedStartScript, /container delete mc-wizard-bedrock/);
+  assert.match(managedStartScript, /run-bedrock-container\.sh/);
+  assert.doesNotMatch(managedStartScript, /container start/);
 });
 
 test("retrieves the Bedrock T flip-flop card", () => {
