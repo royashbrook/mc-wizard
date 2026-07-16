@@ -2,6 +2,12 @@ import { createHmac, randomUUID } from "node:crypto";
 import { allowedWizardAction, allowedWizardGoal, wizardActionRejection, wizardSkillPrompt } from "./skills.mjs";
 import { createMemorySessionStore } from "./sessions.mjs";
 import { createMemoryLearnedRecipeStore, reusableLearnedAction } from "./learned-recipes.mjs";
+import {
+  createMemoryPlayerPreferenceStore,
+  describePlayerPreferences,
+  parsePlayerPreferenceInstruction,
+  playerPreferencePrompt,
+} from "./player-preferences.mjs";
 import { commonFarmAction } from "./common-farms.mjs";
 import {
   explicitlyRequestsCommand,
@@ -501,6 +507,8 @@ function requestedMaterialBlock(question) {
       && !/\bconcrete\s+(?:action|answer|detail|example|idea|plan|step)\b/i.test(target) ? "white" : undefined);
   if (concrete) return `minecraft:${concrete}_concrete`;
   const requests = [
+    ["minecraft:red_mushroom_block", /\b(?:red\s+)?mushroom(?:\s+blocks?)?\b/i],
+    ["minecraft:brown_mushroom_block", /\bbrown\s+mushroom(?:\s+blocks?)?\b/i],
     ["minecraft:polished_blackstone_bricks", /\b(?:polished\s+)?blackstone(?:\s+bricks?)?\b/i],
     ["minecraft:dark_prismarine", /\bdark\s+prismarine\b/i],
     ["minecraft:prismarine_bricks", /\bprismarine(?:\s+bricks?)?\b/i],
@@ -3526,12 +3534,14 @@ function providerTurnSummary(turn, { projectOnly = false, compact = false, fullP
     const actionDetail = action
       ? fullProject ? boundedText(JSON.stringify(action), 10_000) : providerActionSummary(action)
       : "none";
-    return `Project turn: ${boundedText(turn.question, 300)}\nAssistant: ${boundedText(turn.answer, 800)}${goalLine}\n${actionLabel}: ${actionDetail}`
+    const answer = turn.preferenceApplied ? "Private preferences were applied for this turn." : turn.answer;
+    return `Project turn: ${boundedText(turn.question, 300)}\nAssistant: ${boundedText(answer, 800)}${goalLine}\n${actionLabel}: ${actionDetail}`
       + (turn.detail ? `\nOutcome detail: ${boundedText(turn.detail, 300)}` : "");
   }
   const questionLimit = compact ? 300 : 500;
   const answerLimit = compact ? 500 : 800;
-  return `Player: ${boundedText(turn.question, questionLimit)}\nAssistant: ${boundedText(turn.answer, answerLimit)}${goalLine}`
+  const answer = turn.preferenceApplied ? "Private preferences were applied for this turn." : turn.answer;
+  return `Player: ${boundedText(turn.question, questionLimit)}\nAssistant: ${boundedText(answer, answerLimit)}${goalLine}`
     + (turn.action ? `\n${actionLabel}: ${providerActionSummary(turn.action)}` : "")
     + (turn.detail ? `\nOutcome detail: ${boundedText(turn.detail, 300)}` : "");
 }
@@ -3567,14 +3577,17 @@ function providerHistorySummary(history, { fullProject = false } = {}) {
     .map(([, summary]) => summary).join("\n\n");
 }
 
-async function askProvider({ provider, fetchImpl, question, hits, history, player, env, safetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context }) {
+async function askProvider({ provider, fetchImpl, question, hits, history, player, env, safetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context, preferences }) {
   const sources = hits.map((hit, index) =>
     `[Source ${index + 1}: ${hit.title}; edition=${hit.edition}; channel=${hit.channel}; version=${hit.version}]\n${hit.text}`,
   ).join("\n\n");
   const priorDialogue = providerHistorySummary(history, { fullProject: !general });
+  const preferencePolicy = general ? "" : playerPreferencePrompt(preferences, question, {
+    explicitMaterial: Boolean(requestedMaterialBlock(question)),
+  });
   const input = general
     ? `Recent conversation:\n${priorDialogue}\n\nPlayer question:\n${question}`
-    : `Recent conversation:\n${priorDialogue}\n\nLive world snapshot:\n${context ? JSON.stringify(context) : "No live snapshot was available."}\n\nQuestion about Minecraft Bedrock stable:\n${question}\n\nRetrieved sources:\n${sources || "No relevant source was found."}`;
+    : `Recent conversation:\n${priorDialogue}\n\nLive world snapshot:\n${context ? JSON.stringify(context) : "No live snapshot was available."}${preferencePolicy ? `\n\n${preferencePolicy}` : ""}\n\nQuestion about Minecraft Bedrock stable:\n${question}\n\nRetrieved sources:\n${sources || "No relevant source was found."}`;
   const safetyIdentifier = createHmac("sha256", safetySalt)
     .update("mc-wizard:provider-safety-identifier:v1\0")
     .update(player || "anonymous")
@@ -3648,6 +3661,67 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   throw lastError;
 }
 
+export function preferredMaterialAction(action, preferences, question) {
+  const material = preferences.find(({ kind }) => kind === "material");
+  if (!material || requestedMaterialBlock(question) || action?.type !== "build_structure" || !action.plan) return action;
+  const blockId = material.blockId;
+  const originalMaterials = action.plan.materials || {};
+  const replaceable = new Set((material.exclusive
+    ? Object.values(originalMaterials)
+    : [originalMaterials.primary]).filter((value) => typeof value === "string"));
+  return {
+    ...action,
+    plan: {
+      ...action.plan,
+      materials: {
+        ...originalMaterials,
+        primary: blockId,
+        ...(material.exclusive && { accent: blockId, roof: blockId }),
+      },
+      ...(Array.isArray(action.plan.primitives) && {
+        primitives: action.plan.primitives.map((primitive) => (
+          replaceable.has(primitive.blockId) ? { ...primitive, blockId } : primitive
+        )),
+      }),
+    },
+  };
+}
+
+function preferenceNotice(preferences, question, action) {
+  const material = preferences.find(({ kind }) => kind === "material");
+  if (action?.type === "build_structure" && material && !requestedMaterialBlock(question)) {
+    return `I’m following your ${material.label} build rule.`;
+  }
+  const teleport = preferences.find(({ kind }) => kind === "teleport");
+  if (teleport && /\b(?:teleport|\btp\b|take|bring|send|move|travel)\b.{0,48}\b(?:me|us|everyone|all of us|the party)\b/i.test(question)) {
+    return "You asked directly, so I’ll travel this time; I’ll keep asking first otherwise.";
+  }
+  return "";
+}
+
+function actionReferencesBlock(action, blockId) {
+  try {
+    return JSON.stringify(action).includes(`"${blockId}"`);
+  } catch {
+    return false;
+  }
+}
+
+function actionUsesMaterialPreference(action, preferences, question, providerActionAccepted = false) {
+  const material = preferences.find(({ kind }) => kind === "material");
+  // Structures are postprocessed with the rule. Other model actions only
+  // depend on it when their executable action actually contains that block.
+  return Boolean(material && action && !requestedMaterialBlock(question) && (
+    action.type === "build_structure"
+    || (providerActionAccepted && actionReferencesBlock(action, material.blockId))
+  ));
+}
+
+function sessionIdentity(player, playerId) {
+  const id = typeof playerId === "string" ? playerId.trim() : "";
+  return id ? `bedrock:${id}` : String(player || "anonymous");
+}
+
 export function createWizard({
   corpus,
   env = process.env,
@@ -3655,6 +3729,7 @@ export function createWizard({
   logger = console,
   sessions = createMemorySessionStore(),
   recipes = createMemoryLearnedRecipeStore(),
+  preferences = createMemoryPlayerPreferenceStore(),
   settings = async () => ({}),
   safetySalt,
 } = {}) {
@@ -3665,24 +3740,105 @@ export function createWizard({
   const providerSafetySalt = injectedSafetySalt
     || (configuredSafetySalt.length >= 24 ? configuredSafetySalt : randomUUID());
   const terminalActionResults = new Map();
+  const clearPreferenceDerivedState = async (playerIdentity, changedKinds = []) => {
+    const sessionPlayer = sessionIdentity(undefined, playerIdentity);
+    const prefix = `${sessionPlayer}\u0000`;
+    for (const key of terminalActionResults.keys()) if (key.startsWith(prefix)) terminalActionResults.delete(key);
+    if (typeof sessions.invalidate === "function") sessions.invalidate(sessionPlayer, "wizard");
+    const history = sessions.get(sessionPlayer, "wizard");
+    const affectedKinds = new Set(Array.isArray(changedKinds) ? changedKinds : [changedKinds]);
+    const scrubbed = affectedKinds.size
+      ? history.filter((turn) => !turn.preferenceDependencies?.some((kind) => affectedKinds.has(kind)))
+      : history;
+    if (scrubbed.length !== history.length && typeof sessions.set === "function") {
+      await sessions.set(sessionPlayer, "wizard", scrubbed);
+    }
+    if (typeof sessions.clearActionResults === "function") {
+      await sessions.clearActionResults(sessionPlayer, "wizard");
+    }
+  };
+  const preferenceResult = async (playerIdentity, intent) => {
+    const current = () => preferences.get(playerIdentity);
+    if (intent.type === "private") {
+      return {
+        answer: "I only keep and show your own notes. Ask me what I remember about you.",
+        action: null, sources: [], mode: "player-memory", kind: "wizard", label: provider.label,
+        preferences: current(),
+      };
+    }
+    if (intent.type === "list") {
+      return {
+        answer: describePlayerPreferences(current()),
+        action: null, sources: [], mode: "player-memory", kind: "wizard", label: provider.label,
+        preferences: current(),
+      };
+    }
+    if (intent.type === "clear") {
+      const removedKinds = current().map(({ kind }) => kind);
+      const result = await preferences.clear(playerIdentity);
+      if (result.removed) await clearPreferenceDerivedState(playerIdentity, removedKinds);
+      return {
+        answer: result.removed
+          ? "Poof—your lasting notes are gone. I won’t use them anymore."
+          : "I don’t have any lasting notes for you right now.",
+        action: null, sources: [], mode: "player-memory", kind: "wizard", label: provider.label,
+        preferences: result.entries,
+      };
+    }
+    const existing = current();
+    const kind = intent.type === "remove-last"
+      ? [...existing].sort((left, right) => right.updatedAt - left.updatedAt)[0]?.kind : intent.kind;
+    if (intent.type === "remove" || intent.type === "remove-last") {
+      const result = kind ? await preferences.remove(playerIdentity, kind) : { removed: false, entries: existing };
+      if (result.removed) await clearPreferenceDerivedState(playerIdentity, kind);
+      return {
+        answer: result.removed
+          ? "Consider it forgotten. I won’t use that note anymore."
+          : "I couldn’t find that note, so there’s nothing to erase.",
+        action: null, sources: [], mode: "player-memory", kind: "wizard", label: provider.label,
+        preferences: result.entries,
+      };
+    }
+    const result = await preferences.set(playerIdentity, intent.preference);
+    if (result.changed) await clearPreferenceDerivedState(playerIdentity, result.entry?.kind);
+    const entry = result.entry;
+    const answer = entry?.kind === "proximity"
+      ? `Got it—I’ll give you about ${entry.minimumDistance} blocks of space.`
+      : entry?.kind === "material"
+        ? `Got it—I’ll use ${entry.exclusive ? "only " : ""}${entry.label} for your builds until you change your mind.`
+        : "Got it—I’ll ask before I teleport you unless you directly ask me to travel.";
+    return {
+      answer,
+      action: null, sources: [], mode: "player-memory", kind: "wizard", label: provider.label,
+      preferences: result.entries,
+    };
+  };
 
   const api = {
     provider: provider.name,
-    clearSession(player, mode = "wizard") {
+    getPlayerPreferences(playerIdentity) {
+      return preferences.get(playerIdentity);
+    },
+    preferenceHealth() {
+      return typeof preferences.stats === "function" ? preferences.stats() : { players: 0, preferences: 0 };
+    },
+    clearSession(player, mode = "wizard", playerId) {
+      const sessionPlayer = sessionIdentity(player, playerId);
       if (mode === "wizard") {
-        const prefix = `${player}\u0000`;
+        const prefix = `${sessionPlayer}\u0000`;
         for (const key of terminalActionResults.keys()) if (key.startsWith(prefix)) terminalActionResults.delete(key);
       }
-      return sessions.delete(player, mode);
+      return sessions.delete(sessionPlayer, mode);
     },
-    async recordFeedback({ player, requestId, grade, feedback, context }) {
+    async recordFeedback({ player, playerId, requestId, grade, feedback, context }) {
       if (typeof sessions.recordFeedback !== "function") {
         return { matched: false, recorded: false, duplicate: false };
       }
       const note = typeof feedback === "string"
         ? feedback.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 500)
         : "";
-      const binding = await sessions.recordFeedback(player, "wizard", {
+      const sessionPlayer = sessionIdentity(player, playerId);
+      const binding = await sessions.recordFeedback(sessionPlayer, "wizard", {
         requestId, grade, ...(note && { note }),
       });
       const actionLabel = binding.action?.id || binding.action?.plan?.title
@@ -3705,15 +3861,16 @@ export function createWizard({
       if (binding.duplicate) {
         return { ...result, message: "I already saved that grade for this request." };
       }
-      const feedbackHistory = sessions.get(player, "wizard");
+      const feedbackHistory = sessions.get(sessionPlayer, "wizard");
       const gradedTurnIndex = feedbackHistory.findLastIndex((turn) => turn.requestId === requestId);
+      const preferenceBound = Boolean(feedbackHistory[gradedTurnIndex]?.preferenceDependencies?.length);
       const goalVerified = Boolean(binding.goalId && gradedTurnIndex >= 0
         && feedbackHistory.slice(gradedTurnIndex + 1).some((turn) => (
           !turn.action && turn.goalId === binding.goalId
           && allowedWizardGoal(turn.goal)?.status === "complete"
         )));
       const forgetRejectedRecipe = async () => {
-        if (binding.responseMode !== "learned-recipe" || typeof recipes.remove !== "function") return;
+        if (preferenceBound || binding.responseMode !== "learned-recipe" || typeof recipes.remove !== "function") return;
         try {
           await recipes.remove(binding.question);
         } catch (error) {
@@ -3721,7 +3878,7 @@ export function createWizard({
         }
       };
       const rememberSuccessfulRecipe = async () => {
-        if (binding.status !== "completed" || grade < 4
+        if (preferenceBound || binding.status !== "completed" || grade < 4
           || isStagedBuildProgress(binding.action)
           || !reusableLearnedAction(binding.action)
           || typeof recipes.promote !== "function") return false;
@@ -3776,6 +3933,7 @@ export function createWizard({
       if (binding.goalId && immediateCorrection) {
         const followUp = await api.ask({
           player,
+          playerId,
           mode: "wizard",
           question: note,
           requestId: randomUUID(),
@@ -3796,6 +3954,7 @@ export function createWizard({
         const instruction = `Improve this existing ${projectKind} in place using the player's feedback: ${note}`;
         const refinement = await api.ask({
           player,
+          playerId,
           mode: "wizard",
           question: instruction,
           requestId: randomUUID(),
@@ -3814,6 +3973,7 @@ export function createWizard({
       if (correctiveAction) {
         const followUp = await api.ask({
           player,
+          playerId,
           mode: "wizard",
           question: note,
           requestId: randomUUID(),
@@ -3828,6 +3988,7 @@ export function createWizard({
       const instruction = `Answer the player's earlier informational question again in MC Wizard character. Use the feedback as the next instruction. Do not promise or return an in-world action. Earlier question: ${originalQuestion}. Player feedback: ${note}`;
       const refinement = await api.ask({
         player,
+        playerId,
         mode: "wizard",
         question: instruction,
         requestId: randomUUID(),
@@ -3843,14 +4004,15 @@ export function createWizard({
         followUp: refinement,
       };
     },
-    async recordActionResult({ player, requestId, status, detail, context }) {
+    async recordActionResult({ player, playerId, requestId, status, detail, context }) {
+      const sessionPlayer = sessionIdentity(player, playerId);
       const terminal = ["completed", "failed", "partial"].includes(status);
-      const resultKey = `${player}\u0000${requestId}`;
+      const resultKey = `${sessionPlayer}\u0000${requestId}`;
       if (terminal && terminalActionResults.has(resultKey)) {
         return { ...structuredClone(terminalActionResults.get(resultKey)), updated: false, replayed: true };
       }
       if (terminal && typeof sessions.getActionResult === "function") {
-        const persisted = await sessions.getActionResult(player, "wizard", requestId);
+        const persisted = await sessions.getActionResult(sessionPlayer, "wizard", requestId);
         if (persisted) {
           terminalActionResults.set(resultKey, structuredClone(persisted));
           return { ...persisted, updated: false, replayed: true };
@@ -3859,7 +4021,7 @@ export function createWizard({
       const remember = async (result) => {
         if (terminal) {
           if (typeof sessions.setActionResult === "function") {
-            await sessions.setActionResult(player, "wizard", requestId, result);
+            await sessions.setActionResult(sessionPlayer, "wizard", requestId, result);
           }
           terminalActionResults.delete(resultKey);
           terminalActionResults.set(resultKey, structuredClone(result));
@@ -3868,12 +4030,12 @@ export function createWizard({
         return result;
       };
       if (typeof sessions.updateAction !== "function") return { matched: false, updated: false };
-      let outcome = await sessions.updateAction(player, "wizard", { requestId, status, detail });
+      let outcome = await sessions.updateAction(sessionPlayer, "wizard", { requestId, status, detail });
       const terminalRecovery = terminal && outcome.matched && !outcome.updated && outcome.status === status;
       if (!outcome.matched || (!outcome.updated && !terminalRecovery) || !terminal
         || /\b(?:superseded|player left|all players left|server stopp)/i.test(detail || "")) return outcome;
       if (terminalRecovery) outcome = { ...outcome, updated: true, recovered: true };
-      const history = sessions.get(player, "wizard");
+      const history = sessions.get(sessionPlayer, "wizard");
       const actionTurn = history.findLast((turn) => turn.requestId === requestId);
       if (!allowedWizardAction(actionTurn?.action)) return remember(outcome);
       const goalId = actionTurn.goalId || actionTurn.requestId;
@@ -3918,7 +4080,7 @@ export function createWizard({
         });
       }
       if (actionTurn.requestSequence && typeof sessions.isCurrent === "function"
-        && !sessions.isCurrent(player, "wizard", actionTurn.requestSequence)) {
+          && !sessions.isCurrent(sessionPlayer, "wizard", actionTurn.requestSequence)) {
         return remember({ ...outcome, superseded: true });
       }
       const newerProject = history.some((turn) => turn.requestSequence > actionTurn.requestSequence
@@ -3955,13 +4117,14 @@ export function createWizard({
             goalId,
             requestId: review.requestId,
           };
-          if (typeof sessions.append === "function") await sessions.append(player, "wizard", reviewTurn);
-          else await sessions.set(player, "wizard", [...history, reviewTurn]);
+          if (typeof sessions.append === "function") await sessions.append(sessionPlayer, "wizard", reviewTurn);
+          else await sessions.set(sessionPlayer, "wizard", [...history, reviewTurn]);
           return remember({ ...outcome, review });
         }
         if (!context) return remember({ ...outcome, reviewDeferred: true });
         const review = await api.ask({
           player,
+          playerId,
           mode: "wizard",
           question: goalReviewQuestion(goal, detail),
           context,
@@ -3990,6 +4153,7 @@ export function createWizard({
       const originalQuestion = contract?.question || actionTurn.question;
       const replan = await api.ask({
         player,
+        playerId,
         mode: "wizard",
         question: originalQuestion,
         context,
@@ -4003,6 +4167,7 @@ export function createWizard({
     async ask({
       question,
       player = "anonymous",
+      playerId,
       mode: requestMode = "wizard",
       requestId,
       context,
@@ -4011,15 +4176,35 @@ export function createWizard({
       goalRetry,
       answerOnly,
     }) {
-      question = normalizeActionRequest(question);
-      const requestSequence = typeof sessions.reserve === "function"
-        ? sessions.reserve(player, requestMode) : undefined;
-      const tuning = { aiEnabled: true, ...await settings() };
+      const originalQuestion = normalizeActionRequest(question);
+      const sessionPlayer = sessionIdentity(player, playerId);
+      const playerIdentity = typeof playerId === "string" && playerId.trim()
+        ? playerId.trim() : undefined;
+      const existingHistory = sessions.get(sessionPlayer, requestMode);
       const general = requestMode === "general";
+      const memoryIntent = general ? undefined : parsePlayerPreferenceInstruction(originalQuestion, {
+        previousQuestion: existingHistory.at(-1)?.question,
+        previousAction: existingHistory.at(-1)?.action,
+      });
+      if (memoryIntent) {
+        if (!playerIdentity) {
+          return {
+            answer: "I can only save or show lasting notes when I can recognize you in the world.",
+            action: null, sources: [], mode: "player-memory", kind: "wizard", label: provider.label,
+            preferences: [],
+          };
+        }
+        return preferenceResult(playerIdentity, memoryIntent);
+      }
+      question = originalQuestion;
+      const requestSequence = typeof sessions.reserve === "function"
+        ? sessions.reserve(sessionPlayer, requestMode) : undefined;
+      const tuning = { aiEnabled: true, ...await settings() };
+      const playerPreferences = !general && playerIdentity ? preferences.get(playerIdentity) : [];
       const answerOnlyRequest = !general && Boolean(answerOnly);
       const reviewRequest = !general && Boolean(goalReview?.goalId);
       const recipeRequest = !general && !reviewRequest && !answerOnlyRequest && isRecipeRequest(question);
-      const history = sessions.get(player, requestMode);
+      const history = existingHistory;
       const actionHistory = general ? history : historyWithObservedStructure(history, context);
       const satisfied = !general && !reviewRequest && !answerOnlyRequest
         && isGoalSatisfaction(question, actionHistory);
@@ -4066,6 +4251,7 @@ export function createWizard({
       let providerGoal;
       let providerActionRejection;
       let rejectedProviderAction;
+      let providerActionAccepted = false;
       let title = general ? bookTitle(question) : undefined;
       let responseMode = answerOnlyRequest ? "feedback-answer-fallback" : reviewRequest ? "review-deferred"
         : instantAnswer ? "local-instant" : groundedAnswer ? "local-grounded"
@@ -4087,6 +4273,7 @@ export function createWizard({
           const providerAnswer = await askProvider({
             provider, fetchImpl, question, hits, history: actionHistory, player, env,
             safetySalt: providerSafetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context,
+            preferences: playerPreferences,
           });
           const envelope = general ? generalEnvelope(providerAnswer, question) : wizardEnvelope(providerAnswer, question);
           if (!general && !envelope) throw new Error("AI provider returned an invalid Wizard response");
@@ -4121,6 +4308,7 @@ export function createWizard({
             providerGoal = (reviewRequest || buildRequest || projectFeedback || (providerCandidate && intentAllowed))
               ? envelope.goal : undefined;
             selectedAction = intentAllowed ? providerCandidate : null;
+            if (selectedAction) providerActionAccepted = true;
             if (providerActionRejection) {
               answer = safeFallback.answer;
               responseMode = safeFallback.action ? "local-skill"
@@ -4139,13 +4327,14 @@ export function createWizard({
                 const repairedProviderAnswer = await askProvider({
                   provider, fetchImpl, question, hits, history: repairHistory, player, env,
                   safetySalt: providerSafetySalt, general: false, buildRequest: false,
-                  reviewRequest: false, researchRequired: false, tuning, context,
+                  reviewRequest: false, researchRequired: false, tuning, context, preferences: playerPreferences,
                 });
                 const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
                 const repairedGift = repairingGift && !repairedEnvelope?.rawActionRejection
                   ? repairProviderGift(repairedEnvelope?.action, question) : null;
                 if (repairedGift && providerActionMatchesRequest(repairedGift, question, actionHistory)) {
                   selectedAction = repairedGift;
+                  providerActionAccepted = true;
                   providerGoal = repairedEnvelope.goal;
                   answer = localAnswer(question, hits, repairedGift);
                   responseMode = "local-action-repair";
@@ -4211,6 +4400,7 @@ export function createWizard({
             const repairedProviderAnswer = await askProvider({
               provider, fetchImpl, question, hits, history: repairHistory, player, env,
               safetySalt: providerSafetySalt, general: false, buildRequest: true, researchRequired, tuning, context,
+              preferences: playerPreferences,
             });
             const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
             if (repairedEnvelope && !unusableWizardAnswer(repairedEnvelope.answer, question)) {
@@ -4228,6 +4418,7 @@ export function createWizard({
                 && actionCompletesBuildRequest(repairedAction, question, actionHistory)) {
                 answer = repairedEnvelope.answer;
                 selectedAction = repairedAction;
+                providerActionAccepted = true;
                 providerGoal = repairedEnvelope.goal || providerGoal;
               }
             }
@@ -4248,6 +4439,7 @@ export function createWizard({
           answer = safeFallback.answer;
           selectedAction = safeFallback.action;
           providerGoal = undefined;
+          providerActionAccepted = false;
           responseMode = selectedAction?.type === "build_structure"
             ? "local-structure-fallback" : "offline-fallback";
         }
@@ -4270,12 +4462,26 @@ export function createWizard({
           answer = PLANNING_DEFERRED_ANSWER;
         }
       }
+      let appliedPreferenceDependencies = [];
+      if (!general && !answerOnlyRequest && buildRequest && selectedAction) {
+        selectedAction = preferredMaterialAction(selectedAction, playerPreferences, originalQuestion);
+      }
+      if (!general && actionUsesMaterialPreference(
+        selectedAction, playerPreferences, originalQuestion, providerActionAccepted,
+      )) {
+        appliedPreferenceDependencies = ["material"];
+      }
       if (!general && !reviewRequest && !answerOnlyRequest && selectedAction) {
         answer = localAnswer(question, hits, selectedAction);
       }
       if (!general && unsafeCommandAnswer(answer, question)) {
         answer = safeCommandRefusal(Boolean(selectedAction));
       }
+      const memoryNotice = general ? "" : preferenceNotice(playerPreferences, originalQuestion, selectedAction);
+      // Preferences are applied fresh each turn. Do not make an old preference
+      // look like conversational instruction after a child later forgets it.
+      const displayAnswer = memoryNotice && !answer.startsWith(memoryNotice)
+        ? `${memoryNotice} ${answer}` : answer;
       const sources = buildRequest || reviewRequest ? [] : [...new Map(hits.map((hit) => [hit.source, {
         title: hit.title,
         url: hit.source,
@@ -4303,7 +4509,7 @@ export function createWizard({
           ? priorProject?.goalId || priorProject?.requestId || safeRequestId || randomUUID()
           : safeRequestId || randomUUID());
       const supersededResponse = () => ({
-        answer,
+        answer: displayAnswer,
         action: null,
         ...(goal && { goal }),
         sources: [],
@@ -4311,10 +4517,12 @@ export function createWizard({
         kind: general ? "general" : "wizard",
         label: provider.label,
         title,
+        ...(!general && { preferences: playerPreferences }),
+        ...(!general && playerPreferences.length && { preferenceApplied: true }),
         superseded: true,
       });
       if (requestSequence && typeof sessions.isCurrent === "function"
-        && !sessions.isCurrent(player, requestMode, requestSequence)) {
+          && !sessions.isCurrent(sessionPlayer, requestMode, requestSequence)) {
         return supersededResponse();
       }
       const turn = {
@@ -4327,19 +4535,21 @@ export function createWizard({
         ...(failureRetry?.requestId && { retryOfRequestId: failureRetry.requestId }),
         ...(selectedAction && { status: "pending" }),
         responseMode,
+        ...(!general && playerPreferences.length && { preferenceApplied: true }),
+        ...(appliedPreferenceDependencies.length && { preferenceDependencies: appliedPreferenceDependencies }),
         ...(requestSequence && { requestSequence }),
       };
       if (requestSequence && typeof sessions.appendIfCurrent === "function") {
         try {
-          if (!await sessions.appendIfCurrent(player, requestMode, turn)) return supersededResponse();
+          if (!await sessions.appendIfCurrent(sessionPlayer, requestMode, turn)) return supersededResponse();
         } catch (error) {
-          if (typeof sessions.release === "function") sessions.release(player, requestMode, requestSequence);
+          if (typeof sessions.release === "function") sessions.release(sessionPlayer, requestMode, requestSequence);
           throw error;
         }
-      } else if (typeof sessions.append === "function") await sessions.append(player, requestMode, turn);
-      else await sessions.set(player, requestMode, [...history, turn]);
+      } else if (typeof sessions.append === "function") await sessions.append(sessionPlayer, requestMode, turn);
+      else await sessions.set(sessionPlayer, requestMode, [...history, turn]);
       return {
-        answer,
+        answer: displayAnswer,
         action: selectedAction,
         ...(goal && { goal }),
         sources,
@@ -4347,6 +4557,8 @@ export function createWizard({
         kind: general ? "general" : "wizard",
         label: provider.label,
         title,
+        ...(!general && { preferences: playerPreferences }),
+        ...(!general && playerPreferences.length && { preferenceApplied: true }),
         ...(safeRequestId && { requestId: safeRequestId }),
         ...(goalId && { goalId }),
       };

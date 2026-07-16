@@ -101,9 +101,9 @@ test("drives the real wizard path with a headless test player", () => {
   assert.match(e2eScript, /kid\.chat\(message\)/);
   assert.match(e2eScript, /chatCallbacks\.routeAddressedMessage\(kid, message\)/);
   assert.match(packScript, /\[MC Wizard\]\[chat\]/);
-  assert.match(packScript, /logChat\(player, "wizard", "player", trimmed\)/);
+  assert.match(packScript, /logChat\(player, "wizard", "player", trimmed, isPrivatePreferenceMessage\(question\)\)/);
   assert.match(packScript, /logChat\(player, "general", "player", trimmed\)/);
-  assert.match(packScript, /logChat\(player, "wizard", WIZARD_NAME, message\)/);
+  assert.match(packScript, /logChat\(player, "wizard", WIZARD_NAME, message, privatePreference\)/);
   assert.match(packScript, /logChat\(player, "general", label, answer\)/);
   assert.match(e2eScript, /engine-event/);
   assert.match(e2eScript, /direct-harness-fallback/);
@@ -165,11 +165,12 @@ test("embodies the guide as an official simulated player", () => {
   assert.match(packScript, /spawnSimulatedPlayer/);
   assert.match(packScript, /navigateToLocation/);
   assert.match(packScript, /function moveWizardBeside/);
-  assert.match(packScript, /\[3, 4, 5, 6, 7, 8\]\.flatMap/);
+  assert.match(packScript, /function preferredWizardDistance/);
+  assert.match(packScript, /Array\.from\(\{ length: 13 - minimumDistance \}/);
   assert.match(packScript, /for \(const yOffset of \[0, -1, 1, -2, 2\]\)/);
   assert.match(packScript, /if \(!SAFE_GROUND\.has\(arrivalGround\?\.typeId\)\) wizard\.fly\(\)/);
   assert.match(packScript, /blinked beside \$\{player\.name\}/);
-  assert.match(packScript, /distance < 2\.25 \* 2\.25/);
+  assert.match(packScript, /const tooClose = Math\.max\(1\.5, preferredDistance - 0\.75\)/);
   assert.doesNotMatch(packScript, /navigateToEntity\(player/);
   assert.match(packScript, /\.chat\(/);
   assert.match(packScript, /useItemOnBlock/);
@@ -2211,8 +2212,8 @@ test("cancels stale replies and keeps children updated while deeper work runs", 
   assert.match(packScript, /\[80, acknowledgements/);
   assert.match(packScript, /Still working—I’m staying with it/);
   assert.doesNotMatch(packScript, /Let me think about that/);
-  assert.match(packScript, /clearBackendSession/);
-  assert.match(packScript, /HttpRequestMethod\.Delete/);
+  assert.match(packScript, /sessionReset/);
+  assert.match(packScript, /sessionResets\.set\(playerId, `join-/);
   assert.match(packScript, /payload\?\.mode === "planning-deferred"/);
   assert.match(packScript, /planningAttempt < 2/);
   assert.match(packScript, /trying another one now without making you repeat it/);

@@ -98,6 +98,10 @@ const lastStructures = new Map();
 const structuresByKind = new Map();
 const lastProjects = new Map();
 const projectsByKind = new Map();
+const playerPreferences = new Map();
+const playerPreferenceGenerations = new Map();
+const playerPreferencesPending = new Set();
+const sessionResets = new Map();
 const placementRetries = new Map();
 const buildRetryNotices = new Set();
 const preparedPlacements = new Set();
@@ -156,6 +160,7 @@ let buildActionGeneration = 0;
 let activeBuildToken;
 let nextBuildToken = 0;
 let nextQuestionToken = 0;
+const RUNTIME_SESSION_NONCE = `${Date.now().toString(36)}-${Math.floor(Math.random() * 1_000_000_000).toString(36)}`;
 let buildMovement;
 let activeTransaction;
 let lastAmbientTick = 0;
@@ -277,9 +282,10 @@ async function postActionResult(report, status, detail) {
     try {
       const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/action-result"))
         .setMethod(HttpRequestMethod.Post)
-        .setBody(JSON.stringify({
-          player: report.playerName,
-          requestId: report.requestId,
+          .setBody(JSON.stringify({
+            player: report.playerName,
+            ...(report.playerId ? { playerId: report.playerId } : {}),
+            requestId: report.requestId,
           status,
           ...(detail ? { detail: String(detail).slice(0, 240) } : {}),
           ...(context ? { context } : {}),
@@ -867,17 +873,144 @@ function playerById(id) {
   return humanPlayers().find((player) => player.id === id);
 }
 
+function normalizePlayerPreferences(value) {
+  const byKind = new Map();
+  for (const entry of Array.isArray(value) ? value : []) {
+    if (!entry || typeof entry !== "object") continue;
+    if (entry.kind === "proximity" && Number.isFinite(entry.minimumDistance)) {
+      byKind.set("proximity", {
+        kind: "proximity",
+        minimumDistance: Math.min(12, Math.max(3, Math.round(entry.minimumDistance))),
+      });
+    } else if (entry.kind === "material"
+      && typeof entry.blockId === "string" && /^minecraft:[a-z0-9_]+$/.test(entry.blockId)
+      && typeof entry.label === "string") {
+      byKind.set("material", {
+        kind: "material",
+        blockId: entry.blockId,
+        label: entry.label.replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, 48),
+        exclusive: entry.exclusive === true,
+      });
+    } else if (entry.kind === "teleport" && entry.askBeforeTeleport === true) {
+      byKind.set("teleport", { kind: "teleport", askBeforeTeleport: true });
+    }
+  }
+  return [...byKind.values()];
+}
+
+function playerPreferenceGeneration(playerId) {
+  return playerPreferenceGenerations.get(playerId) || 0;
+}
+
+function advancePlayerPreferenceGeneration(playerId) {
+  const next = playerPreferenceGeneration(playerId) + 1;
+  playerPreferenceGenerations.set(playerId, next);
+  return next;
+}
+
+function rememberPlayerPreferences(player, value, expectedGeneration) {
+  if (!player || !Array.isArray(value)) return;
+  if (expectedGeneration !== undefined && playerPreferenceGeneration(player.id) !== expectedGeneration) return;
+  playerPreferences.set(player.id, normalizePlayerPreferences(value));
+}
+
+function receivePlayerPreferences(player, value) {
+  if (!player || !Array.isArray(value)) return;
+  advancePlayerPreferenceGeneration(player.id);
+  rememberPlayerPreferences(player, value);
+  playerPreferencesPending.delete(player.id);
+}
+
+function playerPreference(player, kind) {
+  return playerPreferences.get(player.id)?.find((entry) => entry.kind === kind);
+}
+
+function preferredWizardDistance(player) {
+  return playerPreference(player, "proximity")?.minimumDistance || (playerPreferencesPending.has(player.id) ? 8 : 3);
+}
+
+function needsTeleportConsent(player) {
+  return playerPreferencesPending.has(player.id) || playerPreference(player, "teleport")?.askBeforeTeleport === true;
+}
+
+function directTravelRequest(question) {
+  return /\b(?:teleport|\btp\b|take|bring|send|move|travel)\b.{0,48}\b(?:me|us|everyone|all of us|the party)\b/i.test(String(question || ""));
+}
+
+function commandsTeleportRequester(commands) {
+  return (Array.isArray(commands) ? commands : []).some((command) => /\b(?:teleport|tp|spreadplayers)\b/i.test(String(command || "")));
+}
+
+function commandsMoveOptedOutPlayer(player, commands) {
+  const optedOut = humanPlayers().filter((candidate) => candidate.id !== player.id && needsTeleportConsent(candidate));
+  return optedOut.some((candidate) => (Array.isArray(commands) ? commands : []).some((command) => {
+    const text = String(command || "");
+    if (!/\b(?:teleport|tp|spreadplayers)\b/i.test(text)) return false;
+    return /@(?:a|e|p|r)\b/i.test(text) || text.toLowerCase().includes(candidate.name.toLowerCase());
+  }));
+}
+
+function actionMovesRequester(action) {
+  if (!action || typeof action !== "object") return false;
+  if (action.type === "dimension_travel") return true;
+  if (action.type === "run_commands") return commandsTeleportRequester(action.commands);
+  if (action.type !== "execute_program") return false;
+  return (Array.isArray(action.program?.steps) ? action.program.steps : []).some((step) => (
+    (step?.capability === "script.teleport" && step.arguments?.subject === "requester")
+    || ((step?.capability === "world.command" || step?.capability === "server.console")
+      && commandsTeleportRequester(step.arguments?.commands))
+  ));
+}
+
+function actionMovesOptedOutPlayer(player, action) {
+  if (!action || typeof action !== "object") return false;
+  if (action.type === "run_commands") return commandsMoveOptedOutPlayer(player, action.commands);
+  if (action.type !== "execute_program") return false;
+  return (Array.isArray(action.program?.steps) ? action.program.steps : []).some((step) => (
+    (step?.capability === "world.command" || step?.capability === "server.console")
+      && commandsMoveOptedOutPlayer(player, step.arguments?.commands)
+  ));
+}
+
+async function loadPlayerPreferences(player) {
+  const generation = playerPreferenceGeneration(player.id);
+  let restored = false;
+  try {
+    const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/preferences"))
+      .setMethod(HttpRequestMethod.Post)
+      .setBody(JSON.stringify({ player: player.name, playerId: player.id }))
+      .addHeader("Content-Type", "application/json");
+    if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
+    const response = await http.request(request);
+    if (response.status < 200 || response.status >= 300) throw new Error(`brain returned HTTP ${response.status}`);
+    const payload = JSON.parse(response.body || "{}");
+    const current = playerById(player.id);
+    if (current && Array.isArray(payload.preferences) && playerPreferenceGeneration(current.id) === generation) {
+      rememberPlayerPreferences(current, payload.preferences, generation);
+      restored = true;
+    }
+  } catch (error) {
+    console.warn(`[MC Wizard] could not restore private preferences: ${error}`);
+  } finally {
+    if (restored) playerPreferencesPending.delete(player.id);
+  }
+}
+
 function wizardIsValid() {
   return Boolean(wizard?.isValid);
 }
 
-function logChat(player, channel, speaker, message) {
+function logChat(player, channel, speaker, message, privatePreference = false) {
   console.warn(`[MC Wizard][chat] ${JSON.stringify({
     channel,
     player: player.name,
     speaker,
-    message: String(message),
+    message: privatePreference ? "[private player preference]" : String(message),
   })}`);
+}
+
+function isPrivatePreferenceMessage(message) {
+  return /\b(?:remember|memory|memories|lasting notes|from now on|my stuff|my builds?|keep using|go away|stay away|keep back|too close|not so close|give me space|don'?t stand near|ask .* before .* teleport|don'?t|do not|never|don'?t do that again|forget|erase|delete|remove)\b/i.test(String(message || ""));
 }
 
 function deliverModelAnswer(player, payload, question) {
@@ -920,7 +1053,8 @@ function arrivalPosition(player) {
     y: standingBlockY(player.location),
     z: Math.floor(player.location.z),
   };
-  const offsets = [3, 4, 5, 6, 7, 8].flatMap((radius) => (
+  const minimumDistance = preferredWizardDistance(player);
+  const offsets = Array.from({ length: 13 - minimumDistance }, (_, index) => minimumDistance + index).flatMap((radius) => (
     [[radius, 0], [-radius, 0], [0, radius], [0, -radius], [radius, radius], [-radius, -radius]]
   ));
   for (const [x, z] of offsets) {
@@ -1063,6 +1197,9 @@ function distanceSquared(a, b) {
 function moveWizardBeside(bot, player) {
   const distance = distanceSquared(bot.location, player.location);
   const destination = arrivalPosition(player);
+  const preferredDistance = preferredWizardDistance(player);
+  const tooClose = Math.max(1.5, preferredDistance - 0.75);
+  const tooFar = preferredDistance + 1.5;
   if (distance > 24 * 24 && destination) {
     bot.stopMoving();
     bot.teleport(destination, {
@@ -1079,7 +1216,7 @@ function moveWizardBeside(bot, player) {
     console.warn(`[MC Wizard] blinked beside ${player.name} after they moved far away`);
     return true;
   }
-  if ((distance < 2.25 * 2.25 || distance > 4.5 * 4.5)
+  if ((distance < tooClose * tooClose || distance > tooFar * tooFar)
     && destination
     && distanceSquared(bot.location, destination) > 0.75 * 0.75) {
     bot.navigateToLocation(destination, 0.65);
@@ -1112,9 +1249,13 @@ function bringWizardTo(player, follow = true, forceMovement = false) {
   return bot;
 }
 
-function speak(player, message) {
+function speak(player, message, { privatePreference = false } = {}) {
+  logChat(player, "wizard", WIZARD_NAME, message, privatePreference);
+  if (privatePreference) {
+    for (const line of splitMessage(message)) player.sendMessage(`${PREFIX}${line}`);
+    return;
+  }
   const bot = ensureWizard(player);
-  logChat(player, "wizard", WIZARD_NAME, message);
   for (const line of splitMessage(message)) {
     if (bot?.isValid) {
       try {
@@ -1158,8 +1299,9 @@ async function submitFeedback(prompt, grade, feedback) {
     const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/feedback"))
       .setMethod(HttpRequestMethod.Post)
       .setBody(JSON.stringify({
-        player: prompt.playerName,
-        requestId: prompt.requestId,
+          player: prompt.playerName,
+          playerId: prompt.playerId,
+          requestId: prompt.requestId,
         grade,
         feedback,
         context: liveWorldSnapshot(player),
@@ -4665,6 +4807,7 @@ function nearbyTravelParty(player) {
     candidate.id !== player.id
     && candidate.dimension.id === player.dimension.id
     && distanceSquared(candidate.location, player.location) <= TRAVEL_PARTY_DISTANCE_SQUARED
+    && !needsTeleportConsent(candidate)
   ))];
 }
 
@@ -4799,14 +4942,18 @@ async function applyDimensionTravel(player, action, capturedPartyIds = nearbyTra
     );
     return;
   }
-  const report = beginImmediateAction(player);
-  const playersById = new Map(humanPlayers().map((member) => [member.id, member]));
-  const party = capturedPartyIds.map((id) => playersById.get(id)).filter(Boolean);
-  if (party.length !== capturedPartyIds.length) {
-    speak(player, "One traveler left before the spell began, so I kept everyone else together here instead of splitting the party.");
-    endImmediateAction(report, "failed", "a captured party member left before dimension travel began");
-    return;
-  }
+    const report = beginImmediateAction(player);
+    const playersById = new Map(humanPlayers().map((member) => [member.id, member]));
+    const capturedParty = capturedPartyIds.map((id) => playersById.get(id)).filter(Boolean);
+    if (capturedParty.length !== capturedPartyIds.length) {
+      speak(player, "One traveler left before the spell began, so I kept everyone else together here instead of splitting the party.");
+      endImmediateAction(report, "failed", "a captured party member left before dimension travel began");
+      return;
+    }
+    const party = capturedParty.filter((member) => member.id === player.id || !needsTeleportConsent(member));
+    if (party.length < capturedParty.length) {
+      speak(player, "One traveler is staying behind, so I kept the rest of the trip together.");
+    }
   const targetDimension = world.getDimension(destination.name);
   if (party.every((member) => member.dimension.id === destination.id)
     && bot.dimension.id === destination.id) {
@@ -5064,6 +5211,9 @@ function executeRequesterCommands(player, commands) {
 
 function runCommandsForPlayer(player, commands, report = beginImmediateAction(player)) {
   try {
+    if (commandsMoveOptedOutPlayer(player, commands)) {
+      throw new Error("broad relocation could move a non-participant");
+    }
     const { succeeded, total } = executeRequesterCommands(player, commands);
     if (succeeded === 0) throw new Error("every command reported zero successful targets");
     speak(player, succeeded === commands.length
@@ -5383,7 +5533,7 @@ function dropCapabilityBook(player, { title, text, author }) {
   return `dropped book “${component.title}” at the player's feet`;
 }
 
-async function executeCapabilityStep(player, step, frame) {
+async function executeCapabilityStep(player, step, frame, { allowRequesterTeleport = false } = {}) {
   const args = step.arguments;
   if (step.capability === "control.wait") {
     await system.waitTicks(args.ticks);
@@ -5427,12 +5577,26 @@ async function executeCapabilityStep(player, step, frame) {
     );
     return `used ${args.itemId} on the requested block`;
   }
-  if (step.capability === "world.command") {
-    const result = executeRequesterCommands(player, args.commands);
+    if (step.capability === "world.command") {
+      if (commandsMoveOptedOutPlayer(player, args.commands)) {
+        throw new Error("broad relocation could move a non-participant");
+      }
+      if (needsTeleportConsent(player) && !allowRequesterTeleport && commandsTeleportRequester(args.commands)) {
+        throw new Error("the player asked me to confirm before teleporting them");
+      }
+      const result = executeRequesterCommands(player, args.commands);
     if (result.succeeded !== result.total) throw new Error(`only ${result.succeeded} of ${result.total} commands succeeded`);
     return `executed ${result.succeeded} requester-scoped command${result.succeeded === 1 ? "" : "s"}`;
   }
-  if (step.capability === "server.console") return executeServerConsole(player, args.commands);
+    if (step.capability === "server.console") {
+      if (commandsMoveOptedOutPlayer(player, args.commands)) {
+        throw new Error("broad relocation could move a non-participant");
+      }
+      if (needsTeleportConsent(player) && !allowRequesterTeleport && commandsTeleportRequester(args.commands)) {
+        throw new Error("the player asked me to confirm before teleporting them");
+      }
+      return executeServerConsole(player, args.commands);
+    }
   if (step.capability === "server.configure") return configureServer(player, args);
   if (step.capability === "artifact.book") return dropCapabilityBook(player, args);
   if (step.capability === "observe.snapshot") {
@@ -5473,8 +5637,11 @@ async function executeCapabilityStep(player, step, frame) {
     }
     return `spawned ${args.count} ${args.typeId}`;
   }
-  if (step.capability === "script.teleport") {
-    const subject = args.subject === "requester" ? player : bringWizardTo(player, true, true);
+    if (step.capability === "script.teleport") {
+      if (args.subject === "requester" && needsTeleportConsent(player) && !allowRequesterTeleport) {
+        throw new Error("the player asked me to confirm before teleporting them");
+      }
+      const subject = args.subject === "requester" ? player : bringWizardTo(player, true, true);
     if (!subject) throw new Error("the teleport subject is unavailable");
     subject.teleport(capabilityLocation(frame, args.target), { dimension: player.dimension });
     return `teleported ${args.subject}`;
@@ -5511,11 +5678,11 @@ function capabilityProjectSummary(program, steps) {
   });
 }
 
-async function executeCapabilityProgram(player, program) {
+async function executeCapabilityProgram(player, program, { allowRequesterTeleport = false } = {}) {
   if (buildInProgress || buildPreparing) {
     queueBuild(
       player,
-      (current) => void executeCapabilityProgram(current, program),
+        (current) => void executeCapabilityProgram(current, program, { allowRequesterTeleport }),
       40,
       `I’ve queued “${program.title}” and will continue it automatically when my hands are free.`,
     );
@@ -5523,7 +5690,7 @@ async function executeCapabilityProgram(player, program) {
   }
   const bot = bringWizardTo(player, true, true);
   if (!bot) {
-    queueBuild(player, (current) => void executeCapabilityProgram(current, program), 40, "I’m returning now, then I’ll carry out the whole plan.");
+      queueBuild(player, (current) => void executeCapabilityProgram(current, program, { allowRequesterTeleport }), 40, "I’m returning now, then I’ll carry out the whole plan.");
     return;
   }
   const token = ++nextBuildToken;
@@ -5567,7 +5734,7 @@ async function executeCapabilityProgram(player, program) {
     for (const step of steps) {
       try {
         if (/^(?:player\.(?:place|break|use)|world\.command|script\.)/.test(step.capability)) changedWorld = true;
-        results.push({ id: step.id, detail: await executeCapabilityStep(player, step, frame) });
+          results.push({ id: step.id, detail: await executeCapabilityStep(player, step, frame, { allowRequesterTeleport }) });
       } catch (error) {
         const detail = String(error?.message || error).slice(0, 160);
         failures.push({ id: step.id, detail });
@@ -5612,15 +5779,24 @@ function applyResponse(playerId, payload, question) {
     deliverModelAnswer(player, payload, question);
     return;
   }
+  receivePlayerPreferences(player, payload.preferences);
   console.warn("[MC Wizard] applying response action=" + (payload.action
     ? `${payload.action.type}:${payload.action.id || payload.action.plan?.title || "unnamed"}`
     : "none"));
   if (!buildInProgress && !buildPreparing) bringWizardTo(player);
-  speak(player, payload.answer || "I found no answer.");
+  speak(player, payload.answer || "I found no answer.", {
+    privatePreference: payload.mode === "player-memory" || payload.preferenceApplied === true,
+  });
 
   const action = payload.action;
   registerActionRequest(player, payload);
-  if (action?.type === "place_blueprint"
+  if (actionMovesOptedOutPlayer(player, action)) {
+    speak(player, "That broad travel spell could move players not joining this trip, so I kept it local.");
+    failPendingAction(player, "broad relocation could move a non-participant");
+  } else if (needsTeleportConsent(player) && actionMovesRequester(action) && !directTravelRequest(question)) {
+    speak(player, "I’ll stay put unless you ask me to travel in this message.", { privatePreference: true });
+    failPendingAction(player, "direct travel confirmation required");
+  } else if (action?.type === "place_blueprint"
     && action.id === "copper_bulb_t_flip_flop"
     && action.version === 1) {
     buildCopperBulbTFlipFlop(player);
@@ -5683,7 +5859,9 @@ function applyResponse(playerId, payload, question) {
   } else if (action?.type === "run_commands" && action.version === 1) {
     runCommandsForPlayer(player, action.commands || []);
   } else if (action?.type === "execute_program" && action.version === 1) {
-    void executeCapabilityProgram(player, action.program);
+    void executeCapabilityProgram(player, action.program, {
+      allowRequesterTeleport: directTravelRequest(question),
+    });
   } else if (action?.type === "place_area_torches" && action.version === 1) {
     void placeAreaTorches(player);
   } else if (action?.type === "command_lesson" && action.version === 1) {
@@ -5702,8 +5880,9 @@ function applyResponse(playerId, payload, question) {
 }
 
 async function askBackend(playerId, question, mode = "wizard", planningAttempt = 0, expectedToken, goalRetryId) {
-  const player = playerById(playerId);
+  let player = playerById(playerId);
   if (!player) return;
+  const sessionReset = sessionResets.get(playerId);
   const key = `${playerId}:${mode}`;
   if (expectedToken !== undefined && pendingQuestions.get(key) !== expectedToken) return;
   const token = ++nextQuestionToken;
@@ -5737,11 +5916,13 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
   }
 
   try {
-    const requestBody = {
+      const requestBody = {
       player: player.name,
+      playerId: player.id,
       question,
       mode,
       requestId,
+      ...(sessionReset ? { sessionReset } : {}),
       ...(goalRetryId ? { goalId: goalRetryId } : {}),
       ...(mode === "wizard" ? { context: liveWorldSnapshot(player) } : {}),
     };
@@ -5762,6 +5943,7 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`brain returned HTTP ${response.status}`);
     }
+    if (sessionReset && sessionResets.get(playerId) === sessionReset) sessionResets.delete(playerId);
     const payload = JSON.parse(response.body);
     const retryPlanning = mode === "wizard"
       && payload?.mode === "planning-deferred"
@@ -5771,7 +5953,7 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
     const responseReport = payload?.action
       && typeof payload.requestId === "string"
       && /^[a-zA-Z0-9_-]{1,64}$/.test(payload.requestId)
-      ? { playerName: player.name, requestId: payload.requestId }
+        ? { playerId: player.id, playerName: player.name, requestId: payload.requestId }
       : null;
     system.run(() => {
       if (pendingQuestions.get(key) !== token) {
@@ -5814,19 +5996,6 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
 
 function cancelPendingQuestion(player, mode = "wizard") {
   pendingQuestions.delete(`${player.id}:${mode}`);
-}
-
-async function clearBackendSession(playerName, mode) {
-  try {
-    const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/session"))
-      .setMethod(HttpRequestMethod.Delete)
-      .setBody(JSON.stringify({ player: playerName, mode }))
-      .addHeader("Content-Type", "application/json");
-    if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
-    await http.request(request);
-  } catch (error) {
-    console.warn(`[MC Wizard] could not clear ${mode} session for ${playerName}: ${error}`);
-  }
 }
 
 function handleLocalCommand(player, question) {
@@ -5931,7 +6100,7 @@ function routeAddressedMessage(player, message) {
   if (!match && !bareName && !implicit) return false;
   const playerId = player.id;
   const question = match ? match[1].trim() : bareName ? "" : trimmed;
-  logChat(player, "wizard", "player", trimmed);
+  logChat(player, "wizard", "player", trimmed, isPrivatePreferenceMessage(question));
   system.run(() => {
     const current = playerById(playerId);
     if (!current) return;
@@ -5991,23 +6160,46 @@ world.afterEvents.playerSpawn.subscribe((event) => {
   if (isWizardPlayer(event.player) || event.player.name === WIZARD_NAME) return;
   const playerId = event.player.id;
   const initialSpawn = event.initialSpawn;
+  if (initialSpawn) {
+    cancelPendingQuestion(event.player, "wizard");
+    cancelPendingQuestion(event.player, "general");
+    sessionResets.set(playerId, `join-${RUNTIME_SESSION_NONCE}-${system.currentTick.toString(36)}-${(++nextQuestionToken).toString(36)}`);
+    playerPreferencesPending.add(playerId);
+    system.run(() => {
+      const player = playerById(playerId);
+      if (!player) return;
+      void loadPlayerPreferences(player).then(() => {
+        const current = playerById(playerId);
+        if (current && !buildInProgress && !buildPreparing) bringWizardTo(current, followPlayerId === current.id);
+      });
+    });
+  }
   system.runTimeout(() => {
-    const player = playerById(playerId);
-    if (!player) return;
-    followPlayerId ||= player.id;
-    if (!buildInProgress && !buildPreparing) bringWizardTo(player, followPlayerId === player.id);
-    if (initialSpawn && !greetedPlayers.has(player.id)) {
-      greetedPlayers.add(player.id);
-      cancelPendingQuestion(player);
-      void clearBackendSession(player.name, "wizard");
-      void clearBackendSession(player.name, "general");
-      speak(player, "Hello! I’m MC Wizard. Chat normally when we’re alone or nearby, or say ‘wiz’ when the server is busy. Ask about Bedrock redstone, commands, or a demo.");
+      const player = playerById(playerId);
+      if (!player) return;
+      followPlayerId ||= player.id;
+      if (!buildInProgress && !buildPreparing) bringWizardTo(player, followPlayerId === player.id);
+      if (initialSpawn && !greetedPlayers.has(player.id)) {
+        greetedPlayers.add(player.id);
+        speak(player, "Hello! I’m MC Wizard. Chat normally when we’re alone or nearby, or say ‘wiz’ when the server is busy. Ask about Bedrock redstone, commands, or a demo.");
     }
   }, 20);
 });
 
 world.afterEvents.playerLeave.subscribe((event) => {
   system.run(() => {
+    advancePlayerPreferenceGeneration(event.playerId);
+    playerPreferences.delete(event.playerId);
+    playerPreferencesPending.delete(event.playerId);
+    sessionResets.delete(event.playerId);
+    pendingQuestions.delete(`${event.playerId}:wizard`);
+    pendingQuestions.delete(`${event.playerId}:general`);
+    queuedBuilds.delete(event.playerId);
+    const abandoned = pendingActionReports.get(event.playerId);
+    if (abandoned) {
+      pendingActionReports.delete(event.playerId);
+      void postActionResult(abandoned, "failed", "player left before the action started");
+    }
     pendingFeedback.delete(event.playerId);
     queuedFeedback.delete(event.playerId);
     if (humanPlayers().length) return;

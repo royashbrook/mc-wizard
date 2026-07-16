@@ -176,6 +176,17 @@ Address the character in chat:
 - `wizard, come here` asks MC Wizard to walk to the speaker and face them.
 - `wizard, stay` stops its current movement.
 
+### Private player notes
+
+Each child can give Wiz a few lasting, personal instructions. They follow the child across reconnects, but never become another player's context:
+
+- `wiz, you're standing too close` keeps Wiz about eight blocks away.
+- `wiz, from now on build my stuff with only mushroom blocks` applies that palette to later builds, unless the child names a different material for one build.
+- `wiz, ask before you teleport me` makes movement opt-in; a direct request such as `take me to the Nether` still works.
+- `wiz, what do you remember about me?`, `wiz, forget my mushroom rule`, and `wiz, forget everything` list or remove only the speaker's own notes.
+
+Notes are compact normalized settings, keyed by an HMAC of Bedrock's player ID in ignored `runtime/brain/player-preferences.json` (`0600`). The file contains no raw player names, chat, build plans, action history, or old goals. The operator desk shows only aggregate note counts; it cannot inspect individual notes. The local bridge bearer is a trusted server-to-server boundary, not per-player authentication—keep its port and token off untrusted networks.
+
 The movement commands control only the embodied character. In trusted-family mode the model can also compose physical builds, any Minecraft command, dedicated-server console commands, server properties, experiments, and world options. It still cannot execute arbitrary host JavaScript or shell commands.
 
 Addressed chat is the reliable interaction in this slice. Bedrock may not show a touch `Interact` action for another Player, even a simulated one, so tapping the body is an explicit iPad acceptance test rather than a promised control path.

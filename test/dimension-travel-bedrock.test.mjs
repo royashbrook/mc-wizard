@@ -32,8 +32,9 @@ test("dimension travel moves the requester and nearby same-realm players as one 
   assert.match(executor, /candidate\.dimension\.id === player\.dimension\.id/);
   assert.match(executor, /distanceSquared\(candidate\.location, player\.location\) <= TRAVEL_PARTY_DISTANCE_SQUARED/);
   assert.match(executor, /capturedPartyIds = nearbyTravelParty\(player\)\.map/);
-  assert.match(executor, /const party = capturedPartyIds\.map/);
-  assert.match(executor, /party\.length !== capturedPartyIds\.length/);
+  assert.match(executor, /const capturedParty = capturedPartyIds\.map/);
+  assert.match(executor, /capturedParty\.length !== capturedPartyIds\.length/);
+  assert.match(executor, /const party = capturedParty\.filter/);
   assert.match(executor, /const travelers = \[\.\.\.party, bot\]/);
   assert.match(executor, /travelers\.forEach\(teleportTraveler\)/);
 });

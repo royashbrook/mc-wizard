@@ -10,6 +10,7 @@ import { loadCorpus } from "./rag.mjs";
 import { createInteractionLog } from "./interaction-log.mjs";
 import { createFileSessionStore } from "./sessions.mjs";
 import { createFileLearnedRecipeStore } from "./learned-recipes.mjs";
+import { createFilePlayerPreferenceStore } from "./player-preferences.mjs";
 import { createWizard } from "./wizard.mjs";
 import { readRuntimeSettings } from "./runtime-settings.mjs";
 import { createServerControl } from "./server-control.mjs";
@@ -23,6 +24,18 @@ import {
 
 const MAX_BODY_BYTES = 128 * 1024;
 const CONTEXT_BLOCK_ID = /^minecraft:[a-z0-9_]{1,48}$/;
+const PLAYER_ID = /^[A-Za-z0-9._:-]{1,192}$/;
+const SESSION_RESET = /^[a-zA-Z0-9_-]{1,64}$/;
+
+function opaquePlayerId(value) {
+  if (value === undefined) return undefined;
+  if (typeof value !== "string" || !PLAYER_ID.test(value)) {
+    const error = new Error("playerId must be a 1–192 character opaque Bedrock player identifier");
+    error.status = 400;
+    throw error;
+  }
+  return value;
+}
 
 const finiteInt = (value, min, max) => Number.isInteger(value) && value >= min && value <= max
   ? value : undefined;
@@ -230,6 +243,22 @@ async function recordInteraction(interactionLog, method, value, logger) {
   }
 }
 
+function redactedPreferenceResult(value) {
+  const redact = (response) => {
+    if (!response?.preferenceApplied || typeof response !== "object") return response;
+    const { preferences, ...safe } = response;
+    return { ...safe, answer: "[private player preference applied]" };
+  };
+  const result = redact(value);
+  if (!result || typeof result !== "object") return result;
+  return {
+    ...result,
+    ...(result.replan && { replan: redact(result.replan) }),
+    ...(result.review && { review: redact(result.review) }),
+    ...(result.followUp && { followUp: redact(result.followUp) }),
+  };
+}
+
 function authorized(request, expectedToken) {
   const supplied = request.headers.authorization?.replace(/^Bearer\s+/i, "") || "";
   const expected = Buffer.from(expectedToken);
@@ -279,6 +308,7 @@ export function validateAskBody(body) {
   const player = typeof body.player === "string"
     ? body.player.replace(/[^a-zA-Z0-9 _-]/g, "").slice(0, 64) || "anonymous"
     : "anonymous";
+  const playerId = opaquePlayerId(body.playerId);
   const mode = body.mode === "general" ? "general" : "wizard";
   const requestId = typeof body.requestId === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(body.requestId)
     ? body.requestId : undefined;
@@ -289,11 +319,20 @@ export function validateAskBody(body) {
     error.status = 400;
     throw error;
   }
+  const sessionReset = typeof body.sessionReset === "string" && SESSION_RESET.test(body.sessionReset)
+    ? body.sessionReset : undefined;
+  if (body.sessionReset !== undefined && !sessionReset) {
+    const error = new Error("sessionReset must be 1–64 letters, numbers, underscores, or dashes");
+    error.status = 400;
+    throw error;
+  }
   const context = validateWorldContext(body.context);
   return {
     question, player, mode,
+    ...(playerId && { playerId }),
     ...(requestId && { requestId }),
     ...(goalId && { goalId }),
+    ...(sessionReset && { sessionReset }),
     ...(context && { context }),
   };
 }
@@ -312,6 +351,7 @@ export function validateActionResultBody(body) {
     error.status = 400;
     throw error;
   }
+  const playerId = opaquePlayerId(body.playerId);
   const requestId = typeof body.requestId === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(body.requestId)
     ? body.requestId : undefined;
   if (!requestId) {
@@ -342,7 +382,7 @@ export function validateActionResultBody(body) {
     throw error;
   }
   return {
-    player, requestId, status: body.status,
+    player, ...(playerId && { playerId }), requestId, status: body.status,
     ...(detail && { detail }),
     ...(context && { context }),
   };
@@ -392,6 +432,7 @@ export function validateFeedbackBody(body) {
     error.status = 400;
     throw error;
   }
+  const playerId = opaquePlayerId(body.playerId);
   const requestId = typeof body.requestId === "string" && /^[a-zA-Z0-9_-]{1,64}$/.test(body.requestId)
     ? body.requestId : undefined;
   if (!requestId) {
@@ -419,10 +460,23 @@ export function validateFeedbackBody(body) {
     throw error;
   }
   return {
-    player, requestId, grade: body.grade,
+    player, ...(playerId && { playerId }), requestId, grade: body.grade,
     ...(feedback && { feedback }),
     ...(context && { context }),
   };
+}
+
+export function validatePlayerPreferencesBody(body) {
+  if (!body || typeof body !== "object" || Array.isArray(body)) {
+    throw Object.assign(new Error("request body must be a JSON object"), { status: 400 });
+  }
+  const player = typeof body.player === "string"
+    ? body.player.replace(/[^a-zA-Z0-9 _-]/g, "").slice(0, 64).trim()
+    : "";
+  if (!player) throw Object.assign(new Error("player must be 1–64 safe characters"), { status: 400 });
+  const playerId = opaquePlayerId(body.playerId);
+  if (!playerId) throw Object.assign(new Error("playerId is required"), { status: 400 });
+  return { player, playerId };
 }
 
 export function createHttpServer({
@@ -438,6 +492,26 @@ export function createHttpServer({
 }) {
   let inFlight = 0;
   const lastRequestAt = new Map();
+  const appliedSessionResets = new Map();
+  const resetSessions = async ({ player, playerId, sessionReset }) => {
+    if (!sessionReset) return;
+    const key = `${playerId || player}\u0000${sessionReset}`;
+    let reset = appliedSessionResets.get(key);
+    if (!reset) {
+      reset = Promise.all([
+        wizard.clearSession(player, "wizard", playerId),
+        wizard.clearSession(player, "general", playerId),
+      ]);
+      appliedSessionResets.set(key, reset);
+      while (appliedSessionResets.size > 256) appliedSessionResets.delete(appliedSessionResets.keys().next().value);
+    }
+    try {
+      await reset;
+    } catch (error) {
+      if (appliedSessionResets.get(key) === reset) appliedSessionResets.delete(key);
+      throw error;
+    }
+  };
   return createNodeServer(async (request, response) => {
     const url = new URL(request.url, "http://localhost");
     if (request.method === "GET" && url.pathname === "/health") {
@@ -446,6 +520,7 @@ export function createHttpServer({
         corpusChunks: corpus.size,
         provider: wizard.provider,
         inFlight,
+        preferences: wizard.preferenceHealth?.() || { players: 0, preferences: 0 },
       });
       return;
     }
@@ -493,14 +568,27 @@ export function createHttpServer({
       }
       return;
     }
+    if (request.method === "POST" && url.pathname === "/v1/preferences") {
+      if (!authorized(request, token)) {
+        sendJson(response, 401, { error: "unauthorized" });
+        return;
+      }
+      try {
+        const { playerId } = validatePlayerPreferencesBody(await readJson(request));
+        sendJson(response, 200, { preferences: wizard.getPlayerPreferences(playerId) });
+      } catch (error) {
+        sendJson(response, error.status || 500, { error: error.status ? error.message : "internal error" });
+      }
+      return;
+    }
     if (request.method === "DELETE" && url.pathname === "/v1/session") {
       if (!authorized(request, token)) {
         sendJson(response, 401, { error: "unauthorized" });
         return;
       }
       try {
-        const { player, mode } = validateAskBody({ ...(await readJson(request)), question: "delete" });
-        const deleted = await wizard.clearSession(player, mode);
+        const { player, playerId, mode } = validateAskBody({ ...(await readJson(request)), question: "delete" });
+        const deleted = await wizard.clearSession(player, mode, playerId);
         sendJson(response, 200, { deleted });
       } catch (error) {
         sendJson(response, error.status || 500, { error: error.status ? error.message : "internal error" });
@@ -529,7 +617,9 @@ export function createHttpServer({
           return;
         }
         if (result.recorded) {
-          await recordInteraction(interactionLog, "recordFeedback", { ...feedback, result }, logger);
+          await recordInteraction(interactionLog, "recordFeedback", {
+            ...feedback, result: redactedPreferenceResult(result),
+          }, logger);
         }
         sendJson(response, 200, result);
         logger.log(`[mc-wizard] feedback recorded; grade=${result.grade}`);
@@ -549,7 +639,9 @@ export function createHttpServer({
       try {
         const actionResult = validateActionResultBody(await readJson(request));
         const result = await wizard.recordActionResult(actionResult);
-        await recordInteraction(interactionLog, "recordActionResult", { ...actionResult, result }, logger);
+        await recordInteraction(interactionLog, "recordActionResult", {
+          ...actionResult, result: redactedPreferenceResult(result),
+        }, logger);
         if (!result.matched) {
           sendJson(response, 404, { error: "matching action was not found" });
           return;
@@ -577,21 +669,26 @@ export function createHttpServer({
 
     inFlight += 1;
     try {
-      const { question, player, mode, requestId, goalId, context } = validateAskBody(await readJson(request));
+      const { question, player, playerId, mode, requestId, goalId, sessionReset, context } = validateAskBody(await readJson(request));
+      const requester = playerId || player;
+      await resetSessions({ player, playerId, sessionReset });
       const now = Date.now();
-      if (now - (lastRequestAt.get(player) || 0) < cooldownMs) {
+      if (sessionReset) lastRequestAt.delete(requester);
+      if (!sessionReset && now - (lastRequestAt.get(requester) || 0) < cooldownMs) {
         sendJson(response, 429, { error: "please wait a moment before asking again" });
         return;
       }
-      lastRequestAt.set(player, now);
+      lastRequestAt.set(requester, now);
       logger.log("[mc-wizard] ask request received");
       const result = await wizard.ask({
-        question, player, mode, requestId, context,
+        question, player, playerId, mode, requestId, context,
         ...(goalId && { goalRetry: { goalId } }),
       });
-      await recordInteraction(interactionLog, "recordAsk", {
-        question, player, mode, requestId, result,
-      }, logger);
+      if (result.mode !== "player-memory") {
+        await recordInteraction(interactionLog, "recordAsk", {
+          question, player, mode, requestId, result: redactedPreferenceResult(result),
+        }, logger);
+      }
       sendJson(response, 200, result);
       logger.log("[mc-wizard] ask response sent; action="
         + (result.action?.id || result.action?.plan?.title || result.action?.type || "none"));
@@ -636,6 +733,10 @@ export async function startServer({ env = process.env, logger = console } = {}) 
     filePath: env.LEARNED_RECIPES_FILE || "runtime/brain/learned-recipes.json",
     maxRecipes: Math.min(Math.max(Number(env.LEARNED_RECIPES_MAX) || 100, 1), 500),
   });
+  const preferences = await createFilePlayerPreferenceStore({
+    filePath: env.PLAYER_PREFERENCES_FILE || "runtime/brain/player-preferences.json",
+    salt: wizardSalt,
+  });
   const settingsFile = env.RUNTIME_SETTINGS_FILE || "runtime/admin/settings.json";
   const wizard = createWizard({
     corpus,
@@ -644,6 +745,7 @@ export async function startServer({ env = process.env, logger = console } = {}) 
     logger,
     sessions,
     recipes,
+    preferences,
     settings: () => readRuntimeSettings(settingsFile, logger),
   });
   const interactionLog = createInteractionLog({

@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 
 const REQUEST_ID = /^[a-zA-Z0-9_-]{1,64}$/;
 const ACTION_STATUSES = new Set(["pending", "started", "completed", "failed", "partial", "unknown"]);
+const PREFERENCE_DEPENDENCY_KINDS = new Set(["material", "proximity", "teleport"]);
 // Bump this when persisted dialogue from an older agent contract would teach the
 // current planner false capabilities or revive invalid projects.
 const BEHAVIOR_REVISION = 3;
@@ -17,6 +18,12 @@ function safeDetail(value) {
 
 function safeResponseMode(value) {
   return safeDetail(value)?.slice(0, 64);
+}
+
+function safePreferenceDependencies(value) {
+  if (!Array.isArray(value)) return undefined;
+  const dependencies = [...new Set(value.filter((kind) => PREFERENCE_DEPENDENCY_KINDS.has(kind)))].slice(0, 3);
+  return dependencies.length ? dependencies : undefined;
 }
 
 function safeFeedback(value) {
@@ -86,6 +93,7 @@ function persistedTurn(turn) {
   const responseMode = safeResponseMode(turn?.responseMode);
   const feedback = safeFeedback(turn?.feedback);
   const requestSequence = safeSequence(turn?.requestSequence);
+  const preferenceDependencies = safePreferenceDependencies(turn?.preferenceDependencies);
   return {
     question: turn?.question,
     answer: turn?.answer,
@@ -97,15 +105,17 @@ function persistedTurn(turn) {
     ...(status && { status }),
     ...(detail && { detail }),
     ...(responseMode && { responseMode }),
-    ...(feedback && { feedback }),
-    ...(requestSequence && { requestSequence }),
+      ...(feedback && { feedback }),
+      ...(requestSequence && { requestSequence }),
+      ...(turn?.preferenceApplied === true && { preferenceApplied: true }),
+      ...(preferenceDependencies && { preferenceDependencies }),
   };
 }
 
-function normalizedTurns(turns) {
-  let next = turns.reduce((maximum, turn) => (
+function normalizedTurns(turns, minimumSequence = 0) {
+  let next = Math.max(minimumSequence, turns.reduce((maximum, turn) => (
     Math.max(maximum, safeSequence(turn?.requestSequence) || 0)
-  ), 0);
+  ), 0));
   return turns.map((turn) => {
     const saved = persistedTurn(turn);
     return saved.requestSequence ? saved : { ...saved, requestSequence: ++next };
@@ -209,7 +219,7 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
     },
     async set(player, mode, turns) {
       const key = `${mode}:${player}`;
-      const normalized = trimTurns(normalizedTurns(turns), maxTurns);
+      const normalized = trimTurns(normalizedTurns(turns, sequences.get(key) || 0), maxTurns);
       sessions.set(key, {
         turns: normalized,
         terminalResults: sessions.get(key)?.terminalResults || {},
@@ -220,6 +230,12 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
     reserve(player, mode) {
       const key = `${mode}:${player}`;
       return reserveSequence(sequences, key, sessions.get(key)?.turns);
+    },
+    invalidate(player, mode) {
+      const key = `${mode}:${player}`;
+      const next = Math.max(sequences.get(key) || 0, latestSequence(sessions.get(key)?.turns)) + 1;
+      sequences.set(key, next);
+      return next;
     },
     release(player, mode, requestSequence) {
       const key = `${mode}:${player}`;
@@ -269,6 +285,13 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
       session.updatedAt = Date.now();
       return true;
     },
+    async clearActionResults(player, mode) {
+      const session = sessions.get(`${mode}:${player}`);
+      if (!session) return false;
+      session.terminalResults = {};
+      session.updatedAt = Date.now();
+      return true;
+    },
     async recordFeedback(player, mode, { requestId, grade, note }) {
       const session = sessions.get(`${mode}:${player}`);
       if (!session) return { matched: false, recorded: false, duplicate: false };
@@ -278,7 +301,9 @@ export function createMemorySessionStore({ maxTurns = 12 } = {}) {
     },
     async delete(player, mode) {
       const key = `${mode}:${player}`;
-      sequences.delete(key);
+      // Invalidate any in-flight turn that reserved the old sequence before
+      // deleting its history; otherwise it could append after a reconnect.
+      sequences.set(key, (sequences.get(key) || latestSequence(sessions.get(key)?.turns)) + 1);
       return sessions.delete(key);
     },
   };
@@ -345,7 +370,7 @@ export async function createFileSessionStore({
     },
     async set(player, mode, turns) {
       const key = keyFor(player, mode);
-      const normalized = trimTurns(normalizedTurns(turns), maxTurns);
+      const normalized = trimTurns(normalizedTurns(turns, sequences.get(key) || 0), maxTurns);
       data.sessions[key] = {
         updatedAt: now(),
         turns: normalized,
@@ -357,6 +382,12 @@ export async function createFileSessionStore({
     reserve(player, mode) {
       const key = keyFor(player, mode);
       return reserveSequence(sequences, key, data.sessions[key]?.turns);
+    },
+    invalidate(player, mode) {
+      const key = keyFor(player, mode);
+      const next = Math.max(sequences.get(key) || 0, latestSequence(data.sessions[key]?.turns)) + 1;
+      sequences.set(key, next);
+      return next;
     },
     release(player, mode, requestSequence) {
       const key = keyFor(player, mode);
@@ -416,6 +447,14 @@ export async function createFileSessionStore({
       await persist();
       return true;
     },
+    async clearActionResults(player, mode) {
+      const session = data.sessions[keyFor(player, mode)];
+      if (!session) return false;
+      session.terminalResults = {};
+      session.updatedAt = now();
+      await persist();
+      return true;
+    },
     async recordFeedback(player, mode, { requestId, grade, note }) {
       const session = data.sessions[keyFor(player, mode)];
       if (!session) return { matched: false, recorded: false, duplicate: false };
@@ -428,8 +467,11 @@ export async function createFileSessionStore({
     },
     async delete(player, mode) {
       const key = keyFor(player, mode);
+      const sequence = sequences.get(key) || latestSequence(data.sessions[key]?.turns);
       const deleted = delete data.sessions[key];
-      sequences.delete(key);
+      // Keep a newer in-memory sequence so an old async reply cannot recreate
+      // a session that this deletion intentionally removed.
+      sequences.set(key, sequence + 1);
       if (deleted) await persist();
       return deleted;
     },

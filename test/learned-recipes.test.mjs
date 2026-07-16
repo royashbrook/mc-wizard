@@ -10,6 +10,7 @@ import {
   recipeKey,
   reusableLearnedAction,
 } from "../src/learned-recipes.mjs";
+import { createMemoryPlayerPreferenceStore } from "../src/player-preferences.mjs";
 import { createMemorySessionStore } from "../src/sessions.mjs";
 import { createWizard } from "../src/wizard.mjs";
 
@@ -99,6 +100,66 @@ test("unfamiliar furniture is researched, graded, and reused without another mod
   assert.equal(calls, 1);
   assert.equal(second.mode, "learned-recipe");
   assert.deepEqual(second.action, first.action);
+});
+
+test("a child-specific material note never promotes a shared learned recipe", async () => {
+  const sessions = createMemorySessionStore();
+  const recipes = createMemoryLearnedRecipeStore();
+  const preferences = createMemoryPlayerPreferenceStore();
+  await preferences.set("first-kid", {
+    kind: "material", blockId: "minecraft:red_mushroom_block", label: "mushroom blocks", exclusive: true,
+  });
+  const wizard = createWizard({
+    corpus: { search: () => [] }, sessions, recipes, preferences, logger: quiet,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "I’ll build the furniture now.",
+      action: furnitureAction,
+      goal: { objective: "Build furniture", successCriteria: "Furniture exists", status: "active" },
+    }) } }] }), { status: 200 }),
+  });
+  const question = "please research and build furniture";
+  const first = await wizard.ask({ player: "FirstKid", playerId: "first-kid", question, requestId: "private-furniture" });
+  assert.deepEqual(sessions.get("bedrock:first-kid", "wizard")[0].preferenceDependencies, ["material"]);
+  await wizard.recordActionResult({
+    player: "FirstKid", playerId: "first-kid", requestId: first.requestId, status: "completed", detail: "verified in world",
+    context: {
+      dimension: "minecraft:overworld", buildState: "idle",
+      lastStructure: {
+        kind: first.action.plan.kind, title: first.action.plan.title, dimensions: first.action.plan.dimensions,
+        materials: first.action.plan.materials, features: first.action.plan.features,
+        primitives: first.action.plan.primitives, relativeOrigin: { x: 3, y: 0, z: 3 },
+      },
+    },
+  });
+  const feedback = await wizard.recordFeedback({
+    player: "FirstKid", playerId: "first-kid", requestId: first.requestId, grade: 5,
+  });
+  assert.equal(feedback.learned, undefined);
+  assert.equal(await recipes.find(question), null);
+});
+
+test("a low grade on a personalized learned recipe cannot delete the shared recipe", async () => {
+  const sessions = createMemorySessionStore();
+  const recipes = createMemoryLearnedRecipeStore();
+  const preferences = createMemoryPlayerPreferenceStore();
+  await recipes.promote({ question: "build furniture", action: furnitureAction, grade: 5, verified: true });
+  await preferences.set("private-kid", {
+    kind: "material", blockId: "minecraft:red_mushroom_block", label: "mushroom blocks", exclusive: true,
+  });
+  const wizard = createWizard({ corpus: { search: () => [] }, sessions, recipes, preferences, logger: quiet, env: {} });
+  const result = await wizard.ask({
+    player: "PrivateKid", playerId: "private-kid", question: "build furniture", requestId: "private-recipe",
+  });
+  assert.equal(result.mode, "learned-recipe");
+  assert.deepEqual(sessions.get("bedrock:private-kid", "wizard")[0].preferenceDependencies, ["material"]);
+  await sessions.updateAction("bedrock:private-kid", "wizard", {
+    requestId: result.requestId, status: "completed", detail: "built with the child’s material note",
+  });
+  await wizard.recordFeedback({
+    player: "PrivateKid", playerId: "private-kid", requestId: result.requestId, grade: 1,
+  });
+  assert.deepEqual((await recipes.find("build furniture")).action, furnitureAction);
 });
 
 test("a rejected learned recipe is removed and durable recipes survive reload", async () => {

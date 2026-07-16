@@ -144,7 +144,7 @@ test("active-project targeting selects the most recently completed record", () =
 
 test("Bedrock executes programs sequentially and reports failed steps with a fresh snapshot", () => {
   assert.match(packScript, /import \{ newestProjectRecord, normalizeRuntimeStep, runtimeProgramHasEvidence \} from "\.\/capability-runtime\.js"/);
-  assert.match(packScript, /async function executeCapabilityProgram\(player, program\)/);
+  assert.match(packScript, /async function executeCapabilityProgram\(player, program(?:, \{ allowRequesterTeleport = false \} = \{\})?\)/);
   assert.match(packScript, /function capabilityProgramFrame\(player, program\)/);
   assert.match(packScript, /program\.site === "active_project"/);
   assert.match(packScript, /projectFor\(player, program\.targetKind\)/);
@@ -152,9 +152,9 @@ test("Bedrock executes programs sequentially and reports failed steps with a fre
   assert.match(packScript, /newestProjectRecord\(lastProjectFor\(player\), lastStructureFor\(player\)\)/);
   assert.match(packScript, /program\.steps\.map\(normalizeRuntimeStep\)/);
   assert.match(packScript, /if \(!runtimeProgramHasEvidence\(steps\)\) throw/);
-  assert.match(packScript, /await executeCapabilityStep\(player, step, frame\)/);
+  assert.match(packScript, /await executeCapabilityStep\(player, step, frame(?:, \{ allowRequesterTeleport \})?\)/);
   assert.match(packScript, /action\?\.type === "execute_program" && action\.version === 1/);
-  assert.match(packScript, /void executeCapabilityProgram\(player, action\.program\)/);
+  assert.match(packScript, /void executeCapabilityProgram\(player, action\.program, \{[\s\S]*allowRequesterTeleport:/);
   assert.match(packScript, /placeAsWizard\(/);
   assert.match(packScript, /breakAsWizard\(/);
   assert.match(packScript, /useItemAsWizard\(/);
@@ -164,7 +164,7 @@ test("Bedrock executes programs sequentially and reports failed steps with a fre
   assert.match(packScript, /endBuildAction\(token, changedWorld \? "partial" : "failed", `program/);
   assert.ok(
     packScript.indexOf("/.test(step.capability)) changedWorld = true")
-      < packScript.indexOf("await executeCapabilityStep(player, step, frame)"),
+      < packScript.indexOf("await executeCapabilityStep(player, step, frame, { allowRequesterTeleport })"),
     "a partially completed mutating step must preserve useful world changes",
   );
 });
