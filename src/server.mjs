@@ -518,6 +518,7 @@ export function createHttpServer({
       sendJson(response, 200, {
         ok: true,
         corpusChunks: corpus.size,
+        graph: corpus.graph || { revision: "unavailable", documents: 0, nodes: 0, edges: 0 },
         provider: wizard.provider,
         inFlight,
         preferences: wizard.preferenceHealth?.() || { players: 0, preferences: 0 },

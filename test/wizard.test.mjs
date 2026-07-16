@@ -504,9 +504,10 @@ test("uses a private per-install HMAC for provider safety identifiers", async ()
 
 test("promotes versioned documentation only after retrieval and dialogue evaluation", () => {
   assert.match(syncDocsScript, /\.staging-/);
-  assert.match(syncDocsScript, /evaluateRelease\(staging\)/);
+  assert.match(syncDocsScript, /evaluateRelease\(staging, creatorCommit\)/);
   assert.match(syncDocsScript, /retrieval evaluation failed before promotion/);
   assert.match(syncDocsScript, /dialogue evaluation failed before promotion/);
+  assert.match(syncDocsScript, /child-friendly synthesis evaluation failed before promotion/);
   assert.match(syncDocsScript, /active-release\.json/);
   assert.match(syncDocsScript, /await rename\(activeTemp/);
   assert.match(syncDocsScript, /CC BY 4\.0/);

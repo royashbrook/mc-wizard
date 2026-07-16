@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { cp, mkdir, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { classifyEdition } from "../src/edition.mjs";
 
 const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const CACHE = path.join(ROOT, ".cache");
@@ -63,6 +64,8 @@ export function htmlToMarkdown(html) {
     .trim();
 }
 
+export { classifyEdition };
+
 function safeMetadata(value) {
   return String(value || "").replace(/[\r\n]+/g, " ").replace(/"/g, "'");
 }
@@ -93,18 +96,21 @@ async function syncChangelog(channel, section, releaseRoot) {
   await mkdir(destination, { recursive: true });
   const articles = await fetchArticles(section);
   const current = new Set();
+  const editions = { bedrock: 0, java: 0, unknown: 0 };
   for (const article of articles) {
     const articleId = String(article.id);
     if (!/^\d+$/.test(articleId)) throw new Error(`invalid changelog article id: ${articleId}`);
     const filename = `${articleId}.md`;
     current.add(filename);
     const body = htmlToMarkdown(article.body || "");
+    const edition = classifyEdition({ title: article.title, body, url: article.html_url, channel, kind: "patch-note" });
+    editions[edition] += 1;
     const version = article.title.match(/\b(?:1\.)?\d+(?:\.\d+){1,2}\b/)?.[0] || "unknown";
     const hash = createHash("sha256").update(body).digest("hex");
     const markdown = `---\n` +
       `title: "${safeMetadata(article.title)}"\n` +
       `source: "${safeMetadata(article.html_url)}"\n` +
-      `edition: bedrock\nchannel: ${channel}\nkind: patch-note\n` +
+      `edition: ${edition}\nchannel: ${channel}\nkind: patch-note\nsource_policy: private-reference-cache\n` +
       `version: "${version}"\nupdated: "${article.updated_at}"\n` +
       `article_id: "${articleId}"\ncontent_sha256: "${hash}"\n---\n\n` +
       `# ${article.title}\n\n${body}\n`;
@@ -113,19 +119,20 @@ async function syncChangelog(channel, section, releaseRoot) {
   for (const filename of await readdir(destination)) {
     if (/^\d+\.md$/.test(filename) && !current.has(filename)) await rm(path.join(destination, filename));
   }
-  console.log(`[sync] ${channel}: ${articles.length} release notes`);
-  return articles.length;
+  console.log(`[sync] ${channel}: ${articles.length} release notes (${editions.bedrock} Bedrock, ${editions.java} Java, ${editions.unknown} unknown)`);
+  return { articles: articles.length, editions };
 }
 
-async function evaluateRelease(releaseRoot) {
+async function evaluateRelease(releaseRoot, creatorRef) {
   const { loadCorpus } = await import("../src/rag.mjs");
-  const corpus = await loadCorpus({ roots: [
-    { dir: path.join(ROOT, "knowledge"), kind: "mechanic-card" },
+  const corpus = await loadCorpus({ creatorRef, roots: [
+    { dir: path.join(ROOT, "knowledge"), kind: "mechanic-card", id: "knowledge" },
     ...["Documents", "Commands", "Reference", "ScriptAPI"].map((folder) => ({
       dir: path.join(releaseRoot, "minecraft-creator", "creator", folder),
       kind: "official-doc",
+      id: `minecraft-creator/creator/${folder}`,
     })),
-    { dir: path.join(releaseRoot, "patch-notes"), kind: "patch-note" },
+    { dir: path.join(releaseRoot, "patch-notes"), kind: "patch-note", id: "patch-notes" },
   ] });
   const checks = [
     ["how does a redstone comparator work", /comparator/i],
@@ -145,7 +152,19 @@ async function evaluateRelease(releaseRoot) {
   if (!/hi|hello|hey|welcome/i.test(greeting.answer) || greeting.sources?.length) {
     throw new Error("dialogue evaluation failed before promotion: greeting");
   }
-  return { chunks: corpus.size, retrievalChecks: checks.length, dialogueChecks: 1 };
+  const catTaming = await wizard.ask({ player: "release-eval", question: "how do i tame a cat", mode: "wizard" });
+  if (!/raw (?:cod|salmon)/i.test(catTaming.answer) || catTaming.answer.length > 450
+    || /https?:|\[source|ask an adult|my notes/i.test(catTaming.answer)) {
+    throw new Error("child-friendly synthesis evaluation failed before promotion: cat taming");
+  }
+  return {
+    chunks: corpus.size,
+    retrievalChecks: checks.length,
+    dialogueChecks: 1,
+    childSynthesisChecks: 1,
+    graph: corpus.graph,
+    graphArtifact: corpus.graphArtifact,
+  };
 }
 
 async function main() {
@@ -166,7 +185,9 @@ async function main() {
   }
   const counts = {};
   for (const [channel, section] of CHANGELOGS) counts[channel] = await syncChangelog(channel, section, staging);
-  const evaluation = await evaluateRelease(staging);
+  const rawEvaluation = await evaluateRelease(staging, creatorCommit);
+  const { graphArtifact, ...evaluation } = rawEvaluation;
+  await writeFile(path.join(staging, "knowledge-graph.json"), `${JSON.stringify(graphArtifact)}\n`);
   const revision = `${creatorCommit.slice(0, 12)}-${Date.now()}`;
   const release = path.join(RELEASES, revision);
   const manifest = {
@@ -177,6 +198,7 @@ async function main() {
     channels: ["stable", "preview"],
     edition: "bedrock",
     evaluation,
+    graph: evaluation.graph,
     attribution: {
       documentation: "Microsoft Minecraft Creator documentation; CC BY 4.0 (code samples MIT)",
       changelogs: "Minecraft Feedback release notes; cached privately and linked to original articles",

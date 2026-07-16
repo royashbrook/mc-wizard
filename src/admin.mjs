@@ -76,7 +76,7 @@ const PAGE = `<!doctype html>
 </head>
 <body>
 <main class="shell">
-  <header class="top"><div><h1>MC Wizard<br>operator desk</h1><p>Live controls for the local family server.</p></div><div class="health"><span class="badge" id="bedrock">Bedrock</span><span class="badge" id="brain">Brain</span><span class="badge" id="provider">Provider</span><span class="badge" id="memory">Private notes</span></div></header>
+  <header class="top"><div><h1>MC Wizard<br>operator desk</h1><p>Live controls for the local family server.</p></div><div class="health"><span class="badge" id="bedrock">Bedrock</span><span class="badge" id="brain">Brain</span><span class="badge" id="provider">Provider</span><span class="badge" id="graph">Knowledge graph</span><span class="badge" id="memory">Private notes</span></div></header>
   <div class="grid">
     <div class="stack">
       <section class="panel"><h2>World controls</h2><p class="help">These commands run immediately in the Bedrock console.</p><div class="actions">
@@ -94,7 +94,7 @@ const PAGE = `<!doctype html>
 </main>
 <script>
 const $=id=>document.getElementById(id);async function api(path,options={}){const response=await fetch(path,{headers:{"content-type":"application/json"},...options});const value=await response.json();if(!response.ok)throw new Error(value.error||"Request failed");return value}
-  async function status(){const value=await api("/api/status");for(const key of ["bedrock","brain","provider"]){$(key).dataset.ok=String(Boolean(value[key]));}$("provider").textContent=value.providerName||"Provider";const notes=value.preferences||{};$("memory").dataset.ok=String(Boolean(value.brain));$("memory").textContent='Private notes: '+(Number(notes.preferences)||0)}
+  async function status(){const value=await api("/api/status");for(const key of ["bedrock","brain","provider"]){$(key).dataset.ok=String(Boolean(value[key]));}$("provider").textContent=value.providerName||"Provider";const graph=value.graph||{};$("graph").dataset.ok=String(/^kg-\\d+-\\d+-[a-f0-9]+$/i.test(String(graph.revision||"")));$("graph").textContent='Graph: '+(graph.revision||"building");const notes=value.preferences||{};$("memory").dataset.ok=String(Boolean(value.brain));$("memory").textContent='Private notes: '+(Number(notes.preferences)||0)}
 async function loadSettings(){const value=await api("/api/settings");$("aiEnabled").checked=value.aiEnabled;$("wizardPrompt").value=value.wizardPromptAddendum;$("generalPrompt").value=value.generalPromptAddendum;$("wizardTokens").value=value.wizardMaxOutputTokens??"";$("generalTokens").value=value.generalMaxOutputTokens??"";$("saveStatus").textContent=""}
 async function saveSettings(){try{await api("/api/settings",{method:"PUT",body:JSON.stringify({aiEnabled:$("aiEnabled").checked,wizardPromptAddendum:$("wizardPrompt").value,generalPromptAddendum:$("generalPrompt").value,wizardMaxOutputTokens:$("wizardTokens").value||null,generalMaxOutputTokens:$("generalTokens").value||null})});$("saveStatus").textContent="Saved. The next AI request will use this tuning."}catch(error){$("saveStatus").textContent=error.message}}
 async function sendCommand(command,confirmFirst=true){if(confirmFirst&&!window.confirm('Run "'+command+'" on the Bedrock server?'))return;$("consoleStatus").textContent="Sending...";try{await api("/api/console",{method:"POST",body:JSON.stringify({command})});$("consoleStatus").textContent='Sent: '+command;setTimeout(loadLogs,600)}catch(error){$("consoleStatus").textContent=error.message}}
@@ -134,6 +134,7 @@ export function createAdminServer({
             brain: Boolean(brain.ok),
             provider: Boolean(brain.provider && brain.provider !== "offline"),
             providerName: brain.provider || "Offline",
+            graph: brain.graph || { revision: "unavailable", documents: 0, nodes: 0, edges: 0 },
             preferences: brain.preferences || { players: 0, preferences: 0 },
           });
       }

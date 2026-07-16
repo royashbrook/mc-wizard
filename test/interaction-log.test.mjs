@@ -245,6 +245,33 @@ test("the operator desk exposes and renders the persistent interaction history",
   }
 });
 
+test("the operator desk exposes the promoted knowledge-graph revision", async () => {
+  const server = createAdminServer({
+    logger: quiet,
+    fetchImpl: async () => new Response(JSON.stringify({
+      ok: true,
+      provider: "Codex",
+      graph: { revision: "kg-2-2-test", documents: 31703, nodes: 880, edges: 413 },
+    }), { status: 200 }),
+    execute: async () => ({ code: 0, output: "" }),
+  });
+  const page = (await dispatch(server)).body;
+  assert.match(page, /id="graph"/);
+  assert.match(page, /Graph: /);
+  const response = await dispatch(server, { url: "/api/status" });
+  assert.equal(response.status, 200);
+  assert.deepEqual(JSON.parse(response.body).graph, {
+    revision: "kg-2-2-test", documents: 31703, nodes: 880, edges: 413,
+  });
+  const unavailable = createAdminServer({
+    logger: quiet,
+    fetchImpl: async () => new Response(JSON.stringify({ ok: true, graph: { revision: "unavailable" } }), { status: 200 }),
+    execute: async () => ({ code: 0, output: "" }),
+  });
+  const unavailablePage = (await dispatch(unavailable)).body;
+  assert.match(unavailablePage, /\^kg-/);
+});
+
 test("the operator desk rejects cross-site and non-JSON writes", async () => {
   let executed = false;
   const server = createAdminServer({

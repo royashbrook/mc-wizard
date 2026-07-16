@@ -118,7 +118,7 @@ test("uses only the stable Bedrock actor for private preferences and honors a cu
   assert.equal(forgotten.mode, "player-memory");
   assert.deepEqual(preferences.get("bedrock-actor-a"), []);
   const remainingTurns = sessions.get("bedrock:bedrock-actor-a", "wizard");
-  assert.equal(remainingTurns.some((turn) => turn.preferenceDependencies?.includes("material")), false);
+  assert.equal(remainingTurns.some((turn) => turn.preferenceDependencies?.includes("material")), true);
   assert.equal(remainingTurns.some((turn) => /chicken farm/i.test(turn.question)), true);
   assert.equal(remainingTurns.some((turn) => /red concrete/i.test(turn.question)), true);
   const freshBuild = await wizard.ask({
@@ -167,23 +167,148 @@ test("a deleted session cannot be recreated by an older in-flight reply", async 
   assert.deepEqual(sessions.get("bedrock:race", "wizard"), []);
 });
 
-test("changing a preference keeps an unrelated active project while scrubbing preference-derived turns", async () => {
+test("editing one preference preserves conversation, project, and refinement history while superseding only Wizard work in flight", async () => {
   const corpus = await loadCorpus();
   const preferences = createMemoryPlayerPreferenceStore();
   const sessions = createMemorySessionStore();
   const wizard = createWizard({ corpus, env: {}, preferences, sessions, logger: quiet });
-  await wizard.ask({ player: "Kid", playerId: "bedrock-project", question: "build a 7x7 house" });
+  const player = "bedrock:bedrock-project";
+  await preferences.set("bedrock-project", {
+    kind: "material", blockId: "minecraft:red_mushroom_block", label: "mushroom blocks", exclusive: true,
+  });
+  await sessions.set(player, "wizard", [
+    { question: "hello", answer: "Hello, builder!" },
+    {
+      question: "build a 7x7 house", answer: "I built your mushroom house.",
+      action: { type: "build_structure", version: 1, plan: { kind: "house" } },
+      requestId: "house-project", goalId: "house-project", status: "completed",
+      goal: { objective: "Build a mushroom house", successCriteria: "The house is usable.", status: "active" },
+      preferenceApplied: true, preferenceDependencies: ["material"],
+    },
+  ]);
+  await sessions.setActionResult(player, "wizard", "house-project", { matched: true, updated: true });
+  const inFlightSequence = sessions.reserve(player, "wizard");
+  await sessions.append(player, "wizard", {
+    question: "make it taller", answer: "I’m adding another floor.",
+    action: { type: "build_structure", version: 1, plan: { kind: "house", mode: "modify" } },
+    requestId: "house-refinement", goalId: "house-project", status: "pending",
+    goal: { objective: "Build a mushroom house", successCriteria: "The house is usable.", status: "active" },
+    preferenceApplied: true, preferenceDependencies: ["material"], requestSequence: inFlightSequence,
+  });
+  const before = structuredClone(sessions.get(player, "wizard"));
+  const expected = structuredClone(before);
+  expected[2].action = null;
+  delete expected[2].status;
+  delete expected[2].goal;
+  const generalSequence = sessions.reserve(player, "general");
+  assert.equal(sessions.isCurrent(player, "wizard", inFlightSequence), true);
+
   await wizard.ask({
     player: "Kid", playerId: "bedrock-project",
-    question: "from now on build my stuff with only mushroom blocks",
+    question: "from now on build my stuff with only stone blocks",
   });
-  assert.equal(sessions.get("bedrock:bedrock-project", "wizard").length, 1);
-  const mushroomBuild = await wizard.ask({ player: "Kid", playerId: "bedrock-project", question: "build a new 7x7 house" });
-  assert.equal(mushroomBuild.preferenceApplied, true);
-  assert.deepEqual(sessions.get("bedrock:bedrock-project", "wizard")[1].preferenceDependencies, ["material"]);
-  await wizard.ask({ player: "Kid", playerId: "bedrock-project", question: "forget everything" });
-  assert.equal(sessions.get("bedrock:bedrock-project", "wizard").length, 1);
-  assert.equal(sessions.get("bedrock:bedrock-project", "wizard")[0].preferenceApplied, undefined);
+  assert.deepEqual(sessions.get(player, "wizard"), expected);
+  assert.deepEqual(await sessions.getActionResult(player, "wizard", "house-project"), { matched: true, updated: true });
+  assert.equal((await wizard.recordActionResult({
+    player: "Kid", playerId: "bedrock-project", requestId: "house-project", status: "completed",
+  })).replayed, true);
+  assert.equal(sessions.isCurrent(player, "wizard", inFlightSequence), false);
+  assert.equal(await sessions.appendIfCurrent(player, "wizard", {
+    question: "stale reply", answer: "This must not be remembered.", requestSequence: inFlightSequence,
+  }), false);
+  assert.deepEqual(sessions.get(player, "wizard"), expected);
+  assert.equal(sessions.isCurrent(player, "general", generalSequence), true);
+
+  const removalSequence = sessions.reserve(player, "wizard");
+  await wizard.ask({ player: "Kid", playerId: "bedrock-project", question: "forget my material rule" });
+  assert.deepEqual(sessions.get(player, "wizard"), expected);
+  assert.equal(sessions.isCurrent(player, "wizard", removalSequence), false);
+});
+
+test("invalidates stale Wizard work before a delayed real preference write settles", async () => {
+  const sessions = createMemorySessionStore();
+  let entries = [];
+  let releaseWrite;
+  let writeStarted;
+  let writes = 0;
+  const writeReady = new Promise((resolve) => { writeStarted = resolve; });
+  const preferences = {
+    get: () => structuredClone(entries),
+    async set(_playerId, preference) {
+      writes += 1;
+      if (writes === 1) {
+        writeStarted();
+        await new Promise((resolve) => { releaseWrite = resolve; });
+      }
+      const entry = { ...preference, createdAt: 1, updatedAt: writes };
+      entries = [entry];
+      return { changed: true, entries: structuredClone(entries), entry };
+    },
+  };
+  const wizard = createWizard({ corpus: { search: () => [] }, env: {}, preferences, sessions, logger: quiet });
+  const player = "bedrock:bedrock-delayed-preference";
+  const staleSequence = sessions.reserve(player, "wizard");
+  await sessions.append(player, "wizard", {
+    question: "build a house", answer: "I’m building it.",
+    action: { type: "build_structure", version: 1, plan: { kind: "house" } },
+    requestId: "delayed-house", goalId: "delayed-house", status: "started",
+    goal: { objective: "Build a house", successCriteria: "The house is usable.", status: "active" },
+    requestSequence: staleSequence,
+  });
+  const update = wizard.ask({
+    player: "Kid", playerId: "bedrock-delayed-preference",
+    question: "from now on build my stuff with only stone blocks",
+  });
+  await writeReady;
+  assert.equal(sessions.isCurrent(player, "wizard", staleSequence), false);
+  assert.equal(sessions.get(player, "wizard")[0].action, null);
+  assert.equal(sessions.get(player, "wizard")[0].goal, undefined);
+
+  releaseWrite();
+  await update;
+  const duplicateSequence = sessions.reserve(player, "wizard");
+  await wizard.ask({
+    player: "Kid", playerId: "bedrock-delayed-preference",
+    question: "from now on build my stuff with only stone blocks",
+  });
+  assert.equal(sessions.isCurrent(player, "wizard", duplicateSequence), true);
+});
+
+test("a preference change suppresses a stale in-flight Wizard reply before it can speak or act", async () => {
+  const sessions = createMemorySessionStore();
+  const preferences = createMemoryPlayerPreferenceStore();
+  let releaseReply;
+  let replyStarted;
+  const replyReady = new Promise((resolve) => { replyStarted = resolve; });
+  const wizard = createWizard({
+    corpus: { search: () => [] }, sessions, preferences, logger: quiet,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      replyStarted();
+      await new Promise((resolve) => { releaseReply = resolve; });
+      const content = JSON.stringify({ answer: "Observers notice nearby block changes.", action: null });
+      return new Response(JSON.stringify({ choices: [{ message: { content } }] }), { status: 200 });
+    },
+  });
+  const player = "bedrock:bedrock-stale-preference";
+  await sessions.set(player, "wizard", [{ question: "hello", answer: "Hello, builder!" }]);
+  const before = structuredClone(sessions.get(player, "wizard"));
+  const staleRequest = wizard.ask({
+    player: "Kid", playerId: "bedrock-stale-preference", question: "What does an observer do?",
+  });
+  await replyReady;
+
+  await wizard.ask({
+    player: "Kid", playerId: "bedrock-stale-preference",
+    question: "from now on build my stuff with only stone blocks",
+  });
+  releaseReply();
+  const staleReply = await staleRequest;
+
+  assert.equal(staleReply.mode, "superseded");
+  assert.equal(staleReply.superseded, true);
+  assert.equal(staleReply.action, null);
+  assert.deepEqual(sessions.get(player, "wizard"), before);
 });
 
 test("changing a non-build preference does not erase an active build project", async () => {
@@ -192,7 +317,10 @@ test("changing a non-build preference does not erase an active build project", a
   const wizard = createWizard({
     corpus, env: {}, preferences: createMemoryPlayerPreferenceStore(), sessions, logger: quiet,
   });
-  await wizard.ask({ player: "Kid", playerId: "bedrock-space", question: "build a 7x7 house" });
+  const build = await wizard.ask({ player: "Kid", playerId: "bedrock-space", question: "build a 7x7 house" });
+  await sessions.updateAction("bedrock:bedrock-space", "wizard", {
+    requestId: build.requestId, status: "completed",
+  });
   await wizard.ask({ player: "Kid", playerId: "bedrock-space", question: "please give me space" });
   assert.equal(sessions.get("bedrock:bedrock-space", "wizard").length, 1);
   await wizard.ask({ player: "Kid", playerId: "bedrock-space", question: "forget my space rule" });
@@ -334,7 +462,11 @@ test("bridge validates opaque player IDs, returns only the requested cache, and 
       };
     },
   };
-  const server = createHttpServer({ wizard, corpus: { size: 1 }, token: "test-token", interactionLog, cooldownMs: 0, logger: quiet });
+  const server = createHttpServer({
+    wizard,
+    corpus: { size: 1, graph: { revision: "kg-test", documents: 1, nodes: 2, edges: 1 } },
+    token: "test-token", interactionLog, cooldownMs: 0, logger: quiet,
+  });
   try {
     const ask = await dispatch(server, {
       method: "POST", url: "/v1/ask", token: "test-token",
@@ -364,6 +496,7 @@ test("bridge validates opaque player IDs, returns only the requested cache, and 
     assert.deepEqual(other.body.preferences, []);
     const health = await dispatch(server, { method: "GET", url: "/health" });
     assert.deepEqual(health.body.preferences, { players: 2, preferences: 3 });
+    assert.deepEqual(health.body.graph, { revision: "kg-test", documents: 1, nodes: 2, edges: 1 });
     const raw = await readFile(filePath, "utf8");
     assert.doesNotMatch(raw, /mushroom build rule|red_mushroom_block/);
     assert.match(raw, /private player preference applied/);
