@@ -41,6 +41,7 @@ echo "Starting in trusted open-LAN mode; any authenticated player on this privat
 
 mkdir -p "$DATA"
 node scripts/initialize-bedrock-properties.mjs
+npm run install:pack -- "$DATA" mc-wizard
 container run --detach \
   --name mc-wizard-bedrock \
   --platform linux/amd64 \

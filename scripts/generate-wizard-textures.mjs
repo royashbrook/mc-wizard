@@ -229,6 +229,7 @@ await mkdir(docsAssets, { recursive: true });
 
 await writeFile(path.join(resourceTextures, "entity", "wizard_hat.png"), png(64, 64, oldStars));
 await writeFile(path.join(resourceTextures, "entity", "wizard_robe.png"), png(64, 64, oldStars));
+await writeFile(path.join(resourceTextures, "entity", "mc_wizard.png"), png(64, 64, wizardSkin.pixel));
 await writeFile(path.join(resourceTextures, "items", "wizard_hat.png"), png(16, 16, (x, y) => (
   y > 12 || (y > 3 && x > 4 - Math.floor(y / 4) && x < 11 + Math.floor(y / 4)) ? oldStars(x, y) : transparent
 )));

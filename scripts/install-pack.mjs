@@ -1,6 +1,7 @@
 import { chmod, cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { updateServerProperties } from "../src/server-control.mjs";
 
 const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const PACK_ID = "48450204-0c54-4c3b-855a-c76eda67275d";
@@ -100,6 +101,19 @@ if (existingResourcePack) existingResourcePack.version = RESOURCE_VERSION;
 else worldResourcePacks.push({ pack_id: RESOURCE_PACK_ID, version: RESOURCE_VERSION });
 await writeFile(worldResourcePacksFile, `${JSON.stringify(worldResourcePacks, null, 2)}\n`);
 
+const serverPropertiesFile = path.join(serverRoot, "server.properties");
+let serverProperties = "";
+try {
+  serverProperties = await readFile(serverPropertiesFile, "utf8");
+} catch (error) {
+  if (error.code !== "ENOENT") throw error;
+}
+await writeFile(
+  serverPropertiesFile,
+  updateServerProperties(serverProperties, { "texturepack-required": true }),
+  { mode: 0o600 },
+);
+
 await writeFile(path.join(configTarget, "permissions.json"), `${JSON.stringify({
   allowed_modules: [
     "@minecraft/server",
@@ -130,7 +144,7 @@ await writeFile(secretsFile, `${JSON.stringify({
 await chmod(secretsFile, 0o600);
 
 console.log(`Installed MC Wizard in ${serverRoot}`);
-console.log(`Activated behavior and wand resource packs for world: ${worldName}`);
+console.log(`Activated required behavior and appearance resource packs for world: ${worldName}`);
 console.log(`Brain endpoint: ${brainUrl}`);
 if (token === "dev-only-change-me") console.warn("Using the development bridge token; change it before exposing the service.");
 console.warn("The world must already have the Beta APIs experiment enabled.");
