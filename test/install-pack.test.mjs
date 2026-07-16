@@ -13,18 +13,26 @@ let serverRoot;
 before(async () => {
   serverRoot = await mkdtemp(path.join(tmpdir(), "mc-wizard-install-"));
   await mkdir(path.join(serverRoot, "worlds", "Family Lab"), { recursive: true });
+  await mkdir(path.join(serverRoot, "config", "4e8790fe-18dc-46d1-aa31-ec78a924b717"), { recursive: true });
   await writeFile(path.join(serverRoot, "server.properties"), "texturepack-required=false\nmax-players=10\n");
   await writeFile(path.join(serverRoot, "world_resource_packs.json"), "[]\n");
   await writeFile(path.join(serverRoot, "worlds", "Family Lab", "world_resource_packs.json"), JSON.stringify([{
     pack_id: "5dd80b07-b583-4bb3-979c-41c25ce274d8",
     version: [0, 3, 0],
   }]));
+  await writeFile(
+    path.join(serverRoot, "config", "4e8790fe-18dc-46d1-aa31-ec78a924b717", "variables.json"),
+    JSON.stringify({ mc_wizard_url: "http://192.168.1.50:3000/v1/ask" }),
+  );
   await run(process.execPath, [
     "--env-file-if-exists=.env",
     "scripts/install-pack.mjs",
     serverRoot,
     "Family Lab",
-  ], { cwd: repo });
+  ], {
+    cwd: repo,
+    env: { ...process.env, MC_WIZARD_LAN_IP: "", WIZARD_URL: "" },
+  });
 });
 
 after(async () => {
@@ -41,9 +49,14 @@ test("standalone installs require and version the live Wizard appearance pack", 
     path.join(serverRoot, "resource_packs", "mc_wizard", "manifest.json"),
     "utf8",
   ));
+  const variables = JSON.parse(await readFile(
+    path.join(serverRoot, "config", "4e8790fe-18dc-46d1-aa31-ec78a924b717", "variables.json"),
+    "utf8",
+  ));
   await readFile(path.join(serverRoot, "resource_packs", "mc_wizard", "entity", "player.entity.json"));
 
   assert.match(properties, /^texturepack-required=true$/m);
   assert.match(properties, /^max-players=10$/m);
   assert.deepEqual(assignments.find((pack) => pack.pack_id === manifest.header.uuid)?.version, [0, 4, 0]);
+  assert.equal(variables.mc_wizard_url, "http://192.168.1.50:3000/v1/ask");
 });

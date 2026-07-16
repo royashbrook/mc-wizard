@@ -30,6 +30,7 @@ if (!serverDirectory || !worldName) {
 const serverRoot = path.resolve(serverDirectory);
 const worldsRoot = path.join(serverRoot, "worlds");
 const worldRoot = path.resolve(worldsRoot, worldName);
+const configTarget = path.join(serverRoot, "config", MODULE_ID);
 if (path.basename(worldName) !== worldName || !worldRoot.startsWith(`${worldsRoot}${path.sep}`)) {
   console.error("World name must be a folder directly inside the BDS worlds directory.");
   process.exit(1);
@@ -43,7 +44,21 @@ try {
   process.exit(1);
 }
 
-const brainUrl = requestedUrl || process.env.WIZARD_URL || "http://127.0.0.1:3000/v1/ask";
+let existingBrainUrl;
+try {
+  const existingVariables = JSON.parse(await readFile(path.join(configTarget, "variables.json"), "utf8"));
+  existingBrainUrl = existingVariables.mc_wizard_url;
+} catch (error) {
+  if (error.code !== "ENOENT" && !(error instanceof SyntaxError)) throw error;
+}
+const lanBrainUrl = process.env.MC_WIZARD_LAN_IP
+  ? `http://${process.env.MC_WIZARD_LAN_IP}:3000/v1/ask`
+  : undefined;
+const brainUrl = requestedUrl
+  || process.env.WIZARD_URL
+  || lanBrainUrl
+  || existingBrainUrl
+  || "http://127.0.0.1:3000/v1/ask";
 const parsedUrl = new URL(brainUrl);
 if (!["http:", "https:"].includes(parsedUrl.protocol)) throw new Error("Brain URL must use http or https");
 const token = process.env.BRIDGE_TOKEN || "dev-only-change-me";
@@ -64,7 +79,6 @@ if (!loopbackBrain && (token === "dev-only-change-me" || token.length < 24)) {
 }
 const packTarget = path.join(serverRoot, "behavior_packs", "mc_wizard");
 const resourcePackTarget = path.join(serverRoot, "resource_packs", "mc_wizard");
-const configTarget = path.join(serverRoot, "config", MODULE_ID);
 await mkdir(path.dirname(packTarget), { recursive: true });
 await mkdir(configTarget, { recursive: true });
 await cp(path.join(ROOT, "bedrock", "behavior_packs", "mc_wizard"), packTarget, {
