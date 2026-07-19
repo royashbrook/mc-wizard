@@ -193,6 +193,61 @@ async function markdownFiles(root) {
   return files;
 }
 
+// Matches "/"-prefixed command text (e.g. "/give", "`/tp`") so extraction stays prose-only.
+const COMMAND_TEXT = /(^|[\s(`"'[])\/[a-z]/i;
+const ANSWER_LIMIT = 420;
+
+export function extractiveAnswer(question, hits) {
+  const top = Array.isArray(hits) ? hits[0] : undefined;
+  if (!top || typeof top.text !== "string" || !top.text) return null;
+  const questionWords = new Set(tokenize(question || ""));
+  if (!questionWords.size) return null;
+
+  const title = top.title || "spellbook";
+  const budget = ANSWER_LIMIT - `Here's what my spellbook says:  (from my ${title} notes)`.length;
+
+  const sentences = [];
+  for (const paragraph of top.text.split(/\n+/)) {
+    if (/^#{1,6}\s/.test(paragraph.trim())) continue;
+    for (const raw of paragraph.split(/(?<=[.!?])\s+/)) {
+      const sentence = raw.trim();
+      if (sentence) sentences.push(sentence);
+    }
+  }
+
+  // Short child questions ("what is redstone", "creepers?") reduce to 1-2 content
+  // tokens after stopword removal, so a 2-token floor can never fire for them; allow
+  // single-token matches there while keeping the floor for longer questions (precision).
+  const requiredOverlap = questionWords.size <= 2 ? 1 : 2;
+  const sentenceTokens = sentences.map((sentence) => new Set(tokenize(sentence)));
+  // Term weight: question words appearing in fewer of the card's sentences are more
+  // discriminating, so matches on them rank higher than matches on ubiquitous words.
+  const termWeight = new Map([...questionWords].map((word) => {
+    const appearances = sentenceTokens.reduce((count, tokens) => count + (tokens.has(word) ? 1 : 0), 0);
+    return [word, 1 + 1 / Math.max(1, appearances)];
+  }));
+
+  const scored = sentences
+    .map((sentence, index) => {
+      let overlap = 0;
+      let weight = 0;
+      for (const word of sentenceTokens[index]) {
+        if (!questionWords.has(word)) continue;
+        overlap += 1;
+        weight += termWeight.get(word);
+      }
+      return { sentence, index, overlap, score: weight + Math.max(0, 3 - index) * 0.25 };
+    })
+    .filter(({ sentence, overlap }) => overlap >= requiredOverlap && sentence.length <= budget && !COMMAND_TEXT.test(sentence))
+    .sort((a, b) => b.score - a.score);
+  if (!scored.length) return null;
+
+  const picked = [scored[0]];
+  if (scored[1] && scored[0].sentence.length + scored[1].sentence.length + 1 <= budget) picked.push(scored[1]);
+  picked.sort((a, b) => a.index - b.index);
+  return `Here's what my spellbook says: ${picked.map(({ sentence }) => sentence).join(" ")} (from my ${title} notes)`;
+}
+
 export async function loadCorpus({ roots, graphArtifact, graphFile, creatorRef: suppliedCreatorRef } = {}) {
   const usingDefaultRoots = !roots;
   roots ||= await defaultRoots();
@@ -208,9 +263,11 @@ export async function loadCorpus({ roots, graphArtifact, graphFile, creatorRef: 
     }
   }
   creatorRef ||= "main";
+  let syncedFilesLoaded = false;
   for (const root of roots) {
     const files = await markdownFiles(root.dir);
     if (!files.length) continue;
+    if (root.kind !== "mechanic-card") syncedFilesLoaded = true;
     const realRoot = await realpath(root.dir);
     for (const file of files) {
       const raw = await readFile(file, "utf8");
@@ -248,6 +305,14 @@ export async function loadCorpus({ roots, graphArtifact, graphFile, creatorRef: 
         });
       }
     }
+  }
+
+  const baseOnly = !syncedFilesLoaded;
+  if (baseOnly) {
+    console.warn(
+      "[rag] WARNING: corpus contains only the base knowledge/ cards — official docs and patch notes are missing. "
+      + "Run scripts/sync-docs.mjs to download the full corpus into .cache/.",
+    );
   }
 
   const documentFrequency = new Map();
@@ -328,6 +393,7 @@ export async function loadCorpus({ roots, graphArtifact, graphFile, creatorRef: 
 
   return {
     size: chunks.length,
+    baseOnly,
     search,
     graph: { revision: graph.revision, ...graph.stats },
     graphArtifact: artifact,
