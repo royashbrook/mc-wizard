@@ -1,7 +1,7 @@
 import { createHmac, randomUUID } from "node:crypto";
 import { allowedWizardAction, allowedWizardGoal, wizardActionRejection, wizardSkillPrompt } from "./skills.mjs";
 import { createMemorySessionStore } from "./sessions.mjs";
-import { createMemoryLearnedRecipeStore, reusableLearnedAction } from "./learned-recipes.mjs";
+import { createMemoryLearnedRecipeStore, reusableLearnedAction, safeNovelAction } from "./learned-recipes.mjs";
 import {
   createMemoryPlayerPreferenceStore,
   describePlayerPreferences,
@@ -9,6 +9,8 @@ import {
   playerPreferencePrompt,
 } from "./player-preferences.mjs";
 import { commonFarmAction } from "./common-farms.mjs";
+import { composeStructurePlan, describeProceduralBuild, extractDescriptor } from "./procedural-builder.mjs";
+import { extractiveAnswer } from "./rag.mjs";
 import {
   explicitlyRequestsCommand,
   safeCommandRefusal,
@@ -109,6 +111,27 @@ function pendingActionTurn(history = []) {
   const turn = history.at(-1);
   return turn && !allowedWizardAction(turn.action)
     && (answerPromisesAction(turn.answer) || answerOffersAction(turn.answer)) ? turn : undefined;
+}
+
+// #35 review: a bare "yes" must bind to a concrete pending offer — an offer
+// whose clause resolves to a real action or names a real buildable subject.
+// A capability menu ("...build a working demo, or sculpt a blocky statue of
+// nearly anything—ask me one of those...") lists alternatives a bare "yes"
+// cannot pick, so it never binds; the caller asks one precise clarification
+// instead of building an unrequested generic structure.
+function boundPendingOffer(question, history = []) {
+  if (!isActionConfirmation(question)) return undefined;
+  const pending = pendingActionTurn(history);
+  if (!pending) return undefined;
+  const offerText = String(pending.answer || "");
+  if (/\bask me one of those\b/i.test(offerText)
+    || /\b(?:explain|build|sculpt)\b[^.!?]{0,120},\s*or\s+(?:build|sculpt|explain)\b/i.test(offerText)) return undefined;
+  const pendingQuestion = offeredActionQuestion(pending);
+  const resumed = classifyAction(pendingQuestion, history.filter((turn) => turn !== pending));
+  if (resumed) return { pending, question: pendingQuestion, action: resumed };
+  const subject = primaryBuildSubject(pendingQuestion);
+  return subject && buildableRequestNoun(subject)
+    ? { pending, question: pendingQuestion } : undefined;
 }
 
 const STRUCTURE_TYPES = [
@@ -237,7 +260,9 @@ function targetedStructureKind(question) {
 function directStructureKind(question) {
   const mentioned = mentionedStructureKind(question);
   if (mentioned) return mentioned;
-  const phrase = question.match(/\b(?:build|construct|create|make)\s+(?:me\s+)?(?:an?\s+)?(.+?)(?:\s+(?:that|with|using|made|sized)\b|[?.!,]|$)/i)?.[1]
+  // #35: misspelled build verbs and "i want a <noun>" name a kind too.
+  const phrase = (question.match(/\b(?:build|bild|buld|biuld|buid|construct|create|make|mak|mke|mk)\s+(?:me\s+)?(?:us\s+)?(?:an?\s+)?(.+?)(?:\s+(?:that|with|using|made|sized)\b|[?.!,]|$)/i)
+    || question.match(/\b(?:i|we)\s+(?:really\s+)?(?:want|need)\s+an?\s+(.+?)(?:\s+(?:that|with|using|made|sized)\b|[?.!,]|$)/i))?.[1]
     ?.replace(/\b\d+\s*(?:x|×|by)\s*\d+(?:\s*(?:x|×|by)\s*\d+)?\b/gi, "")
     .replace(/\b(?:working|complete|entire|whole|big|small|large|tiny|automated|automatic)\b/gi, "")
     .trim();
@@ -388,9 +413,12 @@ function isProjectFeedback(question, history = []) {
   const project = latestProjectTurn(history);
   if (!project || isGoalSatisfaction(question, history) || isShortAcknowledgement(question)) return false;
   const text = question.trim();
-  const corrective = /\b(?:refine|fix|repair|redo|rework|revise|research|change|modify|improve|upgrade|expand|enlarge|finish|complete|continue|add|remove|replace|move|light|activate|deactivate|extinguish|turn off|contain|enclose|make it|make that|make (?:a )?(?:real|better)|too (?:short|small|big|tall|plain)|doesn['’]?t|didn['’]?t|isn['’]?t|not (?:working|right|done|enough)|wrong|broken|escape|popping out|walk out|fell out|leak|bigger|smaller|taller|wider|more rooms?|more towers?)\b/i
+  // #35 review: natural rejection phrasing ("that's not a dolphin!", "that
+  // looks wrong", "looks nothing like a dragon") is corrective feedback — the
+  // exact reply describeProceduralBuild invites — not a spellbook question.
+  const corrective = /\b(?:refine|fix|repair|redo|rework|revise|research|change|modify|improve|upgrade|expand|enlarge|finish|complete|continue|add|remove|replace|move|light|activate|deactivate|extinguish|turn off|contain|enclose|make it|make that|make (?:a )?(?:real|better)|too (?:short|small|big|tall|plain)|doesn['’]?t|didn['’]?t|isn['’]?t|not (?:working|right|done|enough)|not (?:a|an|my|the|what)\b|looks? (?:wrong|off|weird|bad)|nothing like|wrong|broken|escape|popping out|walk out|fell out|leak|bigger|smaller|taller|wider|more rooms?|more towers?)\b/i
     .test(text);
-  const refersToProject = /\b(?:it|that|this|those|them|the (?:build|project|farm|machine|portal|city|castle|house|structure|one)|your (?:build|project|farm|machine))\b/i
+  const refersToProject = /\b(?:it|that|thats|this|those|them|the (?:build|project|farm|machine|portal|city|castle|house|structure|one)|your (?:build|project|farm|machine))\b/i
     .test(text);
   const explicitNewBuild = /\b(?:build|construct|create|make)\s+(?:me\s+)?(?:an?|another|new)\s+/i.test(text)
     && !refersToProject;
@@ -833,13 +861,23 @@ const requestsVillagerAddition = (question) => (
   || /\bsome\s+villagers?\b/i.test(question)
 );
 
-function structurePlanSatisfiesRequest(plan, question) {
+function structurePlanSatisfiesRequest(plan, question, { allowRaisedDimensions = false } = {}) {
   if (!plan) return false;
   const requestedDimensions = parseRequestedDimensions(question);
   if (requestedDimensions) {
-    if ((requestedDimensions.width !== undefined && plan.dimensions?.width !== requestedDimensions.width)
+    const mismatched = (requestedDimensions.width !== undefined && plan.dimensions?.width !== requestedDimensions.width)
       || (requestedDimensions.depth !== undefined && plan.dimensions?.depth !== requestedDimensions.depth)
-      || (requestedDimensions.height !== undefined && plan.dimensions?.height !== requestedDimensions.height)) return false;
+      || (requestedDimensions.height !== undefined && plan.dimensions?.height !== requestedDimensions.height);
+    if (mismatched) {
+      // #35 review: a procedural silhouette may raise explicit dimensions to
+      // its template minimum; the caller opts into tolerating raised-only
+      // dimensions and surfaces a caveat. Shrinking stays a hard mismatch.
+      const raisedOnly = allowRaisedDimensions
+        && ["width", "depth", "height"].every((axis) => (
+          requestedDimensions[axis] === undefined || plan.dimensions?.[axis] >= requestedDimensions[axis]
+        ));
+      if (!raisedOnly) return false;
+    }
   }
   const features = new Set(plan.features || []);
   if (!requestedStructureFeatures(question).every((feature) => features.has(feature))) return false;
@@ -1727,17 +1765,55 @@ function isOrdinaryConversation(question) {
     || isWeatherConversation(text);
 }
 
+// #35: nouns a child asks for that must never widen into a build request —
+// deliverable items keep their give_items route and social/conversational
+// requests stay ordinary conversation.
+const NON_BUILDABLE_REQUEST_NOUNS = new Set([
+  "sword", "pickaxe", "axe", "shovel", "hoe", "bow", "arrow", "shield", "armor",
+  "helmet", "elytra", "potion", "apple", "bread", "diamond", "emerald", "ingot",
+  "iron", "gold", "copper", "redstone", "torch", "lever", "hopper", "piston",
+  "observer", "repeater", "comparator", "chest", "stone", "cobblestone", "log",
+  "plank", "button", "item", "block", "tool", "kit",
+  "wish", "hug", "joke", "story", "song", "game", "friend", "hint", "question",
+  "answer", "favor", "favour", "minute", "moment", "second", "break", "nap",
+  "snack", "turn", "chance", "go", "try", "look", "peek", "ride", "demo",
+]);
+
+function buildableRequestNoun(phrase) {
+  // #35 review: trailing prepositional phrases and verb complements
+  // ("for us", "come true", "to play with") must not hide the real head noun
+  // — "make a snack for us" is about the snack, not "us".
+  const clause = String(phrase || "").toLowerCase()
+    .split(/\b(?:for|to|with|so|that|because|come|comes|into|in|on|at|by|from|of|about|near|beside|around|and|or|while|when|until|before|after)\b/)[0];
+  const words = (clause.match(/[a-z0-9]+/g) || [])
+    .filter((word) => !/^\d/.test(word)
+      && !/^(?:please|now|today|tonight|first|next|again|here|there|nearby)$/.test(word));
+  const head = words.at(-1);
+  return Boolean(head) && !NON_BUILDABLE_REQUEST_NOUNS.has(normalizedWord(head));
+}
+
 function explicitlyRequestsBuild(question) {
   const buildTarget = /\b(?:farm|machine|harvester|generator|elevator|engine|factory|smelter|sorter|door|contraption|circuit|calculator|adder|flip\s*flop|portal|castle|house|tower|bridge|barn|base|shop|school|wall|monument|city|village|settlement|treehouse|dragon|statue|sculpture|maze|pixel\s+art|vehicle|boat|ship|car|duck|animal|creature|furniture|sofa|couch|chair|desk|table|bed)\b/i;
   return requestClauses(question).some((clause) => {
     const prefix = /^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i;
     const direct = clause.replace(prefix, "");
-    return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:build|construct|create|place|demo|demonstrate)\b/i.test(direct)
+    // #35: bare "make a <noun>" (with common misspellings) and
+    // "i want a <noun>" register as build requests for buildable nouns.
+    // Item deliveries and world requests are matched before isBuildRequest
+    // ever consults this, so "make it rain" and "give me X" keep their routes.
+    const made = direct.match(/^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:make|mak|mke|mk)\s+(?:(?:me|us)\s+)?(?:a|an|some)\s+([^,.!?]+)/i);
+    if (made && buildableRequestNoun(made[1])) return true;
+    const wanted = direct.match(/^(?:i|we)\s+(?:really\s+)?(?:want|need)\s+(?:a|an)\s+([^,.!?]+)/i);
+    if (wanted && buildableRequestNoun(wanted[1])) return true;
+    return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:build|bild|buld|biuld|buid|construct|create|place|demo|demonstrate)\b/i.test(direct)
       || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:research|look\s+up|figure\s+out|find\s+out)\b.{0,80}\band\s+(?:then\s+)?(?:build|construct|create|place|make)\b/i.test(direct)
       || /^(?:can|could|may|would)\s+(?:i|we)\s+(?:please\s+)?(?:build|construct|create|place)\b/i.test(direct)
       || /^(?:i|we)\s+(?:want|need)\s+(?:you\s+to\s+)?(?:build|construct|create|place)\b/i.test(direct)
       || /^how\s+(?:do\s+i|can\s+i|to)\s+(?:build|construct|create)\b/i.test(direct)
-      || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?make\s+(?:me|us)\b/i.test(direct)
+      // #35 review: "make me/us ..." stays a build request unless the named
+      // noun is explicitly non-buildable ("make us a snack" is conversation).
+      || (/^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?make\s+(?:me|us)\b/i.test(direct)
+        && (!made || buildableRequestNoun(made[1])))
       || (buildTarget.test(direct)
         && /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:make|show\s+me)\b/i.test(direct))
       || /^(?:i|we)\s+(?:want|need)\s+(?:you\s+to\s+)?(?:an?\s+|some\s+|the\s+)?(?:furniture|sofa|couch|chair|desk|table|bed)\b/i.test(direct);
@@ -1799,7 +1875,10 @@ function normalizeActionRequest(question) {
 }
 
 function primaryBuildSubject(question) {
-  return question.match(/\b(?:build|construct|create|make)\s+(?:me\s+|us\s+)?(?:an?|the|some)?\s*([^,.!?]{1,100})/i)?.[1]
+  // #35: misspelled build verbs and "i want a <noun>" carry a subject too.
+  const phrase = question.match(/\b(?:build|bild|buld|biuld|buid|construct|create|make|mak|mke|mk)\s+(?:me\s+|us\s+)?(?:an?|the|some)?\s*([^,.!?]{1,100})/i)
+    || question.match(/\b(?:i|we)\s+(?:really\s+)?(?:want|need)\s+an?\s+([^,.!?]{1,100})/i);
+  return phrase?.[1]
     ?.split(/\b(?:next\s+to|beside|near|inside|in|at|for)\b/i, 1)[0]
     .replace(/\b(?:with|using|made\s+of)\b.*$/i, "")
     .trim();
@@ -1894,7 +1973,9 @@ function isBuildRequest(question, history = []) {
     && (explicitlyRequestsBuild(question)
       || isStructureModification(question, history)
       || isProjectFeedback(question, history)
-      || (isActionConfirmation(question) && pendingActionTurn(history))
+      // #35 review: a bare confirmation is a build request only when it binds
+      // to a concrete pending offer; an unbound "yes" gets a clarification.
+      || Boolean(boundPendingOffer(question, history))
       || (/\b(?:need|want|should|use)\b/i.test(question) && /\b(?:farm|machine|harvester|generator|smelter|sorter|door|contraption|circuit|system|device)\b/i.test(question)));
 }
 
@@ -1911,9 +1992,92 @@ function wantsModelAuthoredStructure(action, buildRequest, question) {
       || CUSTOM_STRUCTURE_DETAIL.test(question));
 }
 
+// Words the deterministic ladder itself consumes: build verbs, request filler,
+// sizing adjectives stripped by directStructureKind, dimension units eaten by
+// parseRequestedDimensions, and count words eaten by entity parsing.
+const BUILD_DESCRIPTOR_STOPWORDS = new Set([
+  "build", "building", "built", "construct", "create", "make", "place", "put", "add", "give",
+  "bild", "buld", "biuld", "buid", "mak", "mke", "mk",
+  "show", "demo", "demonstrate", "want", "wants", "need", "needs", "like", "have", "get",
+  "a", "an", "the", "this", "that", "it", "its", "and", "or", "of", "for", "to", "with",
+  "in", "on", "at", "up", "out", "so", "now", "then", "me", "my", "i", "we", "us", "our",
+  "you", "your", "please", "hey", "hi", "hello", "ok", "okay", "wizard", "wiz",
+  "can", "could", "would", "will", "should", "just", "really", "very", "some", "exactly",
+  "right", "here", "there", "nearby", "new",
+  "small", "tiny", "mini", "little", "big", "large", "working", "complete", "entire",
+  "whole", "automated", "automatic",
+  // #35 review: comparatives have no referent on a fresh build and cannot be
+  // honored deterministically; they never justify a provider wait alone.
+  "bigger", "larger", "smaller", "taller", "shorter", "wider", "narrower", "deeper",
+  "x", "by", "block", "blocks", "wide", "tall", "high", "deep", "long", "size", "sized",
+  "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+  // #35 review: politeness and chat filler are never build descriptors —
+  // "build a t flip flop pls" must keep its instant canned path.
+  "pls", "plz", "plss", "plses", "thx", "ty", "thanks", "thank", "rn", "asap", "lol",
+]);
+
+// #35 review: recipient phrases ("for my friend steve", "for us") name who a
+// build is for, not what it looks like; they never justify a provider wait.
+const BUILD_RECIPIENT_PHRASE = /\bfor\s+(?:(?:my|our|the)\s+)?(?:(?:best\s+)?friends?|famil(?:y|ies)|budd(?:y|ies)|pals?|brothers?|sisters?|mom|mum|dad|cousins?|grandmas?|grandpas?|me|us|him|her|them|everyone|everybody)(?:\s+[a-z0-9_]+)?\b/gi;
+
+// #35 review: the request vocabulary each fixed blueprint's matcher consumes.
+// Consuming the raw request phrase instead would swallow style descriptors
+// ("spooky t flip flop") and skip the consultation the residue gate exists for.
+const BLUEPRINT_TRIGGER_VOCAB = Object.freeze({
+  copper_bulb_t_flip_flop: "t flip flop toggle switch press button",
+  binary_adder_2bit: "calculator binary adder full add adding numbers bits",
+  automated_chicken_farm: "chicken egg farm collector",
+  automatic_wool_farm: "wool sheep shear shears dispenser farm",
+  automatic_kelp_farm: "kelp farm",
+  two_by_two_piston_door: "piston door",
+  item_sorter: "item sorter sorting system sort",
+  automatic_smelter: "furnace smelter smelting system",
+});
+
+// #35: descriptor residue detection. When a build question carries words the
+// deterministic template never matched (rainbow, spooky, candy, giant, ...),
+// the canned template must not silently win — the model is consulted and the
+// template stays behind as the safe fallback. Zero-residue canned asks
+// ("build a t flip flop", "build a house") keep their provider-free path.
+function hasUnmatchedDescriptors(question, action) {
+  if (!action || !BUILD_ACTION_TYPES.has(action.type)) return false;
+  if (action.plan?.mode === "modify") return false;
+  const matched = new Set();
+  const consume = (value) => {
+    for (const word of String(value || "").toLowerCase().match(/[a-z0-9]+/g) || []) {
+      matched.add(word);
+      matched.add(normalizedWord(word));
+      matched.add(canonicalSubjectToken(normalizedWord(word)));
+    }
+  };
+  consume(action.plan?.kind);
+  consume(String(action.id || "").replaceAll("_", " "));
+  consume(String(action.filterItem || "").replace(/^minecraft:/, "").replaceAll("_", " "));
+  if (action.type === "place_blueprint") consume(BLUEPRINT_TRIGGER_VOCAB[action.id] || "");
+  else consume(structureKind(question));
+  // population nouns are parsed into plan.entities by the ladder
+  consume("villager villagers goat goats iron golem golems");
+  const material = requestedMaterialBlock(question);
+  if (material) {
+    consume(material.replace(/^minecraft:/, "").replaceAll("_", " "));
+    // question spellings the material matcher accepts but the block id renames
+    consume("wood wooden oak planks stone bricks brick made using");
+  }
+  const tokens = String(question || "").toLowerCase()
+    .replace(BUILD_RECIPIENT_PHRASE, " ").match(/[a-z0-9]+/g) || [];
+  return tokens.some((word) => {
+    if (/^\d/.test(word)) return false;
+    if (BUILD_DESCRIPTOR_STOPWORDS.has(word)) return false;
+    const singular = normalizedWord(word);
+    if (BUILD_DESCRIPTOR_STOPWORDS.has(singular)) return false;
+    return !matched.has(word) && !matched.has(singular)
+      && !matched.has(canonicalSubjectToken(singular));
+  });
+}
+
 const PLANNING_DEFERRED_ANSWER = "I’m keeping this as our active project, but I don’t have a safe executable change yet. Tell me one specific block or behavior to change and I’ll continue from there.";
 
-function localAnswer(question, hits, action) {
+function localAnswer(question, hits, action, history = []) {
   if (/^(?:hi|hello|hey|hiya|yo)(?:\s+(?:wizard|wiz))?[!.?]*$/i.test(question.trim())) {
     return "Hi! I’m MC Wizard. I can explain Bedrock redstone and commands, or build a working demo while you watch. What are you making?";
   }
@@ -2015,6 +2179,17 @@ function localAnswer(question, hits, action) {
     }
     return `I’m starting with a ${size} first-pass corner and size guide for the ${structureKind(question)}. This is useful progress, not the finished shape, and I’ll keep this goal active while I finish the full build.`;
   }
+  if (action?.type === "build_structure" && /^Blocky /i.test(action.plan.title || "")) {
+    // #35: procedural silhouette narration — honest about being a sculpted
+    // best effort, asks for a grade, and never claims the build is finished.
+    const descriptor = extractDescriptor(question, {
+      kind: action.plan.kind,
+      dimensions: action.plan.dimensions,
+      material: action.plan.materials?.primary,
+      features: action.plan.features,
+    });
+    return describeProceduralBuild({ ...descriptor, dimensions: action.plan.dimensions });
+  }
   if (action?.type === "build_structure") {
     const { width, depth, height } = action.plan.dimensions;
     if (action.plan.mode === "modify") {
@@ -2063,10 +2238,24 @@ function localAnswer(question, hits, action) {
   if (isRecipeRequest(question)) {
     return "That exact recipe is not in my verified giant-grid spellbook yet, so I won’t build the wrong thing. I can still explain it in chat, or help you find one of its ingredients.";
   }
-  if (!hits.length) {
-    return PLANNING_DEFERRED_ANSWER;
+  // #35: the deferred-project line only fits an actually active project;
+  // otherwise answer from the retrieved sources, or admit the gap honestly
+  // and point at real capabilities instead of stalling.
+  if (activeWizardGoal(history)) {
+    // #35 review: kids ask side questions constantly while a build runs. An
+    // informational question mid-project gets a real grounded answer and the
+    // goal stays active; only build-continuation turns get the deferred line.
+    const buildContinuation = isBuildRequest(question, history) || isProjectFeedback(question, history);
+    if (!buildContinuation) {
+      const sideAnswer = extractiveAnswer(question, hits);
+      if (sideAnswer) return sideAnswer;
+    }
+    if (!hits.length) return PLANNING_DEFERRED_ANSWER;
+    return "I’m keeping this project active. I’ll use what we observed to choose a concrete next move instead of pretending the unfinished part is done.";
   }
-  return "I’m keeping this project active. I’ll use what we observed to choose a concrete next move instead of pretending the unfinished part is done.";
+  const extracted = extractiveAnswer(question, hits);
+  if (extracted) return extracted;
+  return "Hmm—my spellbook has nothing on that yet, and I won’t make something up. I can still explain Bedrock redstone and commands, build a working demo, or sculpt a blocky statue of nearly anything—ask me one of those and I’ll get to work.";
 }
 
 function providerFrom(env) {
@@ -2544,6 +2733,9 @@ function normalizeProviderAction(value, question = "") {
     const allowedFeatures = new Set([
       "floor", "walls", "door", "windows", "roof", "lighting", "battlements", "towers",
       "supports", "walkway", "railings", "rooms", "second_floor", "decorations",
+      // #35: requestedStructureFeatures demands "rainbow" for colorful asks;
+      // stripping it here made every provider rainbow plan fail intent-match.
+      "rainbow",
     ]);
     const featureAliases = { foundation: "floor", foundations: "floor", base: "floor", roads: "walkway", streets: "walkway" };
     const features = [...new Set((Array.isArray(value.plan.features) ? value.plan.features : [])
@@ -2855,7 +3047,7 @@ function actionCompletesBuildRequest(action, question, history = []) {
     if (/\bnether\s+portal\b/i.test(question)) return /\bnether\s+portal\b/i.test(action.plan.kind);
     const requestedKind = structureKind(question, history)
       .replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, 48).toLowerCase() || "machine";
-    return isFunctionalBuildRequest(question) && action.plan.kind === requestedKind
+    return isFunctionalBuildRequest(question) && kindMatchesRequest(action.plan.kind, requestedKind, question)
       && machinePlanSatisfiesFeedback(action.plan, question);
   }
   if (action.type === "build_plan") return /\b(?:small|tiny|mini|prototype|detail)\b/i.test(question);
@@ -2869,18 +3061,46 @@ function actionCompletesBuildRequest(action, question, history = []) {
     if (arbitraryFeatureEditNeedsChangedPrimitives(question, history, action.plan)) return false;
     if (editNeedsAuthoredPrimitives(question) && !action.plan.primitives?.length) return false;
   }
-  if (!structurePlanSatisfiesRequest(action.plan, question)) return false;
+  const proceduralSilhouette = /^Blocky /i.test(action.plan.title || "");
+  if (!structurePlanSatisfiesRequest(action.plan, question, { allowRaisedDimensions: proceduralSilhouette })) return false;
   const requestedKind = structureKind(question, history).replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, 48).toLowerCase() || "structure";
-  if (action.plan.kind !== requestedKind) return false;
+  if (!kindMatchesRequest(action.plan.kind, requestedKind, question)) return false;
   const ordinaryGeneratedKind = Object.hasOwn(STRUCTURE_DEFAULTS, requestedKind) && requestedKind !== "structure";
   if (!ordinaryGeneratedKind && !action.plan.primitives?.length) return false;
-  if (!ordinaryGeneratedKind && !authoredSubjectGeometry(action.plan)) return false;
   const requested = parseRequestedDimensions(question);
-  if (!requested) return true;
-  const dimensions = action.plan.dimensions;
-  return (requested.width === undefined || dimensions.width === requested.width)
-    && (requested.depth === undefined || dimensions.depth === requested.depth)
-    && (requested.height === undefined || dimensions.height === requested.height);
+  let clampedDimensions = false;
+  if (requested) {
+    const dimensions = action.plan.dimensions;
+    const exact = (requested.width === undefined || dimensions.width === requested.width)
+      && (requested.depth === undefined || dimensions.depth === requested.depth)
+      && (requested.height === undefined || dimensions.height === requested.height);
+    if (!exact) {
+      // #35 review: a procedural silhouette raises explicit dimensions to its
+      // template minimum so the subject stays recognizable ("5x5x5 heart" →
+      // min width 7). Accept the clamped-up plan with a caveat instead of
+      // returning no action at all; shrinking below a request stays a hard
+      // reject so oversize limits keep their hard line.
+      const clampedUp = proceduralSilhouette
+        && ["width", "depth", "height"].every((axis) => (
+          requested[axis] === undefined || dimensions[axis] >= requested[axis]
+        ));
+      if (!clampedUp) return false;
+      clampedDimensions = true;
+    }
+  }
+  if (!ordinaryGeneratedKind && !authoredSubjectGeometry(action.plan)) {
+    // #35 tri-state: every hard requirement (subject, size, material, features,
+    // population) already passed; rough authored geometry is accepted with a
+    // caveat so the goal-review loop refines it instead of a corner guide.
+    // An air-only plan authored no subject at all and stays a hard reject.
+    const solids = (action.plan.primitives || []).filter(({ blockId }) => blockId !== "minecraft:air");
+    if (!solids.length) return false;
+    return { complete: false, warning: "the authored geometry looks rough for its declared bounds" };
+  }
+  if (clampedDimensions) {
+    return { complete: false, warning: "the requested size sat below the silhouette minimum and was raised to keep the shape recognizable" };
+  }
+  return true;
 }
 
 function authoredSubjectGeometry(plan) {
@@ -2920,6 +3140,68 @@ function normalizedWord(value) {
   if (word.endsWith("ches")) return word.slice(0, -2);
   if (word.endsWith("ies")) return `${word.slice(0, -3)}y`;
   return word.length > 3 && word.endsWith("s") ? word.slice(0, -1) : word;
+}
+
+// #35: local copy of the learned-recipes subject synonym table so a plan kind
+// of "puppy" satisfies a request for a "pet dog" (src/learned-recipes.mjs).
+const SUBJECT_SYNONYMS = [
+  ["dog", "puppy", "pup"],
+  ["cat", "kitten", "kitty"],
+  ["house", "home", "cottage"],
+  ["boat", "ship"],
+  ["statue", "sculpture"],
+  ["couch", "sofa"],
+];
+const CANONICAL_SUBJECT_TOKEN = new Map();
+for (const group of SUBJECT_SYNONYMS) {
+  for (const word of group) CANONICAL_SUBJECT_TOKEN.set(word, group[0]);
+}
+const canonicalSubjectToken = (token) => CANONICAL_SUBJECT_TOKEN.get(token) || token;
+
+// Tokens that carry no subject identity: a generic plan kind may match a
+// generic request, but never stands in for a named subject.
+const GENERIC_KIND_TOKENS = new Set([
+  "structure", "machine", "build", "building", "custom", "basic", "simple",
+  "working", "complete", "entire", "whole", "small", "big", "little", "large",
+  "tiny", "mini", "giant", "huge", "pet",
+  "a", "an", "the", "of", "with", "and", "for", "my", "me",
+]);
+
+// #35: synonym-tolerant kind matching replaces exact string equality. Accept
+// when every non-generic plan.kind token appears in the question or requested
+// kind (after normalization and synonym folding). Subject drift is never
+// salvaged: a "house" plan for "build a dragon" shares no subject token and
+// fails here — that hard line is intentional.
+export function kindMatchesRequest(planKind, requestedKind, question) {
+  const collect = (value) => (String(value || "").toLowerCase().match(/[a-z0-9]+/g) || [])
+    .map((word) => canonicalSubjectToken(normalizedWord(word)));
+  const planTokens = collect(planKind);
+  if (!planTokens.length) return false;
+  const subjectTokens = planTokens.filter((token) => !GENERIC_KIND_TOKENS.has(token));
+  if (!subjectTokens.length) {
+    return collect(requestedKind).every((token) => GENERIC_KIND_TOKENS.has(token));
+  }
+  const accepted = new Set([...collect(question), ...collect(requestedKind)]);
+  return subjectTokens.every((token) => accepted.has(token));
+}
+
+// #35 review: the pack's generated-structure builder accepts only its literal
+// canonical kinds ("house", "castle", ...), while the brain matches kinds
+// fuzzily. A primitive-less plan whose kind is a synonym or adjective compound
+// ("cottage", "stone castle") would validate brain-side and then deterministically
+// fail pack-side, so fold the accepted kind to the canonical generated kind the
+// brain matched before shipping. Subject drift never reaches here — this runs
+// only after kindMatchesRequest already accepted the plan.
+function canonicalizeGeneratedPlanKind(action, question, history = []) {
+  if (action?.type !== "build_structure" || action.plan?.primitives?.length
+    || action.plan?.mode === "modify") return action;
+  const kind = action.plan?.kind;
+  if (typeof kind !== "string" || Object.hasOwn(STRUCTURE_DEFAULTS, kind)) return action;
+  const requestedKind = structureKind(question, history)
+    .replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, 48).toLowerCase() || "structure";
+  if (!Object.hasOwn(STRUCTURE_DEFAULTS, requestedKind) || requestedKind === "structure"
+    || !kindMatchesRequest(kind, requestedKind, question)) return action;
+  return allowedWizardAction({ ...action, plan: { ...action.plan, kind: requestedKind } }) || action;
 }
 
 function namedItemMatchesQuestion(itemId, question) {
@@ -3274,44 +3556,217 @@ function observedStructureSatisfiesAction(context, actionTurn) {
   return structurePlanSatisfiesRequest(plan, actionTurn.question || "");
 }
 
+// #35: expand a validator's JSON violation list (build-plan/machine-plan/
+// build-structure salvage throws its whole list as the error message) so the
+// repair prompt names every violation instead of just the first.
+function expandedViolationList(rejection) {
+  if (!rejection) return [];
+  const text = String(rejection);
+  // #35 review: structure salvage throws {"dropped":[...],"warnings":[...]}
+  // while plan/machine validators throw a bare [...] — parse both shapes.
+  let parsed;
+  for (const pattern of [/\{.*\}/s, /\[.*\]/s]) {
+    const candidate = text.match(pattern)?.[0];
+    if (!candidate) continue;
+    try {
+      parsed = JSON.parse(candidate);
+      break;
+    } catch {
+      parsed = undefined;
+    }
+  }
+  const entries = Array.isArray(parsed) ? parsed
+    : parsed && typeof parsed === "object"
+      ? [...(Array.isArray(parsed.dropped) ? parsed.dropped : []),
+        ...(Array.isArray(parsed.warnings) ? parsed.warnings : [])]
+      : [];
+  if (!entries.length) return [text];
+  return entries.map((entry) => typeof entry === "string" ? entry
+    : entry && typeof entry === "object"
+      ? Object.entries(entry).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(" ")
+      : String(entry));
+}
+
+// #35: concatenates the FULL violation set for the repair prompt instead of
+// stopping at the first miss, capped at 2000 chars.
 function plannerRepairDetail(question, action, history = [], rejection) {
   const requestedKind = structureKind(question, history).replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, 48).toLowerCase();
-  if (!action) return `No executable action was returned${rejection ? ` because ${rejection}` : ""}. Replan the full ${requestedKind || "request"} as one allowed action.`;
+  const violations = expandedViolationList(rejection);
+  if (!action) {
+    violations.push(`No executable action was returned. Replan the full ${requestedKind || "request"} as one allowed action.`);
+    return violations.join("; ").slice(0, 2000);
+  }
   if (action.type === "build_structure") {
     const expectedVillagers = requestedVillagerCount(question);
     const plannedVillagers = (action.plan.entities || [])
       .filter(({ typeId }) => typeId === "minecraft:villager_v2").length;
     if (expectedVillagers && plannedVillagers !== expectedVillagers) {
-      return `The child requested exactly ${expectedVillagers} villager${expectedVillagers === 1 ? "" : "s"}, but the executable plan contained ${plannedVillagers}. Return that exact number in plan.entities as minecraft:villager_v2, with supported two-block-high room at every location.`;
+      violations.push(`The child requested exactly ${expectedVillagers} villager${expectedVillagers === 1 ? "" : "s"}, but the executable plan contained ${plannedVillagers}. Return that exact number in plan.entities as minecraft:villager_v2, with supported two-block-high room at every location.`);
     }
     const missingFeatures = requestedStructureFeatures(question)
       .filter((feature) => !action.plan.features?.includes(feature));
     if (missingFeatures.length) {
-      return `The executable plan omitted these requested features: ${missingFeatures.join(", ")}. Add each feature to the plan and author geometry that visibly implements it.`;
+      violations.push(`The executable plan omitted these requested features: ${missingFeatures.join(", ")}. Add each feature to the plan and author geometry that visibly implements it.`);
     }
     const requestedMaterial = requestedMaterialBlock(question);
     if (requestedMaterial && !structurePlanSatisfiesRequest(action.plan, question)) {
       const role = /\broof\b/i.test(question) ? "roof" : "primary structure";
-      return `The child requested ${requestedMaterial} for the ${role}, but the executable geometry did not use it there. Correct both plan.materials and the matching primitives.`;
+      violations.push(`The child requested ${requestedMaterial} for the ${role}, but the executable geometry did not use it there. Correct both plan.materials and the matching primitives.`);
+    }
+    const requestedDimensions = parseRequestedDimensions(question);
+    const dimensions = action.plan.dimensions || {};
+    if (requestedDimensions && ["width", "depth", "height"].some((axis) => (
+      requestedDimensions[axis] !== undefined && dimensions[axis] !== requestedDimensions[axis]
+    ))) {
+      violations.push(`The plan dimensions were ${dimensions.width}x${dimensions.depth}x${dimensions.height}, but the child asked for ${requestedDimensions.width ?? "any"}x${requestedDimensions.depth ?? "any"}x${requestedDimensions.height ?? "any"} (width x depth x height). Return the exact requested dimensions.`);
     }
     if (/\bbalcony\b/i.test(question)) {
-      return "The balcony stayed inside the old walls. Return mode modify with a solid supported platform and railings that project 1-4 blocks outside x or z while remaining attached to the existing structure.";
+      violations.push("The balcony stayed inside the old walls. Return mode modify with a solid supported platform and railings that project 1-4 blocks outside x or z while remaining attached to the existing structure.");
     }
     if (/\bmoat\b/i.test(question)) {
-      return "The moat did not safely surround the existing project. Keep the castle footprint intact; add four source-block lines one block outside every wall and a complete solid outer rim one block beyond them so the moat cannot spill away.";
+      violations.push("The moat did not safely surround the existing project. Keep the castle footprint intact; add four source-block lines one block outside every wall and a complete solid outer rim one block beyond them so the moat cannot spill away.");
     }
-    if (action.plan.kind !== requestedKind) {
-      return `The plan kind was ${action.plan.kind}, but the child requested ${requestedKind}. Replan the requested kind.`;
+    if (!kindMatchesRequest(action.plan.kind, requestedKind, question)) {
+      violations.push(`The plan kind was ${action.plan.kind}, but the child requested ${requestedKind}. Replan the requested kind.`);
     }
     if (!action.plan.primitives?.length) {
-      return `The custom ${requestedKind} had no authored primitives. Return complete support-ordered primitives for the whole build, including every building, street, and requested feature, across all four phases and declared bounds.`;
+      violations.push(`The custom ${requestedKind} had no authored primitives. Return complete support-ordered primitives for the whole build, including every building, street, and requested feature, across all four phases and declared bounds.`);
     }
-    return `The ${requestedKind} geometry did not satisfy its dimensions or requested features. Return a complete corrected primitive plan.`;
+    if (!violations.length) {
+      violations.push(`The ${requestedKind} geometry did not satisfy its dimensions or requested features. Return a complete corrected primitive plan.`);
+    }
+    return violations.join("; ").slice(0, 2000);
   }
   if (action.type === "build_machine") {
-    return `The ${action.plan.kind} did not match or fully implement the requested functional build. Return the complete machine with every placement, interaction, input, output, and verification.`;
+    violations.push(`The ${action.plan.kind} did not match or fully implement the requested functional build. Return the complete machine with every placement, interaction, input, output, and verification.`);
+    return violations.join("; ").slice(0, 2000);
   }
-  return `The ${plannerActionLabel(action)} action did not complete the child's whole build request. Replan it as one complete allowed action.`;
+  violations.push(`The ${plannerActionLabel(action)} action did not complete the child's whole build request. Replan it as one complete allowed action.`);
+  return violations.join("; ").slice(0, 2000);
+}
+
+// #35: bounded planner repair loop, extracted from ask(). Runs up to
+// MC_WIZARD_REPAIR_ROUNDS (default 2) provider consultations; each round feeds
+// back the full accumulated violation history so distinct violation lists reach
+// the model. Provider transport errors propagate to ask()'s offline fallback.
+async function repairPlannerAction({
+  provider, fetchImpl, question, hits, history, player, env, safetySalt, tuning,
+  context, preferences, researchRequired, projectFeedback, logger,
+  answer, rejectedAction, rejection, providerGoal,
+}) {
+  const rounds = Math.min(Math.max(Number(env.MC_WIZARD_REPAIR_ROUNDS) || 2, 1), 4);
+  // #35 review: rounds alone let a slow provider stack 75s consults into
+  // minutes of dead air for a child. A cumulative wall-clock budget (default
+  // 90s, MC_WIZARD_REPAIR_BUDGET_MS) stops repairing and lets the guaranteed
+  // procedural floor fire instead.
+  const budgetMs = Math.min(Math.max(Number(env.MC_WIZARD_REPAIR_BUDGET_MS) || 90_000, 1), 600_000);
+  const startedAt = Date.now();
+  const failedTurns = [];
+  let currentAction = rejectedAction;
+  let currentRejection = rejection;
+  let currentAnswer = answer;
+  let lastEnvelope;
+  for (let round = 0; round < rounds; round += 1) {
+    const elapsedMs = Date.now() - startedAt;
+    if (elapsedMs >= budgetMs) {
+      logger.warn(`[wizard] planner repair budget exhausted after ${elapsedMs}ms (budget ${budgetMs}ms); engaging the local fallback`);
+      break;
+    }
+    const detail = plannerRepairDetail(question, currentAction, history, currentRejection);
+    if (round > 0) logger.warn(`[wizard] planner repair round ${round} still rejected: ${detail}`);
+    failedTurns.push({
+      question,
+      answer: currentAnswer,
+      action: currentAction,
+      goal: providerGoal || defaultGoal(question, currentAction),
+      status: "failed",
+      detail: `Planner contract rejection: ${detail}`,
+    });
+    const repairedProviderAnswer = await askProvider({
+      provider, fetchImpl, question, hits, history: [...history, ...failedTurns], player, env,
+      safetySalt, general: false, buildRequest: true, researchRequired, tuning, context, preferences,
+    });
+    const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
+    lastEnvelope = repairedEnvelope;
+    if (repairedEnvelope && !unusableWizardAnswer(repairedEnvelope.answer, question)) {
+      const repairedAction = bindProgramToActiveProject(
+        carryForwardStructurePrimitives(repairedEnvelope.action, history, question),
+        projectFeedback, question, history,
+      );
+      const contract = (!researchRequired || reusableLearnedAction(repairedAction))
+        && providerActionMatchesRequest(repairedAction, question, history, { buildRequest: true, projectFeedback })
+        && repairedAction
+        ? actionCompletesBuildRequest(repairedAction, question, history) : false;
+      if (contract) {
+        return {
+          accepted: true,
+          action: repairedAction,
+          answer: repairedEnvelope.answer,
+          goal: repairedEnvelope.goal,
+          contract,
+        };
+      }
+      currentAction = repairedAction;
+      currentAnswer = repairedEnvelope.answer;
+      currentRejection = repairedEnvelope.rawActionRejection || undefined;
+    } else {
+      currentAction = null;
+      currentAnswer = answer;
+      currentRejection = repairedEnvelope
+        ? "the repaired answer was a capability disclaimer"
+        : "the repaired response was not a valid Wizard envelope";
+    }
+  }
+  return {
+    accepted: false,
+    finalDetail: plannerRepairDetail(question, currentAction, history, currentRejection),
+    rawActionLabel: lastEnvelope?.rawActionLabel,
+    rawActionRejection: lastEnvelope?.rawActionRejection,
+  };
+}
+
+// #35: compose a complete procedural silhouette for an unusual subject. The
+// kind is sanitized exactly like actionCompletesBuildRequest's requestedKind so
+// kind equality holds by construction, and the request's explicit dimensions,
+// material, features, and entity counts override the template defaults.
+function proceduralStructureAction(question, history = []) {
+  const requestedKind = structureKind(question, history)
+    .replace(/[^a-zA-Z0-9 _-]/g, "").trim().slice(0, 48).toLowerCase() || "structure";
+  const entities = requestedStructureEntityCounts(question)
+    .flatMap(([typeId, count]) => Array.from({ length: count }, () => ({ typeId })));
+  const overrides = {
+    dimensions: parseRequestedDimensions(question),
+    material: requestedMaterialBlock(question),
+    features: requestedStructureFeatures(question),
+    entities,
+  };
+  let descriptor = extractDescriptor(question, {
+    ...overrides,
+    kind: requestedKind !== "structure" ? requestedKind : undefined,
+  });
+  if (!kindMatchesRequest(descriptor.kind, requestedKind, question)) {
+    // The free-form subject guess drifted from the deterministic kind; force
+    // the sanitized requested kind so kind equality holds by construction.
+    descriptor = extractDescriptor(question, { ...overrides, kind: requestedKind });
+  }
+  return allowedWizardAction({ type: "build_structure", version: 1, plan: composeStructurePlan(descriptor) });
+}
+
+// A staged corner guide is only continued, never started (#35): the fallback
+// stays staged when this active goal already made staged progress in history.
+function priorStagedStructureProgress(question, history = []) {
+  const kind = structureKind(question, history);
+  const goalTurn = latestWizardGoalTurn(history);
+  const goalId = goalTurn?.goal.status === "active"
+    ? goalTurn.turn.goalId || goalTurn.turn.requestId : undefined;
+  if (!goalId) return false;
+  return history.some((turn) => {
+    const action = allowedWizardAction(turn.action);
+    return (turn.goalId || turn.requestId) === goalId
+      && action?.type === "build_structure"
+      && action.plan.kind === kind
+      && isStagedBuildProgress(action);
+  });
 }
 
 function localStructureFallback(question, history) {
@@ -3327,7 +3782,10 @@ function localStructureFallback(question, history) {
     || Object.hasOwn(REPRESENTATIONAL_DEFAULTS, representationalKind(kind) || "")) {
     return structureAction(question, history);
   }
-  return stagedBuildProgressAction(question, history);
+  // #35: the terminal corner-guide fallback is replaced by a complete
+  // procedural silhouette; staged passes remain only as continuations.
+  if (priorStagedStructureProgress(question, history)) return stagedBuildProgressAction(question, history);
+  return proceduralStructureAction(question, history);
 }
 
 function projectFeedbackFallback(question, history = []) {
@@ -3593,6 +4051,13 @@ function providerActionSummary(action) {
 
 const PROVIDER_HISTORY_CHARACTER_BUDGET = 14_000;
 
+// #35 review: planner contract rejections carry the FULL violation set
+// (plannerRepairDetail's 2000-char budget); a 300-char display cap would cut
+// the list mid-entry and starve the repair rounds of most violations.
+const turnDetailLimit = (detail) => (
+  String(detail || "").startsWith("Planner contract rejection:") ? 2_048 : 300
+);
+
 function providerTurnSummary(turn, { projectOnly = false, compact = false, fullProject = false } = {}) {
   const actionLabel = ({
     pending: "Planned action",
@@ -3612,14 +4077,14 @@ function providerTurnSummary(turn, { projectOnly = false, compact = false, fullP
       : "none";
     const answer = turn.preferenceApplied ? "Private preferences were applied for this turn." : turn.answer;
     return `Project turn: ${boundedText(turn.question, 300)}\nAssistant: ${boundedText(answer, 800)}${goalLine}\n${actionLabel}: ${actionDetail}`
-      + (turn.detail ? `\nOutcome detail: ${boundedText(turn.detail, 300)}` : "");
+      + (turn.detail ? `\nOutcome detail: ${boundedText(turn.detail, turnDetailLimit(turn.detail))}` : "");
   }
   const questionLimit = compact ? 300 : 500;
   const answerLimit = compact ? 500 : 800;
   const answer = turn.preferenceApplied ? "Private preferences were applied for this turn." : turn.answer;
   return `Player: ${boundedText(turn.question, questionLimit)}\nAssistant: ${boundedText(answer, answerLimit)}${goalLine}`
     + (turn.action ? `\n${actionLabel}: ${providerActionSummary(turn.action)}` : "")
-    + (turn.detail ? `\nOutcome detail: ${boundedText(turn.detail, 300)}` : "");
+    + (turn.detail ? `\nOutcome detail: ${boundedText(turn.detail, turnDetailLimit(turn.detail))}` : "");
 }
 
 function providerHistorySummary(history, { fullProject = false } = {}) {
@@ -3653,6 +4118,22 @@ function providerHistorySummary(history, { fullProject = false } = {}) {
     .map(([, summary]) => summary).join("\n\n");
 }
 
+// #35: Invariant — the wizard's provider timeout must cover the local bridge's
+// own CLI budget (45-60s, scripts/local-ai-bridge.mjs:13,341) plus its 10s
+// queue wait (scripts/local-ai-bridge.mjs:29-76); otherwise the wizard aborts
+// first and every slow-but-successful bridged answer is thrown away.
+// #35 review: the 60/75s floors are local-bridge defaults, not a mandate for
+// every provider. An explicitly configured AI_TIMEOUT_MS is respected even
+// when lower (fast remote providers, tests, and ops need short timeouts); the
+// floors apply only when the operator configured nothing.
+export function providerTimeoutMs(env = {}, planningRequest = false) {
+  const configured = Number(env.AI_TIMEOUT_MS);
+  if (Number.isFinite(configured) && configured > 0) {
+    return Math.min(Math.max(configured, 1_000), 120_000);
+  }
+  return planningRequest ? 75_000 : 60_000;
+}
+
 async function askProvider({ provider, fetchImpl, question, hits, history, player, env, safetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context, preferences }) {
   const sources = hits.map((hit, index) =>
     `[Source ${index + 1}: ${hit.title}; edition=${hit.edition}; channel=${hit.channel}; version=${hit.version}]\n${hit.text}`,
@@ -3671,8 +4152,10 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
   const runtimeTokens = general ? tuning.generalMaxOutputTokens : tuning.wizardMaxOutputTokens;
   const configuredTokens = runtimeTokens || (general ? env.AI_GENERAL_MAX_OUTPUT_TOKENS : env.AI_MAX_OUTPUT_TOKENS);
   const planningRequest = buildRequest || reviewRequest;
-  const defaultTokens = general ? 1_200 : (planningRequest ? 3_000 : 260);
-  const tokenLimit = general || planningRequest ? 3_000 : 400;
+  // #35: non-planning wizard turns need room for a grounded in-character answer;
+  // 260 tokens truncated mid-sentence. General mode budgets are untouched.
+  const defaultTokens = general ? 1_200 : (planningRequest ? 3_000 : 900);
+  const tokenLimit = 3_000;
   const maxOutputTokens = Math.min(Math.max(Number(configuredTokens) || defaultTokens, 64), tokenLimit);
   const addendum = general ? tuning.generalPromptAddendum : tuning.wizardPromptAddendum;
   const actionRequirement = !general && buildRequest
@@ -3703,8 +4186,7 @@ async function askProvider({ provider, fetchImpl, question, hits, history, playe
         safety_identifier: safetyIdentifier,
         text: { verbosity: "low" },
       };
-  const configuredTimeout = Math.min(Math.max(Number(env.AI_TIMEOUT_MS) || 30_000, 1_000), 120_000);
-  const timeout = planningRequest ? Math.max(configuredTimeout, 65_000) : configuredTimeout;
+  const timeout = providerTimeoutMs(env, planningRequest);
   const headers = { "content-type": "application/json" };
   if (provider.apiKey) headers.authorization = `Bearer ${provider.apiKey}`;
   const endpoint = provider.style === "chat" ? "chat/completions" : "responses";
@@ -3827,6 +4309,13 @@ export function createWizard({
   const providerSafetySalt = injectedSafetySalt
     || (configuredSafetySalt.length >= 24 ? configuredSafetySalt : randomUUID());
   const terminalActionResults = new Map();
+  // Gate telemetry is operator-only (#35): nested follow-up results embedded in
+  // feedback/action-result payloads must not carry it back to the pack.
+  const stripTelemetry = (value) => {
+    if (!value || typeof value !== "object" || !("telemetry" in value)) return value;
+    const { telemetry, ...rest } = value;
+    return rest;
+  };
   const invalidateInFlightPreferenceWork = (playerIdentity) => {
     const sessionPlayer = sessionIdentity(undefined, playerIdentity);
     // A preference update must stop an older Wizard reply from being published
@@ -3977,11 +4466,17 @@ export function createWizard({
           && allowedWizardGoal(turn.goal)?.status === "complete"
         )));
       const forgetRejectedRecipe = async () => {
-        if (preferenceBound || binding.responseMode !== "learned-recipe" || typeof recipes.remove !== "function") return;
+        // #35: one rejection now decrements the recipe's counters instead of
+        // deleting it outright; the store removes it only after repeated misses.
+        if (preferenceBound || !/^learned-recipe/.test(String(binding.responseMode || ""))) return;
         try {
-          await recipes.remove(binding.question);
+          if (typeof recipes.recordOutcome === "function") {
+            await recipes.recordOutcome(binding.question, { success: false });
+          } else if (typeof recipes.remove === "function") {
+            await recipes.remove(binding.question);
+          }
         } catch (error) {
-          logger.warn(`[wizard] could not remove rejected learned recipe: ${error.message}`);
+          logger.warn(`[wizard] could not record rejected learned recipe: ${error.message}`);
         }
       };
       const rememberSuccessfulRecipe = async () => {
@@ -4023,8 +4518,11 @@ export function createWizard({
       const requestsChange = /\b(?:but|however|please|should|needs?|want|fix|repair|redo|change|add|remove|replace|make|build|place|give|teleport|move|light|decorate|furnish|improve|bigger|smaller|shorter|longer|taller|wider|brighter|darker|clearer|easier|ugly|wrong|broken|missing|not\s+enough|too\s+(?:dark|small|big|plain|short|tall))\b/i
         .test(note)
         || Boolean(binding.goalId && isProjectFeedback(note, feedbackHistory));
+      // #35: promotion runs BEFORE the change branch, so "grade 5: maybe add a
+      // flag" both saves the working recipe and refines the project; only low
+      // grades count as a recipe failure.
+      const learned = grade >= 4 ? await rememberSuccessfulRecipe() : false;
       if (grade >= 4 && !requestsChange) {
-        const learned = await rememberSuccessfulRecipe();
         return {
           ...result,
           ...(learned && { learned: true }),
@@ -4033,7 +4531,7 @@ export function createWizard({
             : "Thanks! I saved your grade and I’m glad that worked.",
         };
       }
-      await forgetRejectedRecipe();
+      if (grade <= 3) await forgetRejectedRecipe();
 
       const correctiveAction = classifyAction(note, feedbackHistory);
       const immediateCorrection = correctiveAction && !BUILD_ACTION_TYPES.has(correctiveAction.type);
@@ -4049,8 +4547,9 @@ export function createWizard({
         });
         return {
           ...result,
+          ...(learned && { learned: true }),
           message: "Thanks—that correction asks me to act, so I’m doing it now.",
-          followUp,
+          followUp: stripTelemetry(followUp),
         };
       }
 
@@ -4070,8 +4569,9 @@ export function createWizard({
         });
         return {
           ...result,
+          ...(learned && { learned: true }),
           message: "Thanks—that’s my next instruction. I’m improving this same project now.",
-          followUp: refinement,
+          followUp: stripTelemetry(refinement),
         };
       }
 
@@ -4088,8 +4588,9 @@ export function createWizard({
         });
         return {
           ...result,
+          ...(learned && { learned: true }),
           message: "Thanks—that correction asks me to act, so I’m doing it now.",
-          followUp,
+          followUp: stripTelemetry(followUp),
         };
       }
       const instruction = `Answer the player's earlier informational question again in MC Wizard character. Use the feedback as the next instruction. Do not promise or return an in-world action. Earlier question: ${originalQuestion}. Player feedback: ${note}`;
@@ -4107,11 +4608,19 @@ export function createWizard({
       });
       return {
         ...result,
+        ...(learned && { learned: true }),
         message: "Thanks—that’s my next instruction. I answered that again with your feedback in mind.",
-        followUp: refinement,
+        followUp: stripTelemetry(refinement),
       };
     },
     async recordActionResult({ player, playerId, requestId, status, detail, context }) {
+      // #35: forward-compatible degradation — a status this build does not
+      // recognize (pack/server version skew) is treated as a failure, never as
+      // silent success.
+      if (!["started", "completed", "failed", "partial"].includes(status)) {
+        detail = `unknown action status "${String(status).slice(0, 32)}"${detail ? `: ${detail}` : ""}`;
+        status = "failed";
+      }
       const sessionPlayer = sessionIdentity(player, playerId);
       const terminal = ["completed", "failed", "partial"].includes(status);
       const resultKey = `${sessionPlayer}\u0000${requestId}`;
@@ -4195,14 +4704,19 @@ export function createWizard({
       if (newerProject) return remember({ ...outcome, superseded: true });
       const goal = activeWizardGoal(history);
       if (!goal) return remember(outcome);
-      if (status === "completed") {
-        const executorVerified = EXECUTOR_VERIFIED_ACTION_TYPES.has(actionTurn.action.type);
-        const completedActions = history.filter((turn) => turn.status === "completed"
+      if (status === "completed" || status === "partial") {
+        // #35: 'partial' is completed-with-review — the executor salvaged most
+        // of the plan but dropped entries, so one goal review names the dropped
+        // work and the goal never completes silently.
+        const partialCompletion = status === "partial";
+        const executorVerified = !partialCompletion
+          && EXECUTOR_VERIFIED_ACTION_TYPES.has(actionTurn.action.type);
+        const completedActions = history.filter((turn) => ["completed", "partial"].includes(turn.status)
           && (turn.goalId || turn.requestId) === goalId).length;
         if (!executorVerified && completedActions >= MAX_AUTOMATIC_GOAL_ACTIONS) {
           return remember({ ...outcome, reviewLimitReached: true });
         }
-        if (executorVerified || (context && observedStructureSatisfiesAction(context, actionTurn))) {
+        if (executorVerified || (!partialCompletion && context && observedStructureSatisfiesAction(context, actionTurn))) {
           const completedGoal = { ...goal, status: "complete" };
           const review = {
             answer: executorVerified
@@ -4229,14 +4743,16 @@ export function createWizard({
           return remember({ ...outcome, review });
         }
         if (!context) return remember({ ...outcome, reviewDeferred: true });
-        const review = await api.ask({
+        const review = stripTelemetry(await api.ask({
           player,
           playerId,
           mode: "wizard",
-          question: goalReviewQuestion(goal, detail),
+          question: goalReviewQuestion(goal, partialCompletion
+            ? `the action completed partially and dropped planned entries: ${detail || "the executor did not name the dropped entries"}. Repair the dropped parts of this exact project.`
+            : detail),
           context,
           goalReview: { goalId },
-        });
+        }));
         if (review.action) return remember({ ...outcome, review, replan: review });
         if (isStagedBuildProgress(actionTurn.action)) {
           const contract = originalGoalContract(history, goalId, actionTurn);
@@ -4258,14 +4774,14 @@ export function createWizard({
       if (failures >= 3) return remember({ ...outcome, retryLimitReached: true });
       const contract = originalGoalContract(history, goalId, actionTurn);
       const originalQuestion = contract?.question || actionTurn.question;
-      const replan = await api.ask({
+      const replan = stripTelemetry(await api.ask({
         player,
         playerId,
         mode: "wizard",
         question: originalQuestion,
         context,
         failureRetry: { goalId, requestId },
-      });
+      }));
       if (replan.superseded) return remember({ ...outcome, superseded: true, replan });
       return remember(replan.action
         ? { ...outcome, replan }
@@ -4304,6 +4820,16 @@ export function createWizard({
         return preferenceResult(playerIdentity, memoryIntent);
       }
       question = originalQuestion;
+      // #35 review: a bare "yes" binds to the concrete pending offer recorded
+      // in session state — when the offer names a subject without a
+      // deterministic template, planning proceeds on the offer clause itself.
+      // An unbound "yes" (e.g. after the offline capability menu) must never
+      // build an unrequested generic structure; it asks one precise
+      // clarification below instead.
+      const confirmationOffer = general ? undefined : boundPendingOffer(question, existingHistory);
+      const unboundConfirmation = !general && !confirmationOffer
+        && isActionConfirmation(question) && Boolean(pendingActionTurn(existingHistory));
+      if (confirmationOffer && !confirmationOffer.action) question = confirmationOffer.question;
       const requestSequence = typeof sessions.reserve === "function"
         ? sessions.reserve(sessionPlayer, requestMode) : undefined;
       const tuning = { aiEnabled: true, ...await settings() };
@@ -4317,7 +4843,10 @@ export function createWizard({
         && isGoalSatisfaction(question, actionHistory);
       const instantAnswer = general || reviewRequest ? undefined : satisfied
         ? "Brilliant. I’ll mark this project complete and stay nearby for your next idea."
-        : answerOnlyRequest ? undefined : instantConversationAnswer(question);
+        : answerOnlyRequest ? undefined
+          : unboundConfirmation
+            ? "Happy to! Tell me exactly which one—say something like “build a small castle”, “explain how a piston works”, or “sculpt a blocky dolphin”—and I’ll start right away."
+            : instantConversationAnswer(question);
       const projectFeedback = !general && !answerOnlyRequest
         && (reviewRequest || isProjectFeedback(question, actionHistory));
       const buildRequest = !general && !reviewRequest && !answerOnlyRequest
@@ -4338,13 +4867,28 @@ export function createWizard({
       const hits = rankedHits.filter((hit) => hit.score >= relevanceFloor);
       const action = general || reviewRequest || answerOnlyRequest
         ? null : classifyAction(question, actionHistory);
-      const learnedEntry = !general && !reviewRequest && !answerOnlyRequest && buildRequest && !projectFeedback
-        && typeof recipes.find === "function" ? await recipes.find(question) : null;
-      const learnedCandidate = allowedWizardAction(learnedEntry?.action);
+      const recipeLookup = !general && !reviewRequest && !answerOnlyRequest && buildRequest && !projectFeedback;
+      const learnedEntry = recipeLookup && typeof recipes.find === "function"
+        ? await recipes.find(question) : null;
+      // #35: near-miss lookup — a verified >=0.8 match replays through the same
+      // gates as an exact hit; weaker or provisional matches only stand in for
+      // the corner-guide fallback below and are never silently replayed.
+      const learnedMatch = !learnedEntry && recipeLookup && typeof recipes.findBest === "function"
+        ? await recipes.findBest(question) : null;
+      const verifiedEntry = learnedEntry && learnedEntry.tier !== "provisional" ? learnedEntry
+        : learnedMatch && learnedMatch.similarity >= 0.8 && learnedMatch.entry.tier === "verified"
+          ? learnedMatch.entry : null;
+      const learnedCandidate = allowedWizardAction(verifiedEntry?.action);
       const learnedAction = learnedCandidate
         && providerActionMatchesRequest(learnedCandidate, question, actionHistory, { buildRequest: true })
         && actionCompletesBuildRequest(learnedCandidate, question, actionHistory)
         ? learnedCandidate : null;
+      const provisionalEntry = learnedAction ? null
+        : learnedEntry?.tier === "provisional" ? learnedEntry : learnedMatch?.entry;
+      const provisionalCandidate = allowedWizardAction(provisionalEntry?.action);
+      const provisionalRecipeAction = provisionalCandidate
+        && actionAdvancesBuildRequest(provisionalCandidate, question, actionHistory)
+        ? provisionalCandidate : null;
       const groundedAnswer = reviewRequest || answerOnlyRequest
         ? undefined : groundedQuickAnswer(question, hits);
       let answer = reviewRequest
@@ -4353,7 +4897,7 @@ export function createWizard({
           ? answerOnly.fallbackAnswer
         : instantAnswer || groundedAnswer || (general
         ? `${provider.label} did not answer yet. I’ll keep this request short and try again when you ask.`
-        : localAnswer(question, hits, action));
+        : localAnswer(question, hits, action, actionHistory));
       let selectedAction = learnedAction || action;
       let providerGoal;
       let providerActionRejection;
@@ -4365,9 +4909,30 @@ export function createWizard({
           : learnedAction ? "learned-recipe" : action ? "local-skill" : "offline";
       const researchRequired = !general && buildRequest && !learnedAction
         && (!action || wantsModelAuthoredStructure(action, buildRequest, question));
-      const askModel = !instantAnswer && !groundedAnswer && provider.enabled && tuning.aiEnabled
-        && !learnedAction && (answerOnlyRequest || reviewRequest || !action
-          || wantsModelAuthoredStructure(action, buildRequest, question));
+      // #35: canned instant/grounded answers suppress consultation only on
+      // non-actionable turns (a satisfied goal still closes out locally), and
+      // descriptor residue (rainbow, spooky, candy, ...) forces consultation
+      // even when the deterministic ladder produced a template.
+      const actionable = buildRequest || projectFeedback;
+      const askModel = provider.enabled && tuning.aiEnabled && !learnedAction
+        && !((instantAnswer || groundedAnswer) && (!actionable || satisfied))
+        && (answerOnlyRequest || reviewRequest || !action
+          || wantsModelAuthoredStructure(action, buildRequest, question)
+          || (buildRequest && hasUnmatchedDescriptors(question, action)));
+      let contractCaveat = "";
+      // #35: operator telemetry — every gate that rejects provider output
+      // records its name and a bounded reason; the server logs and strips it.
+      const gateTrace = [];
+      let providerConsulted = false;
+      const recordRejection = (gate, reason) => {
+        gateTrace.push({ gate, reason: String(reason || "").replace(/\s+/g, " ").trim().slice(0, 200) });
+      };
+      const gateError = (gate, message) => {
+        recordRejection(gate, message);
+        const error = new Error(message);
+        error.gateRecorded = true;
+        return error;
+      };
       if (askModel) {
         const safeFallback = {
           answer: !general && !answerOnlyRequest && !hits.length && !selectedAction
@@ -4377,14 +4942,15 @@ export function createWizard({
           action: selectedAction,
         };
         try {
+          providerConsulted = true;
           const providerAnswer = await askProvider({
             provider, fetchImpl, question, hits, history: actionHistory, player, env,
             safetySalt: providerSafetySalt, general, buildRequest, reviewRequest, researchRequired, tuning, context,
             preferences: playerPreferences,
           });
           const envelope = general ? generalEnvelope(providerAnswer, question) : wizardEnvelope(providerAnswer, question);
-          if (!general && !envelope) throw new Error("AI provider returned an invalid Wizard response");
-          if (!general && unusableWizardAnswer(envelope.answer, question)) throw new Error("AI provider returned a capability disclaimer");
+          if (!general && !envelope) throw gateError("envelope-parse", "AI provider returned an invalid Wizard response");
+          if (!general && unusableWizardAnswer(envelope.answer, question)) throw gateError("unusable-answer", "AI provider returned a capability disclaimer");
           answer = envelope?.answer || providerAnswer;
           responseMode = provider.name;
           if (general) title = envelope?.title || title;
@@ -4403,7 +4969,10 @@ export function createWizard({
             );
             const providerCandidate = repairProviderGift(projectBoundProviderCandidate, question);
             const repairedProviderGift = providerCandidate !== projectBoundProviderCandidate;
-            const researchAllowed = !researchRequired || reusableLearnedAction(providerCandidate);
+            // #35: research acceptance checks capability safety only —
+            // staged titles and 1-placement machines are quality concerns for
+            // the build contract, and must not poison acceptance here.
+            const researchAllowed = !researchRequired || safeNovelAction(providerCandidate);
             const intentAllowed = researchAllowed && providerActionMatchesRequest(providerCandidate, question, actionHistory, {
               buildRequest, projectFeedback, reviewRequest,
             });
@@ -4411,16 +4980,31 @@ export function createWizard({
               || (providerCandidate && !researchAllowed
                 ? "web-researched build plans cannot contain server administration or arbitrary commands"
                 : providerCandidate && !intentAllowed ? "action does not match the player's explicit request" : undefined);
+            if (providerActionRejection) {
+              recordRejection(
+                providerCandidate && !researchAllowed ? "research-restriction" : "intent-match",
+                providerActionRejection,
+              );
+            }
             if (providerCandidate && !intentAllowed) rejectedProviderAction = providerCandidate;
             providerGoal = (reviewRequest || buildRequest || projectFeedback || (providerCandidate && intentAllowed))
               ? envelope.goal : undefined;
             selectedAction = intentAllowed ? providerCandidate : null;
             if (selectedAction) providerActionAccepted = true;
             if (providerActionRejection) {
-              answer = safeFallback.answer;
-              responseMode = safeFallback.action ? "local-skill"
-                : groundedAnswer ? "local-grounded" : "offline";
-              if (!hits.length && !selectedAction && !buildRequest && !projectFeedback && !reviewRequest) {
+              const informationalRepair = !hits.length && !selectedAction
+                && !buildRequest && !projectFeedback && !reviewRequest;
+              // #35 prose salvage: on a non-build turn only the action was
+              // rejected — the envelope answer was already disclaimer-checked
+              // upstream, so it stays while the rejected action is dropped and
+              // never executed. Build, feedback, review, and the bounded
+              // informational-repair turns keep the safe local fallback.
+              if (buildRequest || projectFeedback || reviewRequest || informationalRepair) {
+                answer = safeFallback.answer;
+                responseMode = safeFallback.action ? "local-skill"
+                  : groundedAnswer ? "local-grounded" : "offline";
+              }
+              if (informationalRepair) {
                 const repairingGift = rejectedProviderAction?.type === "give_items"
                   && Boolean(explicitItemRequestClause(question));
                 const repairHistory = [...actionHistory, {
@@ -4493,80 +5077,111 @@ export function createWizard({
               throw new Error("AI goal review returned neither verified completion nor a related corrective action");
             }
           }
-          if (!general && buildRequest && !actionCompletesBuildRequest(selectedAction, question, actionHistory)) {
-            const repairDetail = plannerRepairDetail(question, rejectedProviderAction || selectedAction, actionHistory, providerActionRejection);
-            logger.warn(`[wizard] planner contract rejected: ${repairDetail}`);
-            const repairHistory = [...actionHistory, {
-              question,
-              answer,
-              action: rejectedProviderAction || selectedAction,
-              goal: providerGoal || defaultGoal(question, selectedAction),
-              status: "failed",
-              detail: `Planner contract rejection: ${repairDetail}`,
-            }];
-            const repairedProviderAnswer = await askProvider({
-              provider, fetchImpl, question, hits, history: repairHistory, player, env,
-              safetySalt: providerSafetySalt, general: false, buildRequest: true, researchRequired, tuning, context,
-              preferences: playerPreferences,
-            });
-            const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
-            if (repairedEnvelope && !unusableWizardAnswer(repairedEnvelope.answer, question)) {
-              const repairedAction = bindProgramToActiveProject(
-                carryForwardStructurePrimitives(repairedEnvelope.action, actionHistory, question),
-                projectFeedback,
-                question,
-                actionHistory,
-              );
-              if ((!researchRequired || reusableLearnedAction(repairedAction))
-                && providerActionMatchesRequest(repairedAction, question, actionHistory, {
-                  buildRequest: true,
-                  projectFeedback,
-                })
-                && actionCompletesBuildRequest(repairedAction, question, actionHistory)) {
-                answer = repairedEnvelope.answer;
-                selectedAction = repairedAction;
-                providerActionAccepted = true;
-                providerGoal = repairedEnvelope.goal || providerGoal;
+          if (!general && buildRequest) {
+            let contract = selectedAction
+              ? actionCompletesBuildRequest(selectedAction, question, actionHistory) : false;
+            if (contract !== true && !(contract && contract.warning)) {
+              const repairDetail = plannerRepairDetail(question, rejectedProviderAction || selectedAction, actionHistory, providerActionRejection);
+              recordRejection("build-contract", repairDetail);
+              logger.warn(`[wizard] planner contract rejected: ${repairDetail}`);
+              // #35 salvage-tolerant recovery: when the deterministic ladder
+              // already compiled a complete plan for this exact request, adopt
+              // it instead of spending provider repair rounds on it.
+              const deterministicPlan = safeFallback.action
+                && actionCompletesBuildRequest(safeFallback.action, question, actionHistory) === true
+                ? safeFallback.action : null;
+              if (deterministicPlan) {
+                selectedAction = deterministicPlan;
+                providerActionAccepted = false;
+                answer = localAnswer(question, hits, deterministicPlan);
+                responseMode = "local-structure-fallback";
+                contract = true;
+              } else {
+                const repair = await repairPlannerAction({
+                  provider, fetchImpl, question, hits, history: actionHistory, player, env,
+                  safetySalt: providerSafetySalt, tuning, context, preferences: playerPreferences,
+                  researchRequired, projectFeedback, logger,
+                  answer,
+                  rejectedAction: rejectedProviderAction || selectedAction,
+                  rejection: providerActionRejection,
+                  providerGoal,
+                });
+                if (repair.accepted) {
+                  answer = repair.answer;
+                  selectedAction = repair.action;
+                  providerActionAccepted = true;
+                  providerGoal = repair.goal || providerGoal;
+                  contract = repair.contract;
+                } else {
+                  recordRejection("repair-failed", repair.finalDetail);
+                  logger.warn(`[wizard] repaired planner action still missed the request: ${repair.finalDetail}`);
+                  // #35: a graded-but-unproven recipe outranks the corner guide.
+                  const fallback = provisionalRecipeAction || localStructureFallback(question, actionHistory);
+                  if (!fallback || !actionAdvancesBuildRequest(fallback, question, actionHistory)) {
+                    throw new Error(`AI planner action did not satisfy the active goal (raw=${envelope.rawActionLabel}; rejection=${providerActionRejection || "goal mismatch"}; repaired=${repair.rawActionLabel || "none"}; repairedRejection=${repair.rawActionRejection || "goal mismatch"}; requested=${structureKind(question, actionHistory)})`);
+                  }
+                  recordRejection("fallback-engaged", `local fallback ${fallback.plan?.title || fallback.id || fallback.type}`);
+                  selectedAction = fallback;
+                  answer = localAnswer(question, hits, fallback, actionHistory);
+                  responseMode = fallback === provisionalRecipeAction ? "learned-recipe-provisional"
+                    : isStagedBuildProgress(fallback) ? "local-build-progress" : "local-structure-fallback";
+                  contract = true;
+                }
               }
             }
-            const repaired = actionCompletesBuildRequest(selectedAction, question, actionHistory);
-            if (!repaired) {
-              logger.warn(`[wizard] repaired planner action still missed the request: ${plannerRepairDetail(question, selectedAction, actionHistory, repairedEnvelope?.rawActionRejection)}`);
-              const fallback = localStructureFallback(question, actionHistory);
-              if (!fallback || !actionAdvancesBuildRequest(fallback, question, actionHistory)) {
-                throw new Error(`AI planner action did not satisfy the active goal (raw=${envelope.rawActionLabel}; rejection=${providerActionRejection || "goal mismatch"}; repaired=${repairedEnvelope?.rawActionLabel || "none"}; repairedRejection=${repairedEnvelope?.rawActionRejection || "goal mismatch"}; requested=${structureKind(question, actionHistory)})`);
-              }
-              selectedAction = fallback;
-              answer = localAnswer(question, hits, fallback);
-              responseMode = isStagedBuildProgress(fallback) ? "local-build-progress" : "local-structure-fallback";
+            if (contract && contract !== true && contract.warning && selectedAction) {
+              // #35 accept-with-warning: keep the imperfect authored plan and
+              // let the goal-review loop refine it; the goal stays active.
+              contractCaveat = contract.warning;
+              if (providerGoal?.status === "complete") providerGoal = { ...providerGoal, status: "active" };
             }
           }
         } catch (error) {
+          if (!error.gateRecorded) recordRejection("provider-error", error.message);
           logger.warn(`[wizard] ${error.message}; using offline answer`);
           answer = safeFallback.answer;
           selectedAction = safeFallback.action;
           providerGoal = undefined;
           providerActionAccepted = false;
+          contractCaveat = "";
           responseMode = selectedAction?.type === "build_structure"
             ? "local-structure-fallback" : "offline-fallback";
         }
       } else if (!tuning.aiEnabled) {
         responseMode = "admin-disabled";
       }
+      // #35 review: the pack only ever sees canonical generated kinds.
+      if (!general && !answerOnlyRequest && (buildRequest || projectFeedback) && selectedAction) {
+        selectedAction = canonicalizeGeneratedPlanKind(selectedAction, question, actionHistory);
+      }
       if (!general && !answerOnlyRequest && buildRequest && selectedAction
         && !actionAdvancesBuildRequest(selectedAction, question, actionHistory)) {
         selectedAction = null;
-        answer = localAnswer(question, hits, null);
+        answer = localAnswer(question, hits, null, actionHistory);
       }
       if (!general && !answerOnlyRequest && buildRequest && !selectedAction) {
-        const fallback = localStructureFallback(question, actionHistory);
+        // #35: a graded-but-unproven recipe outranks the corner guide.
+        const fallback = provisionalRecipeAction || localStructureFallback(question, actionHistory);
         if (fallback && actionAdvancesBuildRequest(fallback, question, actionHistory)) {
+          if (providerConsulted) {
+            recordRejection("fallback-engaged", `local fallback ${fallback.plan?.title || fallback.id || fallback.type}`);
+          }
           selectedAction = fallback;
-          answer = localAnswer(question, hits, fallback);
-          responseMode = isStagedBuildProgress(fallback) ? "local-build-progress" : "local-structure-fallback";
+          answer = localAnswer(question, hits, fallback, actionHistory);
+          responseMode = fallback === provisionalRecipeAction ? "learned-recipe-provisional"
+            : isStagedBuildProgress(fallback) ? "local-build-progress" : "local-structure-fallback";
         } else {
           responseMode = "planning-deferred";
           answer = PLANNING_DEFERRED_ANSWER;
+        }
+      }
+      // #35 review: fallback-selected plans (offline procedural silhouettes,
+      // repair-exhausted floors) carry their contract warning too, so a
+      // clamped-dimension build gets its honest in-character size caveat.
+      if (!general && !answerOnlyRequest && buildRequest && selectedAction && !contractCaveat) {
+        const finalContract = actionCompletesBuildRequest(selectedAction, question, actionHistory);
+        if (finalContract && finalContract !== true && finalContract.warning) {
+          contractCaveat = finalContract.warning;
         }
       }
       let appliedPreferenceDependencies = [];
@@ -4579,7 +5194,15 @@ export function createWizard({
         appliedPreferenceDependencies = ["material"];
       }
       if (!general && !reviewRequest && !answerOnlyRequest && selectedAction) {
-        answer = localAnswer(question, hits, selectedAction);
+        answer = localAnswer(question, hits, selectedAction, actionHistory);
+      }
+      if (!general && contractCaveat && selectedAction) {
+        // #35: in-character caveat for accept-with-warning plans. A clamped
+        // size gets an honest "a bit bigger" note; rough geometry keeps the
+        // sculpting caveat. The goal stays active either way.
+        answer = /\b(?:size|raised|minimum)\b/i.test(contractCaveat)
+          ? `${answer} I’m making it a little bigger than the exact size you asked so the shape still looks right—tell me if you want it changed.`
+          : `${answer} The first pass may look a little rough—tell me what seems off and I’ll keep sculpting it with you.`;
       }
       if (!general && unsafeCommandAnswer(answer, question)) {
         answer = safeCommandRefusal(Boolean(selectedAction));
@@ -4627,6 +5250,7 @@ export function createWizard({
         ...(!general && { preferences: playerPreferences }),
         ...(!general && playerPreferences.length && { preferenceApplied: true }),
         superseded: true,
+        telemetry: { providerConsulted, ...(gateTrace.length && { rejections: gateTrace }) },
       });
       if (requestSequence && typeof sessions.isCurrent === "function"
           && !sessions.isCurrent(sessionPlayer, requestMode, requestSequence)) {
@@ -4668,6 +5292,9 @@ export function createWizard({
         ...(!general && playerPreferences.length && { preferenceApplied: true }),
         ...(safeRequestId && { requestId: safeRequestId }),
         ...(goalId && { goalId }),
+        // #35: operator-only gate telemetry; the server logs it and strips it
+        // before the result reaches the pack.
+        telemetry: { providerConsulted, ...(gateTrace.length && { rejections: gateTrace }) },
       };
     },
   };

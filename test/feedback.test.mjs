@@ -201,6 +201,32 @@ test("a high grade still applies short concrete corrections to the active projec
   }
 });
 
+// #35 review: describeProceduralBuild explicitly invites "tell me what to
+// change" — the child's most natural rejection phrasings must count as
+// corrective project feedback offline, never the spellbook-gap boilerplate.
+test("natural rejection phrasing counts as corrective project feedback offline", async () => {
+  for (const rejection of ["thats not a dolphin", "that's not a dolphin!", "that looks wrong", "that looks nothing like a dolphin"]) {
+    const sessions = createMemorySessionStore();
+    const wizard = createWizard({ corpus, sessions, env: {}, logger: quiet });
+    const initial = await wizard.ask({ player: "DolphinKid", question: "build me a dolphin" });
+    assert.match(initial.action.plan.title, /^Blocky dolphin/i, rejection);
+    const result = await wizard.ask({ player: "DolphinKid", question: rejection });
+    assert.doesNotMatch(result.answer, /spellbook has nothing/i, rejection);
+    // the turn stays on the active project — either a concrete corrective
+    // action or the keep-project line inviting one specific change
+    assert.equal(result.goal?.status, "active", rejection);
+  }
+});
+
+test("natural rejection phrasing still requires an active project to correct", async () => {
+  // negative: without any prior project the same words are an ordinary
+  // question, not project feedback — no goal is invented for them.
+  const wizard = createWizard({ corpus, sessions: createMemorySessionStore(), env: {}, logger: quiet });
+  const result = await wizard.ask({ player: "NoProjectKid", question: "thats not a dolphin" });
+  assert.equal(result.action, null);
+  assert.equal(result.goal, undefined);
+});
+
 test("informational feedback regenerates an answer without a world action", async () => {
   const sessions = createMemorySessionStore();
   let calls = 0;
@@ -361,4 +387,76 @@ test("feedback endpoint is private, exact, terminal, idempotent, and logged with
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+// #35: revised recipe semantics — a change note no longer blocks a grade-5
+// promotion, and one rejection decrements counters instead of deleting.
+
+test("a grade 5 with a change note both saves the recipe and refines the project", async () => {
+  const { createMemoryLearnedRecipeStore } = await import("../src/learned-recipes.mjs");
+  const sessions = createMemorySessionStore();
+  const recipes = createMemoryLearnedRecipeStore();
+  const wizard = createWizard({ corpus, sessions, recipes, env: {}, logger: quiet });
+  const initial = await wizard.ask({
+    player: "FlagKid", question: "Build me a dog", requestId: "dog-request",
+  });
+  assert.equal(initial.action.type, "build_structure");
+  await sessions.updateAction("FlagKid", "wizard", {
+    requestId: initial.requestId, status: "completed", detail: "dog placed",
+  });
+  const result = await wizard.recordFeedback({
+    player: "FlagKid",
+    requestId: initial.requestId,
+    grade: 5,
+    feedback: "maybe add a flag on its back",
+  });
+  // the working plan is saved (provisionally, since the goal was unverified)
+  assert.equal(result.learned, true);
+  const saved = await recipes.findBest("Build me a dog");
+  assert.equal(saved.entry.tier, "provisional");
+  // and the change note still refines the same project
+  assert.ok(result.followUp);
+  assert.match(result.message, /next instruction|improving/i);
+});
+
+test("a first rejection keeps a proven recipe with a failure counter instead of deleting it", async () => {
+  const { createMemoryLearnedRecipeStore } = await import("../src/learned-recipes.mjs");
+  const sessions = createMemorySessionStore();
+  const recipes = createMemoryLearnedRecipeStore();
+  const dogAction = {
+    type: "build_structure", version: 1, plan: {
+      title: "Blocky Dog", kind: "dog",
+      dimensions: { width: 10, depth: 7, height: 6 },
+      materials: {
+        primary: "minecraft:brown_concrete",
+        accent: "minecraft:black_concrete",
+        roof: "minecraft:brown_concrete",
+      },
+      features: ["decorations"], phases: ["foundation", "shell", "roof", "details"],
+      primitives: [
+        { shape: "box", phase: "foundation", blockId: "minecraft:brown_concrete", from: [0, 0, 0], to: [9, 0, 6] },
+        { shape: "box", phase: "shell", blockId: "minecraft:brown_concrete", from: [0, 1, 0], to: [9, 3, 6] },
+        { shape: "box", phase: "roof", blockId: "minecraft:brown_concrete", from: [6, 4, 2], to: [9, 5, 4] },
+        { shape: "box", phase: "details", blockId: "minecraft:black_concrete", from: [9, 4, 3], to: [9, 4, 3] },
+      ],
+    },
+  };
+  await recipes.promote({ question: "build me a dog", action: dogAction, grade: 5, verified: true });
+  const wizard = createWizard({ corpus, sessions, recipes, env: {}, logger: quiet });
+  const replay = await wizard.ask({
+    player: "RejectingKid", question: "build me a dog", requestId: "dog-replay",
+  });
+  assert.equal(replay.mode, "learned-recipe");
+  await sessions.updateAction("RejectingKid", "wizard", {
+    requestId: replay.requestId, status: "completed", detail: "dog placed",
+  });
+  const result = await wizard.recordFeedback({
+    player: "RejectingKid", requestId: replay.requestId, grade: 1,
+  });
+  assert.equal(result.needsFeedback, true);
+  // #35: the proven recipe survives its first rejection with a counter
+  const survivor = await recipes.find("build me a dog");
+  assert.ok(survivor, "one rejection must not delete a proven recipe");
+  assert.equal(survivor.failures, 1);
+  assert.equal(survivor.tier, "verified");
 });

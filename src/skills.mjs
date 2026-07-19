@@ -305,7 +305,9 @@ export function wizardActionRejection(value) {
     else return allowedWizardAction(value) ? null : "action is not registered or its arguments are invalid";
     return null;
   } catch (error) {
-    return String(error?.message || error).slice(0, 240);
+    // #35 review: 240 chars cut salvage violation lists mid-entry; match the
+    // 2000-char repair-detail budget so the model sees the full set.
+    return String(error?.message || error).slice(0, 2000);
   }
 }
 

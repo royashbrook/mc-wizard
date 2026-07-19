@@ -59,12 +59,23 @@ test("rejects invalid shells while allowing bounded horizontal modification exte
   assert.throws(() => validateBuildStructurePlan(modification({
     shape: "box", phase: "details", blockId: "minecraft:stone_bricks", from: [-5, 1, 0], to: [-1, 1, 2],
   })), /outside the requested dimensions/);
-  assert.throws(() => validateBuildStructurePlan(plan([
+  // #35: for a NEW structure this was a hard "outside the requested
+  // dimensions" throw. The salvage validator now reads raw coordinates,
+  // translates the whole solid set to the origin, and renormalizes the
+  // declared dimensions to the real extents with recorded warnings; only
+  // modify patches keep the bounded margin above.
+  const renormalized = validateBuildStructurePlan(plan([
     { shape: "box", phase: "foundation", blockId: "minecraft:stone", from: [-1, 0, 0], to: [8, 0, 6] },
     { shape: "hollow_box", phase: "shell", blockId: "minecraft:stone_bricks", from: [0, 0, 0], to: [8, 5, 6] },
     { shape: "line", phase: "roof", blockId: "minecraft:spruce_planks", from: [0, 5, 3], to: [8, 5, 3] },
     { shape: "box", phase: "details", blockId: "minecraft:glass", from: [4, 2, 0], to: [4, 2, 0] },
-  ])), /outside the requested dimensions/);
+  ]));
+  assert.deepEqual(renormalized.dimensions, { width: 10, depth: 7, height: 6 });
+  assert.deepEqual(renormalized.primitives[0].from, [0, 0, 0]);
+  assert.deepEqual(renormalized.primitives[0].to, [9, 0, 6]);
+  assert.ok(renormalized.salvage.warnings.some((warning) => /translated by \[1,0,0\]/.test(warning)));
+  assert.ok(renormalized.salvage.warnings.some((warning) => /renormalized to the solid primitive bounds/.test(warning)));
+  assert.deepEqual(renormalized.salvage.dropped, []);
 });
 
 test("charges hollow boxes for their actual shell volume under the existing plan limit", () => {
@@ -102,7 +113,12 @@ test("rejects a generic room labeled as a city and accepts a real multi-building
     { shape: "line", phase: "roof", blockId: "minecraft:spruce_planks", from: [0, 5, 3], to: [8, 5, 3] },
     { shape: "box", phase: "details", blockId: "minecraft:sea_lantern", from: [4, 3, 3], to: [4, 3, 3] },
   ], { kind: "city" });
-  assert.throws(() => validateBuildStructurePlan(fakeCity), /at least four distinct habitable/);
+  // #35: city-quality geometry is advisory after the salvage change — a fake
+  // city still validates structurally, but each quality shortfall is recorded
+  // as a salvage warning for the goal-review loop instead of a hard throw.
+  // Safety limits (materials, bounds, plan size) remain hard elsewhere.
+  const fake = validateBuildStructurePlan(fakeCity);
+  assert.ok(fake.salvage.warnings.some((warning) => /at least four distinct habitable/.test(warning)));
 
   const realCity = plan([
     { shape: "box", phase: "foundation", blockId: "minecraft:stone", from: [0, 0, 9], to: [19, 0, 10] },
@@ -121,19 +137,23 @@ test("rejects a generic room labeled as a city and accepts a real multi-building
     kind: "city",
     dimensions: { width: 20, depth: 20, height: 12 },
   });
-  assert.equal(validateBuildStructurePlan(realCity).primitives.filter(({ shape }) => shape === "hollow_box").length, 4);
+  const real = validateBuildStructurePlan(realCity);
+  assert.equal(real.primitives.filter(({ shape }) => shape === "hollow_box").length, 4);
+  assert.deepEqual(real.salvage.warnings, []);
 
   const overlapping = structuredClone(realCity);
   const oneShell = overlapping.primitives.find(({ shape }) => shape === "hollow_box");
   overlapping.primitives = overlapping.primitives.map((primitive) => (
     primitive.shape === "hollow_box" ? structuredClone(oneShell) : primitive
   ));
-  assert.throws(() => validateBuildStructurePlan(overlapping), /distinct and separated/);
+  assert.ok(validateBuildStructurePlan(overlapping).salvage.warnings
+    .some((warning) => /distinct and separated/.test(warning)));
 
   const slabRoad = structuredClone(realCity);
   slabRoad.primitives = [
     { shape: "box", phase: "foundation", blockId: "minecraft:stone", from: [0, 0, 0], to: [19, 0, 19] },
     ...slabRoad.primitives.filter(({ phase }) => phase !== "foundation"),
   ];
-  assert.throws(() => validateBuildStructurePlan(slabRoad), /two distinct thin connected paths/);
+  assert.ok(validateBuildStructurePlan(slabRoad).salvage.warnings
+    .some((warning) => /two distinct thin connected paths/.test(warning)));
 });

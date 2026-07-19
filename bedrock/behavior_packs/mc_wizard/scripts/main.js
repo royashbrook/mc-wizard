@@ -38,6 +38,8 @@ import { createRecipeDisplay } from "./recipe-display.js";
 import { createAutomaticWoolFarmBlueprint } from "./wool-farm.js";
 import { splitMessage } from "./chat.js";
 import { newestProjectRecord, normalizeRuntimeStep, runtimeProgramHasEvidence } from "./capability-runtime.js";
+// Kept as a separate import: contract tests assert the exact line above.
+import { synthesizeRuntimeEvidence } from "./capability-runtime.js";
 import { legacyPropertySuffix, stablePropertySuffix } from "./project-memory-key.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
@@ -188,6 +190,14 @@ let activeTransaction;
 let lastAmbientTick = 0;
 let learnedWizardSkin;
 const lastCompletedBuildTokens = new Map();
+// Validator salvage records (#35): entries the brain-side validators dropped
+// ride along with the build token so a verified-complete salvaged build posts
+// status "partial" naming the dropped indices instead of a clean "completed".
+const salvageDropsByToken = new Map();
+// Synchronous handoff from buildMachinePlan into buildInteractiveBlueprint;
+// the call site must stay byte-stable for contract tests, so the drops cannot
+// travel as an extra argument.
+let nextBlueprintSalvageDrops;
 
 function variable(name, fallback) {
   try {
@@ -309,7 +319,7 @@ async function postActionResult(report, status, detail) {
             ...(report.playerId ? { playerId: report.playerId } : {}),
             requestId: report.requestId,
           status,
-          ...(detail ? { detail: String(detail).slice(0, 240) } : {}),
+          ...(detail ? { detail: String(detail).slice(0, 1600) } : {}),
           ...(context ? { context } : {}),
         }))
         .addHeader("Content-Type", "application/json");
@@ -474,6 +484,8 @@ function bindBuildProject(player, token, projectRecord) {
 
 function endBuildAction(token, status, detail) {
   const report = actionReportsByToken.get(token);
+  const dropped = salvageDropsByToken.get(token);
+  salvageDropsByToken.delete(token);
   if (!report) return;
   actionReportsByToken.delete(token);
   if (status === "completed" && report.playerId) lastCompletedBuildTokens.set(report.playerId, token);
@@ -482,6 +494,17 @@ function endBuildAction(token, status, detail) {
   }
   if (["completed", "partial"].includes(status) && report.projectRecord) {
     rememberLastProject({ name: report.playerName }, report.projectRecord);
+  }
+  if (status === "completed" && dropped?.length) {
+    // A salvaged plan built everything that survived validation, but the child
+    // asked for more: post partial with the dropped entries so the brain
+    // reviews the gap instead of closing the goal on a clean completion (#35).
+    status = "partial";
+    detail = `${detail ? `${detail}; ` : ""}salvage dropped ${dropped.length} entr${dropped.length === 1 ? "y" : "ies"}: ${JSON.stringify(dropped)}`;
+    withCurrentActionPlayer(report, (player) => speak(
+      player,
+      `I built most of it—${dropped.length} piece${dropped.length === 1 ? "" : "s"} didn’t fit this world. Want me to fix those?`,
+    ));
   }
   void postActionResult(report, status, detail);
 }
@@ -2964,14 +2987,28 @@ function sameGeneratedStructureBase(plan, previousPlan) {
     && JSON.stringify(plan.entities || []) === JSON.stringify(previousPlan.entities || []);
 }
 
-function structurePlanOperations(plan, previousPlan) {
+function structurePlanOperations(plan, previousPlan, { reconstructing = false } = {}) {
   const primitives = primitiveStructureOperations(plan);
   const detailOnlyPatch = primitives.length > 0
     && plan.mode === "modify"
     && GENERATED_STRUCTURE_KINDS.has(plan.kind)
     && sameGeneratedStructureBase(plan, previousPlan);
   let operations;
-  if (!primitives.length) operations = structureOperations(plan);
+  if (!primitives.length) {
+    // `reconstructing` replays a plan that already stands in the world (the
+    // saved record of a previous build). Legacy generic-box-era records have
+    // no primitives and no mode, and their kind may not be a generated kind
+    // ("dragon" built before #35); the parametric generator is exactly what
+    // was built then, so the fail-fast below must not apply to them or the
+    // legacy structure could never be modified again.
+    if (!reconstructing && plan.mode !== "modify" && !GENERATED_STRUCTURE_KINDS.has(plan.kind)) {
+      // Fail fast instead of silently substituting the generic parametric box:
+      // a primitive-less "dragon" would otherwise become a house-shaped
+      // building that is not what the child asked for (#35).
+      throw new Error(`a ${plan.kind} needs authored shape primitives (box/line/hollow_box); send its silhouette instead of a generic building`);
+    }
+    operations = structureOperations(plan);
+  }
   else if (plan.mode !== "modify" || !GENERATED_STRUCTURE_KINDS.has(plan.kind)) operations = primitives;
   else if (detailOnlyPatch) {
     const previousPrimitiveKeys = new Set(
@@ -3513,13 +3550,19 @@ function structureEntitySteps(plan, player, origin, forward, right, inhabitantTa
 }
 
 async function buildStructure(player, value) {
+  // The brain ships its salvage drop records on the already-salvaged plan it
+  // validated (value.salvage.dropped). Re-validating those clean survivors
+  // below recomputes an empty salvage, so read the incoming records first —
+  // exactly like buildMachinePlan reads value.dropped — or a salvaged build
+  // would post "completed" instead of "partial" (#35).
+  const brainSalvageDrops = Array.isArray(value?.salvage?.dropped) ? value.salvage.dropped : [];
   let plan;
   try {
     plan = validateBuildStructurePlan(value);
   } catch (error) {
     console.warn(`[MC Wizard] rejected malformed structure plan: ${error}`);
     speak(player, "That drawing had a broken piece. I’m revising this same project now instead of pretending a wooden box is what you asked for.");
-    failPendingAction(player, `structure plan validation failed: ${String(error).slice(0, 160)}`);
+    failPendingAction(player, `structure plan validation failed: ${String(error?.message || error).slice(0, 1600)}`);
     return;
   }
   if (buildInProgress || buildPreparing) {
@@ -3540,13 +3583,24 @@ async function buildStructure(player, value) {
       speak(player, "I can’t find that earlier structure in this dimension, so I’m rebuilding the complete improved version nearby instead of stopping.");
     }
   }
-  const operations = structurePlanOperations(plan, modificationSite?.previous?.plan);
-  const previousOperations = modifying
-    ? structurePlanOperations(modificationSite.previous.plan)
-    : [];
-  const cleanupOperations = modifying
-    ? obsoleteExpansionOperations(modificationSite.previous.plan, plan, previousOperations)
-    : [];
+  let operations;
+  let previousOperations = [];
+  let cleanupOperations = [];
+  try {
+    operations = structurePlanOperations(plan, modificationSite?.previous?.plan);
+    previousOperations = modifying
+      ? structurePlanOperations(modificationSite.previous.plan, undefined, { reconstructing: true })
+      : [];
+    cleanupOperations = modifying
+      ? obsoleteExpansionOperations(modificationSite.previous.plan, plan, previousOperations)
+      : [];
+  } catch (error) {
+    // The dragon fail-fast above lands here: honest failure over a generic box.
+    console.warn(`[MC Wizard] rejected structure plan without an authored silhouette: ${error}`);
+    speak(player, "That drawing arrived without the real shape of what you asked for. I’m asking for its actual silhouette instead of pretending a plain building is it.");
+    failPendingAction(player, `structure plan validation failed: ${String(error?.message || error).slice(0, 1600)}`);
+    return;
+  }
   speak(player, modifying
     ? `I found your last ${plan.kind}. I’m improving it in place—same center and direction, with the requested rooms, floors, details, and inhabitants.`
     : `I mapped “${plan.title}” at exactly ${plan.dimensions.width} by ${plan.dimensions.depth} by ${plan.dimensions.height}. I’m building the whole thing here in four visible phases.`);
@@ -3566,6 +3620,8 @@ async function buildStructure(player, value) {
       ? modificationSite.previous.inhabitantTag : newStructureInhabitantTag(token),
   };
   bindBuildAction(player, token, structureRecord);
+  const salvageDrops = [...brainSalvageDrops, ...(plan.salvage?.dropped || [])];
+  if (salvageDrops.length) salvageDropsByToken.set(token, salvageDrops);
   try {
     await prepareStructureArea(
       player,
@@ -4220,6 +4276,11 @@ function repairBlueprintVerification(dimension, blueprint, origin, forward, righ
 }
 
 async function buildInteractiveBlueprint(player, blueprint, waitingForBody = false) {
+  if (nextBlueprintSalvageDrops) {
+    // Synchronous pickup from buildMachinePlan before any await or requeue.
+    blueprint = { ...blueprint, dropped: nextBlueprintSalvageDrops };
+    nextBlueprintSalvageDrops = undefined;
+  }
   if (buildInProgress || buildPreparing) {
     queueBuild(player, (current) => buildInteractiveBlueprint(current, blueprint));
     return;
@@ -4274,6 +4335,7 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
     clearBuild(token);
     return;
   }
+  if (blueprint.dropped?.length) salvageDropsByToken.set(token, blueprint.dropped);
   bindBuildProject(player, token, {
     ...projectSummary,
     dimensionId: dimension.id,
@@ -4416,11 +4478,16 @@ async function buildInteractiveBlueprint(player, blueprint, waitingForBody = fal
 
 function buildMachinePlan(player, value) {
   try {
+    // A brain-validated plan carries its own salvage drop records; hand them
+    // to the blueprint executor so a completed salvaged machine posts partial.
+    nextBlueprintSalvageDrops = Array.isArray(value?.dropped) && value.dropped.length
+      ? value.dropped : undefined;
     void buildInteractiveBlueprint(player, machineBlueprint(value));
   } catch (error) {
+    nextBlueprintSalvageDrops = undefined;
     console.warn(`[MC Wizard] rejected unsafe machine plan: ${error}`);
     speak(player, "That machine drawing had one broken part. I’m revising this same machine now instead of swapping in an unrelated redstone trick.");
-    failPendingAction(player, `machine plan validation failed: ${String(error).slice(0, 160)}`);
+    failPendingAction(player, `machine plan validation failed: ${String(error?.message || error).slice(0, 1600)}`);
   }
 }
 
@@ -4446,6 +4513,10 @@ function findCustomSite(player, plan, forward, right) {
 }
 
 async function buildValidatedPlan(player, value) {
+  // Same brain-drop handoff as buildStructure: the incoming plan is already
+  // salvaged brain-side, so its drop records ride value.salvage.dropped and
+  // re-validation alone would lose them (#35).
+  const brainSalvageDrops = Array.isArray(value?.salvage?.dropped) ? value.salvage.dropped : [];
   let plan;
   try {
     plan = validateBuildPlan(value);
@@ -4493,6 +4564,8 @@ async function buildValidatedPlan(player, value) {
     clearBuild(token);
     return;
   }
+  const salvageDrops = [...brainSalvageDrops, ...(plan.salvage?.dropped || [])];
+  if (salvageDrops.length) salvageDropsByToken.set(token, salvageDrops);
   lastBuildTick.set(player.id, system.currentTick);
   const steps = plan.blocks.map((placement) => {
     const target = customLocation(origin, forward, right, placement.target);
@@ -6068,7 +6141,9 @@ async function executeCapabilityProgram(player, program, { allowRequesterTelepor
   let transactionStarted = false;
   let changedWorld = false;
   try {
-    const steps = program.steps.map(normalizeRuntimeStep);
+    // Deterministic mutations get their verification synthesized from their own
+    // declared outcomes; the evidence assert below stays as the final guard.
+    const steps = synthesizeRuntimeEvidence(program.steps.map(normalizeRuntimeStep));
     if (!runtimeProgramHasEvidence(steps)) throw new Error("the program lacks runtime evidence for its mutations");
     const frame = capabilityProgramFrame(player, program);
     const expectedBlocks = steps.flatMap((step) => {

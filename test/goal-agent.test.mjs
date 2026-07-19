@@ -819,7 +819,10 @@ test("replays the live rainbow castle refinements immediately without a planner 
   const player = "RainbowKid";
   const initialQuestion = "build a 17x26 rainbow castle with 3 villagers and a goat in it";
   const initial = await wizard.ask({ player, question: initialQuestion });
-  assert.equal(providerCalls, 0);
+  // #35: "rainbow" is descriptor residue, so the fresh build consults the
+  // model once; the provider is down here, and the offline fallback still
+  // delivers the full deterministic rainbow castle immediately.
+  assert.equal(providerCalls, 1);
   assert.equal(initial.action.type, "build_structure");
   assert.deepEqual(initial.action.plan.dimensions, { width: 17, depth: 26, height: 9 });
   assert.ok(initial.action.plan.features.includes("rainbow"));
@@ -849,7 +852,8 @@ test("replays the live rainbow castle refinements immediately without a planner 
   assert.equal(afterCompletedReview?.plan.mode, "modify");
 
   const repaint = await wizard.ask({ player, question: "the colors are wrong. fix the colors" });
-  assert.equal(providerCalls, 0);
+  // #35: refinements of the same project stay planner-free (count unchanged)
+  assert.equal(providerCalls, 1);
   assert.equal(repaint.action.type, "build_structure");
   assert.equal(repaint.action.plan.mode, "modify");
   assert.equal(new Set(repaint.action.plan.primitives
@@ -859,7 +863,7 @@ test("replays the live rainbow castle refinements immediately without a planner 
 
   const correctionQuestion = "but it's not rainbow colored. make it taller, add stairs so we can get to another floor and add some rooms, a moat filled with lava, a redstone powered bridge, and several iron golem guards around.";
   const correction = await wizard.ask({ player, question: correctionQuestion });
-  assert.equal(providerCalls, 0);
+  assert.equal(providerCalls, 1); // #35: still no planner wait for refinements
   assert.equal(correction.action.type, "build_structure");
   assert.equal(correction.action.plan.mode, "modify");
   assert.deepEqual(correction.action.plan.dimensions, { width: 17, depth: 26, height: 13 });
@@ -882,7 +886,7 @@ test("replays the live rainbow castle refinements immediately without a planner 
   await sessions.updateAction(player, "wizard", { requestId: correction.requestId, status: "completed", detail: "upgraded" });
 
   const lighting = await wizard.ask({ player, question: "it's too dark in the castle. light it up" });
-  assert.equal(providerCalls, 0);
+  assert.equal(providerCalls, 1); // #35: still no planner wait for refinements
   assert.equal(lighting.action.plan.mode, "modify");
   assert.ok(lighting.action.plan.primitives.filter(({ blockId }) => blockId === "minecraft:sea_lantern").length >= 8);
 });
@@ -1039,7 +1043,10 @@ test("compiles an incomplete city declaration into a complete executable city in
   assert.equal(turns[0].goalId, turns.at(-1).goalId);
 });
 
-test("replaces a model's compact one-room city with a complete default-size city", async () => {
+// #35: accept-with-warning replaced wholesale replacement. A compact but
+// subject-shaped city is now accepted with an in-character caveat and an
+// active goal so the review loop refines it, instead of being thrown away.
+test("accepts a model's compact one-room city with a caveat and keeps the goal active", async () => {
   let calls = 0;
   const wizard = createWizard({
     corpus,
@@ -1074,8 +1081,10 @@ test("replaces a model's compact one-room city with a complete default-size city
 
   const result = await wizard.ask({ player: "CompactCityKid", question: "Build a city" });
   assert.equal(calls, 1);
-  assert.deepEqual(result.action.plan.dimensions, { width: 31, depth: 31, height: 18 });
-  assert.equal(result.action.plan.primitives.filter(({ shape }) => shape === "hollow_box").length, 4);
+  // salvage renormalized the declared bounds to the authored 9x9x5 room
+  assert.deepEqual(result.action.plan.dimensions, { width: 9, depth: 9, height: 5 });
+  assert.equal(result.goal.status, "active");
+  assert.match(result.answer, /rough|sculpting/i);
   assert.doesNotThrow(() => validateBuildStructurePlan(result.action.plan));
 });
 
@@ -1322,7 +1331,10 @@ test("rejects a destructive whole-city air patch instead of pretending it is a p
     player: "ParkKid", requestId: initial.requestId, status: "completed", detail: "city verified",
   });
   const result = await wizard.ask({ player: "ParkKid", question: "Add a park to this city" });
-  assert.equal(providerCalls, 3);
+  // #35: the first turn now adopts the deterministic city instead of spending
+  // a provider repair round on the destructive plan, so one call is saved. The
+  // air patch itself is still rejected and no action is executed.
+  assert.equal(providerCalls, 2);
   assert.equal(result.action, null);
   assert.equal(result.goal.status, "active");
 });
@@ -1403,7 +1415,9 @@ test("rejects an unrelated replacement action for corrective feedback", async ()
     assert.equal(correction.mode, "planning-deferred");
     assert.notEqual(correction.goal?.objective, "Build a calculator instead");
   }
-  assert.equal(providerCalls, 6);
+  // #35: each attempt now runs the bounded two-round repair loop
+  // (MC_WIZARD_REPAIR_ROUNDS default 2), so every attempt costs three calls.
+  assert.equal(providerCalls, 9);
   assert.match(correction.answer, /don’t have a safe executable change yet/i);
   assert.doesNotMatch(correction.answer, /automatic|retry|trying another|you do not need to ask/i);
 });
@@ -1450,7 +1464,8 @@ test("the three-attempt planning loop repairs chicken containment before its ter
 
   const correction = attempts.at(-1);
   assert.equal(attempts.length, 1);
-  assert.equal(providerCalls, 3);
+  // #35: review (1) + planner consult (1) + two bounded repair rounds (2)
+  assert.equal(providerCalls, 4);
   assert.equal(correction.action.type, "build_machine");
   assert.equal(correction.action.plan.mode, "modify");
   assert.equal(correction.action.plan.kind, "automatic chicken farm");
@@ -1498,7 +1513,9 @@ test("open-ended style wording never changes the requested action family", async
     },
   });
   const result = await wizard.ask({ player: "SurpriseKid", question: "Build me a castle, surprise me" });
-  assert.equal(providerCalls, 0);
+  // #35: "surprise me" is descriptor residue and now consults the model once;
+  // the off-family calculator is still rejected and the castle family wins.
+  assert.equal(providerCalls, 1);
   assert.equal(result.action.type, "build_structure");
   assert.equal(result.action.plan.kind, "castle");
   assert.doesNotMatch(result.answer, /calculator/i);
@@ -1849,7 +1866,10 @@ test("automatic build review cannot invent console or destructive command powers
   }
 });
 
-test("partial immediate actions become retryable terminal observations", async () => {
+// #35: 'partial' is now completed-with-review — the executor salvaged most of
+// the plan, so one goal review names the dropped entries instead of a blind
+// replan; the terminal grade binding is unchanged.
+test("partial results are completed-with-review and schedule one review naming the dropped work", async () => {
   const sessions = createMemorySessionStore();
   const wizard = createWizard({ corpus, sessions, env: {} });
   const first = await wizard.ask({ player: "PartialKid", question: "light up this area" });
@@ -1863,11 +1883,47 @@ test("partial immediate actions become retryable terminal observations", async (
   assert.equal(outcome.status, "partial");
   assert.equal(sessions.get("PartialKid", "wizard")
     .find((turn) => turn.requestId === first.requestId).status, "partial");
+  // no fresh world snapshot: the review is deferred, never silently completed
+  assert.equal(outcome.reviewDeferred, true);
+  assert.equal(outcome.replan, undefined);
   const feedback = await sessions.recordFeedback("PartialKid", "wizard", {
     requestId: first.requestId, grade: 2, note: "place the missing torches",
   });
   assert.equal(feedback.recorded, true);
   assert.equal(feedback.pending, undefined);
+
+  const contextual = createMemorySessionStore();
+  const reviewer = createWizard({ corpus, sessions: contextual, env: {} });
+  const started = await reviewer.ask({ player: "PartialReviewKid", question: "light up this area" });
+  const reviewed = await reviewer.recordActionResult({
+    player: "PartialReviewKid",
+    requestId: started.requestId,
+    status: "partial",
+    detail: "placed 5 of 8 torches",
+    context: { dimension: "minecraft:overworld", buildState: "idle" },
+  });
+  assert.ok(reviewed.review, "a snapshot schedules exactly one goal review");
+  assert.notEqual(reviewed.review.goal?.status, "complete");
+  const reviewTurn = contextual.get("PartialReviewKid", "wizard").at(-1);
+  assert.match(reviewTurn.question, /completed partially and dropped planned entries: placed 5 of 8 torches/i);
+});
+
+// #35: unknown statuses from a newer pack (version skew) degrade to 'failed'
+// semantics — the action replans like a failure and is never counted a success.
+test("an unrecognized action status degrades to failed semantics", async () => {
+  const sessions = createMemorySessionStore();
+  const wizard = createWizard({ corpus, sessions, env: {} });
+  const first = await wizard.ask({ player: "SkewKid", question: "light up this area" });
+  const outcome = await wizard.recordActionResult({
+    player: "SkewKid",
+    requestId: first.requestId,
+    status: "vaporized",
+    detail: "the pack sent a status this server has never seen",
+  });
+  assert.equal(outcome.matched, true);
+  assert.equal(outcome.status, "failed");
+  assert.equal(sessions.get("SkewKid", "wizard")
+    .find((turn) => turn.requestId === first.requestId).status, "failed");
   assert.equal(outcome.replan.action.type, "place_area_torches");
 });
 
@@ -1909,6 +1965,41 @@ test("bounds automatic completion reviews without falsely completing the goal", 
   assert.equal(stopped.reviewLimitReached, true);
   assert.equal(stopped.review, undefined);
   assert.equal(reviews, 5);
+});
+
+// #35 review: kids ask side questions constantly while a build runs. An
+// informational question mid-project must get a real grounded answer offline
+// — the extractive path cannot be dead code behind the active-goal branch —
+// while the goal stays active and continuation turns keep their project line.
+test("mid-project informational questions get grounded answers while the goal stays active", async () => {
+  const catHits = [{
+    title: "Cats in Minecraft",
+    text: "Tame a cat by feeding it raw cod or raw salmon near a village. Cats trust players slowly, so crouch and wait between fish.",
+    edition: "bedrock", channel: "stable", version: "1.21", score: 5, source: "cats.md",
+  }];
+  const sessions = createMemorySessionStore();
+  const wizard = createWizard({
+    corpus: { search: (query) => /cat|tame/i.test(query) ? catHits : [] },
+    sessions,
+    env: {},
+    logger: { warn() {} },
+  });
+  const build = await wizard.ask({ player: "SideQuestionKid", question: "wizard build me a big castle" });
+  assert.equal(build.action?.type, "build_structure");
+  assert.equal(build.goal.status, "active");
+  const side = await wizard.ask({ player: "SideQuestionKid", question: "wiz how do i tame a cat" });
+  assert.equal(side.action, null);
+  assert.match(side.answer, /raw cod|raw salmon/i, "the extractive answer must reach the child mid-project");
+  assert.doesNotMatch(side.answer, /keeping this project active|keeping this as our active project/i);
+  // the project goal survives the side question untouched
+  const history = sessions.get("SideQuestionKid", "wizard");
+  assert.equal(history.at(-2).goal.status, "active");
+  assert.equal(history.at(-1).goal, undefined);
+  // negative: a side question with no retrievable grounding still gets the
+  // deferred project line, never a fabricated answer
+  const ungrounded = await wizard.ask({ player: "SideQuestionKid", question: "whats the best food for horses" });
+  assert.equal(ungrounded.action, null);
+  assert.doesNotMatch(ungrounded.answer, /spellbook says/i);
 });
 
 test("keeps active-project feedback across chat but starts explicit new builds on a new goal", async () => {
@@ -2106,13 +2197,53 @@ test("a failed arbitrary machine action replans to honest staged progress on the
   assert.equal(outcome.retryLimitReached, undefined);
 });
 
+// #35: mirrors stagedBuildProgressAction's first pass for a 17x13x9 pavilion so
+// continuation tests can seed prior staged history now that a fresh unknown
+// build composes a complete procedural plan instead.
+function stagedZorbFirstPass() {
+  const materials = {
+    primary: "minecraft:white_concrete",
+    accent: "minecraft:light_blue_concrete",
+    roof: "minecraft:white_concrete",
+  };
+  return {
+    type: "build_structure",
+    version: 1,
+    plan: {
+      title: "First pass zorb pavilion",
+      kind: "zorb pavilion",
+      dimensions: { width: 17, depth: 13, height: 9 },
+      materials,
+      features: ["supports"],
+      phases: ["foundation", "shell", "roof", "details"],
+      primitives: [
+        { shape: "box", phase: "foundation", blockId: materials.primary, from: [0, 0, 0], to: [16, 0, 0] },
+        { shape: "box", phase: "shell", blockId: materials.primary, from: [0, 0, 0], to: [0, 0, 12] },
+        { shape: "box", phase: "roof", blockId: materials.roof, from: [0, 0, 0], to: [0, 8, 0] },
+        { shape: "box", phase: "details", blockId: materials.accent, from: [16, 0, 12], to: [16, 0, 12] },
+      ],
+    },
+  };
+}
+
+// #35: a fresh unknown build now composes a complete procedural plan, so the
+// staged corner guide only appears as a continuation. This test seeds the prior
+// first-pass turn to preserve its original continuation intent.
 test("a first-pass structure stays active and requests continuation even when its snapshot matches", async () => {
   const sessions = createMemorySessionStore();
   const question = "Build me a 17x13x9 zorb pavilion";
+  await sessions.set("StageKid", "wizard", [{
+    question,
+    answer: "I’m starting with a first-pass corner and size guide.",
+    action: stagedZorbFirstPass(),
+    goal: { objective: question, successCriteria: "The full pavilion exists.", status: "active" },
+    goalId: "zorb-goal", requestId: "zorb-first", status: "completed",
+  }]);
   const wizard = createWizard({ corpus, sessions, env: {} });
-  const first = await wizard.ask({ player: "StageKid", question });
+  const first = await wizard.ask({ player: "StageKid", question, goalRetry: { goalId: "zorb-goal" } });
   assert.equal(first.action.type, "build_structure");
-  assert.match(first.action.plan.title, /^First pass\b/);
+  assert.match(first.action.plan.title, /^Progress 2\b/);
+  assert.equal(first.mode, "local-build-progress");
   assert.deepEqual(first.action.plan.dimensions, { width: 17, depth: 13, height: 9 });
   assert.equal(first.goal.status, "active");
   const plan = first.action.plan;
@@ -2148,9 +2279,19 @@ test("persistent offline structure retries make cumulative same-site progress th
     env: { AI_BASE_URL: "http://offline-model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
     fetchImpl: async () => { throw new Error("provider remains offline"); },
   });
-  let current = await wizard.ask({ player: "OfflineStructureKid", question });
-  const plans = [current.action.plan];
-  const goalId = sessions.get("OfflineStructureKid", "wizard").at(-1).goalId;
+  // #35: seeded staged history — the fresh offline ask now yields a complete
+  // procedural plan, so cumulative staged passes are exercised as continuation.
+  const seeded = stagedZorbFirstPass();
+  const goalId = "zorb-goal";
+  await sessions.set("OfflineStructureKid", "wizard", [{
+    question,
+    answer: "I’m starting with a first-pass corner and size guide.",
+    action: seeded,
+    goal: { objective: question, successCriteria: "The full pavilion exists.", status: "active" },
+    goalId, requestId: "zorb-first", status: "pending",
+  }]);
+  let current = { requestId: "zorb-first", action: seeded };
+  const plans = [seeded.plan];
 
   assert.match(current.action.plan.title, /^First pass\b/);
   assert.deepEqual(current.action.plan.dimensions, { width: 17, depth: 13, height: 9 });
@@ -2220,23 +2361,27 @@ test("a staged structure review advances to a full same-site modify action on th
       { shape: "box", phase: "details", blockId: "minecraft:light_blue_concrete", from: [0, 3, 5], to: [16, 4, 7] },
     ],
   };
-  let calls = 0;
   const wizard = createWizard({
     corpus, sessions, logger: { warn() {} },
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
-    fetchImpl: async () => {
-      calls += 1;
-      if (calls === 1) throw new Error("temporary provider outage");
-      return modelResponse("I’ve finished the complete pavilion on this same marked site.", {
-        type: "build_structure", version: 1, plan: fullPlan,
-      }, {
-        objective: question,
-        successCriteria: "The complete pavilion fills the marked dimensions",
-        status: "active",
-      });
-    },
+    fetchImpl: async () => modelResponse("I’ve finished the complete pavilion on this same marked site.", {
+      type: "build_structure", version: 1, plan: fullPlan,
+    }, {
+      objective: question,
+      successCriteria: "The complete pavilion fills the marked dimensions",
+      status: "active",
+    }),
   });
-  const first = await wizard.ask({ player: "StageReviewKid", question });
+  // #35: prior staged history is seeded — a fresh ask would now compose a
+  // complete procedural plan instead of a first-pass guide.
+  const first = { requestId: "zorb-first", action: stagedZorbFirstPass() };
+  await sessions.set("StageReviewKid", "wizard", [{
+    question,
+    answer: "I’m starting with a first-pass corner and size guide.",
+    action: first.action,
+    goal: { objective: question, successCriteria: "The full pavilion exists.", status: "active" },
+    goalId: "zorb-goal", requestId: first.requestId, status: "pending",
+  }]);
   assert.match(first.action.plan.title, /^First pass\b/);
   const plan = first.action.plan;
   const outcome = await wizard.recordActionResult({

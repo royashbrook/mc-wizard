@@ -81,8 +81,16 @@ export function createInteractionLog({
   };
 
   return {
-    recordAsk({ player, question, mode, requestId: suppliedRequestId, result }) {
+    recordAsk({ player, question, mode, requestId: suppliedRequestId, telemetry: suppliedTelemetry, result }) {
       const id = requestId(result?.requestId, player) || requestId(suppliedRequestId, player);
+      const telemetry = suppliedTelemetry ?? result?.telemetry;
+      const rejections = Array.isArray(telemetry?.rejections)
+        ? telemetry.rejections.slice(0, 8).flatMap((item) => {
+          const gate = text(item?.gate, 40);
+          const reason = privateText(item?.reason, 200, player);
+          return gate || reason ? [{ ...(gate && { gate }), ...(reason && { reason }) }] : [];
+        })
+        : [];
       const timestamp = now();
       const hash = playerHash(player);
       const goal = goalId(result, player);
@@ -102,6 +110,9 @@ export function createInteractionLog({
         ...(label && { actionLabel: label }),
         ...(responseMode && { responseMode }),
         ...(actionType && { actionType }),
+        ...(telemetry && typeof telemetry === "object"
+          && { providerConsulted: Boolean(telemetry.providerConsulted) }),
+        ...(rejections.length > 0 && { rejections }),
       });
     },
     recordActionResult({ player, requestId: suppliedRequestId, status, detail, result }) {

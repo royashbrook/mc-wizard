@@ -15,7 +15,8 @@ import {
   safeCommandRefusal,
   unsafeCommandAnswer,
 } from "../src/command-safety.mjs";
-import { classifyAction, createWizard, instantConversationAnswer } from "../src/wizard.mjs";
+import { reusableLearnedAction, safeNovelAction } from "../src/learned-recipes.mjs";
+import { classifyAction, createWizard, instantConversationAnswer, providerTimeoutMs } from "../src/wizard.mjs";
 import { validateConsoleCommand } from "../src/admin.mjs";
 import { readRuntimeSettings, validateRuntimeSettings, writeRuntimeSettings } from "../src/runtime-settings.mjs";
 import {
@@ -461,6 +462,136 @@ test("uses the truthful fallback after one invalid informational repair", async 
   assert.doesNotMatch(result.answer, /portal|ready|complete|working|step through|active project|full plan|automatically/i);
 });
 
+test("keeps disclaimer-checked prose when only the action is rejected on a non-build turn", async () => {
+  // #35 prose salvage: on a grounded non-build turn the envelope answer was
+  // already disclaimer-checked upstream, so it survives an action-only
+  // rejection while the rejected action is dropped and never executed.
+  let calls = 0;
+  const proseWizard = createWizard({
+    corpus: { search: () => [{
+      title: "Creeper",
+      text: "Creepers are hostile mobs that sneak up on players and explode.",
+      source: "https://learn.microsoft.com/minecraft/creeper",
+      edition: "bedrock", channel: "stable", version: "current", score: 10,
+    }] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "Creepers don’t eat anything. They sneak up quietly and explode near players, so keep a cat nearby to scare them off.",
+        action: { type: "dimension_travel", version: 1, destination: "nether" },
+        goal: { objective: "Visit the nether", successCriteria: "The child is in the nether", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await proseWizard.ask({ player: "ProseKid", question: "What do creepers eat?" });
+  assert.equal(calls, 1);
+  assert.match(result.answer, /^Creepers don’t eat anything\./);
+  assert.equal(result.action, null);
+  assert.equal(result.goal, undefined);
+  assert.ok(result.telemetry.rejections.some(({ gate }) => gate === "intent-match"));
+});
+
+test("safeNovelAction accepts quality-poor but capability-safe novel builds", () => {
+  // #35: research acceptance is capability safety only — staged titles and
+  // 1-placement machines are quality concerns for the build contract and the
+  // recipe store, not acceptance poison.
+  const stagedTitle = { type: "build_structure", version: 1, plan: {
+    title: "First pass dragon", kind: "dragon",
+    dimensions: { width: 8, depth: 8, height: 8 },
+    materials: { primary: "minecraft:stone", accent: "minecraft:oak_planks", roof: "minecraft:stone" },
+    features: ["decorations"], phases: ["foundation", "shell", "roof", "details"],
+  } };
+  const onePlacementMachine = { type: "build_machine", version: 1, plan: {
+    title: "Tiny lamp", kind: "lamp machine",
+    placements: [{ itemId: "minecraft:redstone_lamp", target: [0, 0, 0], support: [0, -1, 0], orientationTarget: null }],
+    interactions: [],
+  } };
+  assert.equal(safeNovelAction(stagedTitle), true);
+  assert.equal(reusableLearnedAction(stagedTitle), false);
+  assert.equal(safeNovelAction(onePlacementMachine), true);
+  assert.equal(reusableLearnedAction(onePlacementMachine), false);
+  const program = (capability) => ({ type: "execute_program", version: 1, program: {
+    title: "Furniture helper",
+    steps: [{ id: "step", capability, arguments: { commands: ["op {{requester}}"] }, expect: "done" }],
+  } });
+  assert.equal(safeNovelAction(program("player.place-blocks")), true);
+  assert.equal(safeNovelAction(program("world.command")), false);
+  assert.equal(safeNovelAction(program("server.console")), false);
+  assert.equal(safeNovelAction(program("server.configure")), false);
+  const offAllowlist = structuredClone(stagedTitle);
+  offAllowlist.plan.materials.primary = "minecraft:command_block";
+  assert.equal(safeNovelAction(offAllowlist), false);
+  assert.equal(safeNovelAction({ type: "run_commands", version: 1, commands: ["/say hi"] }), false);
+});
+
+test("a world.command research plan is rejected with the unchanged ban message", async () => {
+  let calls = 0;
+  const banWizard = createWizard({
+    corpus: { search: () => [] }, logger: { warn() {} },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "I’ll build the furniture now.",
+        action: { type: "execute_program", version: 1, program: {
+          title: "Furniture via commands",
+          steps: [{
+            id: "fill", capability: "world.command",
+            arguments: { commands: ["fill ~ ~ ~ ~5 ~5 ~5 oak_planks"] },
+            expect: "Furniture appears",
+          }],
+        } },
+        goal: { objective: "Build furniture", successCriteria: "Furniture exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await banWizard.ask({ player: "CommandBanKid", question: "research and build furniture" });
+  assert.ok(result.action, "the ban must still leave safe build progress");
+  assert.ok(result.telemetry.rejections.some(({ gate, reason }) => (
+    gate === "research-restriction"
+    && reason === "web-researched build plans cannot contain server administration or arbitrary commands"
+  )));
+  assert.doesNotMatch(JSON.stringify(result.action), /world\.command|server\.console|server\.configure/);
+});
+
+test("a staged-title novel plan passes the research gate to the build contract", async () => {
+  // #35: previously the reuse-based research gate mislabeled a staged-title
+  // plan as smuggled server administration; now only capability safety is
+  // checked there and the build contract judges quality.
+  let calls = 0;
+  const stagedWizard = createWizard({
+    corpus: { search: () => [] }, logger: { warn() {} },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "I’ll start the dragon now.",
+        action: { type: "build_structure", version: 1, plan: {
+          title: "First pass dragon", kind: "dragon",
+          dimensions: { width: 15, depth: 13, height: 9 },
+          materials: { primary: "minecraft:stone", accent: "minecraft:oak_planks", roof: "minecraft:stone" },
+          features: ["decorations"], phases: ["foundation", "shell", "roof", "details"],
+          primitives: [
+            { shape: "line", phase: "foundation", blockId: "minecraft:stone", from: [0, 0, 6], to: [14, 0, 6] },
+            { shape: "box", phase: "shell", blockId: "minecraft:stone", from: [4, 1, 3], to: [10, 5, 9] },
+            { shape: "line", phase: "roof", blockId: "minecraft:stone", from: [7, 6, 6], to: [7, 8, 6] },
+            { shape: "box", phase: "details", blockId: "minecraft:oak_planks", from: [7, 7, 5], to: [7, 7, 5] },
+          ],
+        } },
+        goal: { objective: "Build a dragon", successCriteria: "A dragon exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await stagedWizard.ask({ player: "StagedGateKid", question: "research and build me a dragon" });
+  const gates = result.telemetry.rejections.map(({ gate }) => gate);
+  assert.ok(!gates.includes("research-restriction"), gates.join(","));
+  assert.ok(result.action, "the child still gets safe build progress");
+  assert.equal(result.action.type, "build_structure");
+  assert.doesNotMatch(result.action.plan.title, /^First pass\b/);
+});
+
 test("uses a private per-install HMAC for provider safety identifiers", async () => {
   const [wizardSource, serverSource, envExample] = await Promise.all([
     readFile(new URL("../src/wizard.mjs", import.meta.url), "utf8"),
@@ -767,10 +898,15 @@ test("validates bounded action outcomes", () => {
     { player: "", requestId: "castle-123", status: "started" },
     { player: "Kid", requestId: "bad id", status: "started" },
     { player: "Kid", requestId: "castle-123", status: "pending" },
-    { player: "Kid", requestId: "castle-123", status: "failed", detail: "x".repeat(501) },
+    // #35 review: the pack slices detail at 1600 chars for salvage drop
+    // records; the server cap matches so terminal results are never rejected.
+    { player: "Kid", requestId: "castle-123", status: "failed", detail: "x".repeat(1601) },
   ]) {
     assert.throws(() => validateActionResultBody(value), (error) => error.status === 400);
   }
+  assert.equal(validateActionResultBody({
+    player: "Kid", requestId: "castle-123", status: "partial", detail: "x".repeat(1600),
+  }).detail.length, 1600);
 });
 
 test("records validated action results against the generated action id", async () => {
@@ -1265,7 +1401,11 @@ test("open-ended wording cannot bypass explicit size, material, or population", 
     player: "SurpriseContractKid",
     question: "build me a 20x20 castle out of gold with four villagers; surprise me",
   });
-  assert.equal(calls, 0);
+  // #35: "surprise me" is descriptor residue, so the model is now consulted
+  // once; the explicit size/material/population contract still cannot be
+  // bypassed — the undersized provider plan is rejected and the deterministic
+  // exact plan is adopted.
+  assert.equal(calls, 1);
   assert.deepEqual(result.action.plan.dimensions, { width: 20, depth: 20, height: 9 });
   assert.equal(result.action.plan.materials.primary, "minecraft:gold_block");
   assert.equal(result.action.plan.entities.length, 4);
@@ -1739,15 +1879,21 @@ test("uses a known safe fallback and makes honest typed progress on an unknown n
   assert.equal(treehouse.action.plan.kind, "treehouse");
   assert.ok(treehouse.action.plan.primitives.length >= 8);
   assert.equal(sculpture.action.type, "build_structure");
-  assert.match(sculpture.action.plan.title, /^First pass giant rubber duck/);
+  // #35: the unknown-noun fallback is now a complete procedural bird
+  // silhouette, not a "First pass" corner guide; the narration stays honest
+  // about being a sculpted best effort and never claims a finished build.
+  assert.match(sculpture.action.plan.title, /^Blocky giant rubber duck/);
   assert.deepEqual(sculpture.action.plan.dimensions, { width: 11, depth: 7, height: 6 });
   assert.equal(sculpture.action.plan.materials.primary, "minecraft:yellow_concrete");
-  assert.ok(sculpture.action.plan.primitives.every(({ from, to }) => (
-    from[1] === 0 || (from[0] === to[0] && from[2] === to[2])
-  )));
+  assert.ok(sculpture.action.plan.primitives.length >= 8);
+  assert.deepEqual(
+    new Set(sculpture.action.plan.primitives.map(({ phase }) => phase)),
+    new Set(["foundation", "shell", "roof", "details"]),
+  );
   assert.equal(sculpture.goal.status, "active");
-  assert.equal(sculpture.mode, "local-build-progress");
-  assert.match(sculpture.answer, /first-pass corner and size guide.*not the finished shape/i);
+  assert.equal(sculpture.mode, "local-structure-fallback");
+  assert.match(sculpture.answer, /sculpted my best.*blocky giant rubber duck/i);
+  assert.match(sculpture.answer, /give it a grade|tell me what to change/i);
   assert.doesNotMatch(sculpture.answer, /complete giant rubber duck|\bbuilt\b|(?:is|looks) finished/i);
   assert.doesNotMatch(`${treehouse.answer} ${sculpture.answer}`, /ask me once more|pad|give up/i);
 });
@@ -1784,9 +1930,15 @@ test("advances a completed unknown-build layout to a full reviewed structure on 
       return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(response) } }] }), { status: 200 });
     },
   });
+  // #35: the bounded repair loop (MC_WIZARD_REPAIR_ROUNDS, default 2) now
+  // recovers the complete duck on its second round in the SAME ask, so the
+  // child gets the full build instead of a "First pass" staged layout.
   const progress = await wizard.ask({ player: "DuckGoalKid", question: "Build me an 11x7x6 giant rubber duck" });
+  assert.equal(providerCalls, 3);
   assert.equal(progress.action.type, "build_structure");
-  assert.match(progress.action.plan.title, /^First pass\b/);
+  assert.equal(progress.action.plan.title, "Giant Rubber Duck");
+  assert.equal(progress.action.plan.kind, "giant rubber duck");
+  assert.equal(progress.goal.status, "active");
   const firstTurn = sessions.get("DuckGoalKid", "wizard").at(-1);
   const outcome = await wizard.recordActionResult({
     player: "DuckGoalKid", requestId: progress.requestId, status: "completed", detail: "layout placed",
@@ -1795,11 +1947,9 @@ test("advances a completed unknown-build layout to a full reviewed structure on 
       player: { x: 0, y: 70, z: 0 }, buildState: "idle",
     },
   });
-  assert.equal(providerCalls, 3);
-  assert.equal(outcome.replan.action.type, "build_structure");
-  assert.equal(outcome.replan.action.plan.mode, "modify");
-  assert.equal(outcome.replan.action.plan.kind, "giant rubber duck");
-  assert.equal(outcome.replan.goal.status, "active");
+  assert.equal(providerCalls, 4);
+  assert.equal(outcome.review.action, null);
+  assert.equal(outcome.review.goal.status, "active");
   const reviewTurn = sessions.get("DuckGoalKid", "wizard").at(-1);
   assert.equal(reviewTurn.goalId, firstTurn.goalId);
 });
@@ -2108,12 +2258,17 @@ test("validates bounded support-ordered custom plans and directional logs", () =
   assert.throws(() => validateBuildPlan({
     blocks: [{ target: [9, 0, 1], support: [9, -1, 1], itemId: "minecraft:stone" }],
   }), /outside the build bounds/);
-  assert.throws(() => validateBuildPlan({
+  // #35: the salvage validator now repairs a sideways support reference for a
+  // floor-mounted block to the block below instead of rejecting the whole plan.
+  const salvaged = validateBuildPlan({
     blocks: [
       { target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:stone" },
       { target: [1, 0, 1], support: [0, 0, 1], itemId: "minecraft:redstone" },
     ],
-  }), /requires support directly below/);
+  });
+  assert.deepEqual(salvaged.blocks[1].support, [1, -1, 1]);
+  assert.equal(salvaged.salvage.repairedSupports, 1);
+  assert.deepEqual(salvaged.salvage.dropped, []);
 });
 
 test("executes custom plans through player placement with journaled rollback and undo", () => {
@@ -2140,6 +2295,49 @@ test("returns a typed build action without waiting for retrieval", async () => {
   assert.deepEqual(result.sources, []);
 });
 
+test("bare, wanted, and misspelled child build phrasings get real offline actions", async () => {
+  // #35: "make a <noun>", "i want a <noun>", and misspelled build verbs must
+  // register as build requests instead of falling to offline mode with no
+  // action and no plan.
+  const phrasings = [
+    { question: "make a couch", noun: /couch/i },
+    { question: "make a giant rainbow", noun: /giant rainbow/i },
+    { question: "i want a rainbow bridge", noun: /bridge/i },
+    { question: "bild me a castle", noun: /castle/i },
+    { question: "buld a tower", noun: /tower/i },
+    { question: "mke a house", noun: /house/i },
+  ];
+  for (const { question, noun } of phrasings) {
+    const offline = createWizard({ corpus: { search: () => [] }, env: {}, logger: { warn() {} } });
+    const result = await offline.ask({ player: "PhrasingKid", question });
+    assert.ok(result.action, `${question} produced no action (mode=${result.mode})`);
+    assert.equal(result.action.type, "build_structure", question);
+    assert.doesNotMatch(result.action.plan.title || "", /^(?:First pass|Progress \d+)\b/, question);
+    assert.doesNotMatch(result.answer, /don’t have a safe executable change yet/i, question);
+    assert.match(result.answer, noun, question);
+  }
+});
+
+test("widened build phrasing never swallows world requests, deliveries, or conversation", async () => {
+  // #35 negative space for the widened detection: world requests stay world
+  // requests, item deliveries stay deliveries, and non-buildable nouns stay
+  // ordinary conversation.
+  const offline = () => createWizard({ corpus: { search: () => [] }, env: {}, logger: { warn() {} } });
+  const rain = await offline().ask({ player: "WeatherKid", question: "make it rain" });
+  assert.equal(rain.action?.type, "world_control");
+  assert.equal(rain.action.weather, "rain");
+  const day = await offline().ask({ player: "WeatherKid", question: "make it daytime" });
+  assert.equal(day.action?.type, "world_control");
+  assert.equal(day.action.time, "day");
+  const wish = await offline().ask({ player: "WishKid", question: "make a wish" });
+  assert.equal(wish.action, null);
+  const sword = await offline().ask({ player: "GiftKid", question: "give me a diamond sword" });
+  assert.equal(sword.action?.type, "give_items");
+  assert.deepEqual(sword.action.items, [{ itemId: "minecraft:diamond_sword", amount: 1 }]);
+  const wantedSword = await offline().ask({ player: "GiftKid", question: "i want a diamond sword" });
+  assert.notEqual(wantedSword.action?.type, "build_structure");
+});
+
 test("never dumps retrieved documentation when the model is unavailable", async () => {
   const commandWizard = createWizard({
     env: {},
@@ -2158,7 +2356,11 @@ test("never dumps retrieved documentation when the model is unavailable", async 
   const result = await commandWizard.ask({ question: "How do I clone a building with command blocks?" });
   assert.doesNotMatch(result.answer, /\/clone command copies blocks/i);
   assert.doesNotMatch(result.answer, /notes|sources|documentation|corpus/i);
-  assert.match(result.answer, /project active|concrete next move/i);
+  // #35: with no active project the offline tail no longer pretends a project
+  // exists; command-bearing source text stays unextracted and the wizard
+  // admits the gap while pointing at real capabilities.
+  assert.match(result.answer, /spellbook has nothing on that yet/i);
+  assert.match(result.answer, /redstone|demo|statue/i);
 });
 
 test("never relays a malformed provider fragment to a child", async () => {
@@ -2242,7 +2444,9 @@ test("uses the OpenAI Responses adapter without giving the model build authority
   const result = await modelWizard.ask({ player: "BuilderKid", question: "What powers redstone dust?" });
   assert.equal(request.url, "https://api.example/v1/responses");
   assert.equal(request.body.store, false);
-  assert.equal(request.body.max_output_tokens, 260);
+  // #35: non-planning wizard turns now default to 900 output tokens so grounded
+  // answers stop truncating mid-sentence (was 260).
+  assert.equal(request.body.max_output_tokens, 900);
   assert.equal(request.body.model, "test-model");
   assert.match(request.body.instructions, /well-established, stable Minecraft gameplay facts/);
   assert.doesNotMatch(request.body.instructions, /Use only the supplied/);
@@ -2812,4 +3016,600 @@ test("serves a loopback admin desk and sends console text without a shell", asyn
   assert.match(localBridgeScript, /browser-originated requests are not allowed/);
   assert.match(installPackScript, /chmod\(secretsFile, 0o600\)/);
   assert.match(await readFile(new URL("../scripts/admin-service.mjs", import.meta.url), "utf8"), /function adminPids\(\)/);
+});
+
+// #35 WP7: budgets, timeouts, consultation gate, and softened acceptance.
+
+test("providerTimeoutMs defaults to bridge-safe floors but honors explicit configuration", () => {
+  // #35 review: the 60/75s floors are local-bridge defaults for an
+  // unconfigured AI_TIMEOUT_MS (scripts/local-ai-bridge.mjs:13,29-76).
+  assert.equal(providerTimeoutMs({}, false), 60_000);
+  assert.equal(providerTimeoutMs({}, true), 75_000);
+  assert.equal(providerTimeoutMs({ AI_TIMEOUT_MS: "not-a-number" }, true), 75_000);
+  assert.equal(providerTimeoutMs({ AI_TIMEOUT_MS: "0" }, false), 60_000);
+  assert.equal(providerTimeoutMs({ AI_TIMEOUT_MS: "90000" }, false), 90_000);
+  assert.equal(providerTimeoutMs({ AI_TIMEOUT_MS: "90000" }, true), 90_000);
+  // the [1s, 120s] clamp still applies to explicit values
+  assert.equal(providerTimeoutMs({ AI_TIMEOUT_MS: "500000" }, true), 120_000);
+  assert.equal(providerTimeoutMs({ AI_TIMEOUT_MS: "10" }, false), 1_000);
+  // #35 review: an explicitly configured low timeout is respected — fast
+  // remote providers, tests, and ops must be able to undercut the bridge
+  // floor instead of blocking every child-facing turn for 60-75s.
+  assert.equal(providerTimeoutMs({ AI_TIMEOUT_MS: "5000" }, false), 5_000);
+  assert.equal(providerTimeoutMs({ AI_TIMEOUT_MS: "5000" }, true), 5_000);
+});
+
+test("descriptor residue consults the model and an accepted enhanced plan replaces the default bridge", async () => {
+  const rainbowPlan = {
+    title: "Rainbow Bridge", kind: "rainbow bridge",
+    dimensions: { width: 5, depth: 15, height: 4 },
+    materials: { primary: "minecraft:red_concrete", accent: "minecraft:yellow_concrete", roof: "minecraft:blue_concrete" },
+    features: ["rainbow", "walkway", "railings"],
+    phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:red_concrete", from: [0, 0, 0], to: [4, 0, 14] },
+      { shape: "box", phase: "shell", blockId: "minecraft:orange_concrete", from: [0, 1, 0], to: [0, 2, 14] },
+      { shape: "box", phase: "shell", blockId: "minecraft:yellow_concrete", from: [4, 1, 0], to: [4, 2, 14] },
+      { shape: "box", phase: "details", blockId: "minecraft:blue_concrete", from: [1, 3, 0], to: [3, 3, 14] },
+    ],
+  };
+  let calls = 0;
+  const rainbowWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "A rainbow bridge, coming right up.",
+        action: { type: "build_structure", version: 1, plan: rainbowPlan },
+        goal: { objective: "Build a rainbow bridge", successCriteria: "A colorful bridge exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await rainbowWizard.ask({ player: "RainbowBridgeKid", question: "Build me a rainbow bridge" });
+  assert.equal(calls, 1);
+  assert.equal(result.action.plan.kind, "rainbow bridge");
+  assert.equal(result.action.plan.title, "Rainbow Bridge");
+  assert.equal(result.goal.status, "active");
+});
+
+test("non-build phrasing gets at least the 900-token wizard answer budget", async () => {
+  let body;
+  const clubWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async (_url, options) => {
+      body = JSON.parse(options.body);
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "A clubhouse sounds fun. Let me plan one with you.", action: null,
+      }) } }] }), { status: 200 });
+    },
+  });
+  await clubWizard.ask({ player: "ClubKid", question: "Can I have a little clubhouse?" });
+  assert.ok(body.max_tokens >= 900, `expected >= 900, got ${body.max_tokens}`);
+});
+
+test("general mode keeps its own budgets", async () => {
+  let body;
+  const generalWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async (_url, options) => {
+      body = JSON.parse(options.body);
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        title: "Cloud Story", answer: "A complete story with a final sentence.",
+      }) } }] }), { status: 200 });
+    },
+  });
+  await generalWizard.ask({ player: "GenKid", question: "write a story about clouds", mode: "general" });
+  assert.equal(body.max_tokens, 1_200);
+});
+
+test("synonym-tolerant kind matching accepts a puppy plan for a pet dog request", async () => {
+  const puppyPlan = {
+    title: "Blocky Puppy", kind: "puppy",
+    dimensions: { width: 7, depth: 9, height: 6 },
+    materials: { primary: "minecraft:brown_mushroom_block", accent: "minecraft:white_concrete", roof: "minecraft:brown_mushroom_block" },
+    features: [], phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:brown_mushroom_block", from: [1, 0, 1], to: [5, 0, 7] },
+      { shape: "box", phase: "shell", blockId: "minecraft:brown_mushroom_block", from: [1, 1, 1], to: [5, 3, 7] },
+      { shape: "box", phase: "roof", blockId: "minecraft:brown_mushroom_block", from: [2, 4, 6], to: [4, 5, 8] },
+      { shape: "box", phase: "details", blockId: "minecraft:white_concrete", from: [2, 4, 8], to: [4, 4, 8] },
+    ],
+  };
+  let calls = 0;
+  const puppyWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "One loyal blocky puppy.",
+        action: { type: "build_structure", version: 1, plan: puppyPlan },
+        goal: { objective: "Build a pet dog", successCriteria: "A dog statue exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await puppyWizard.ask({ player: "PetDogKid", question: "Build me a pet dog" });
+  assert.equal(calls, 1);
+  assert.equal(result.action.plan.kind, "puppy");
+  assert.equal(result.goal.status, "active");
+});
+
+// #35 review: the pack's generated-structure builder only accepts canonical
+// kinds ("house", "castle", ...). A primitive-less plan whose kind is a
+// synonym the brain accepted ("cottage") must be folded to the canonical kind
+// before shipping, or the pack deterministically throws on an action the
+// brain certified.
+test("an accepted primitive-less synonym kind is canonicalized before shipping to the pack", async () => {
+  const cottagePlan = {
+    title: "Cozy Cottage", kind: "cottage",
+    dimensions: { width: 9, depth: 9, height: 5 },
+    materials: { primary: "minecraft:oak_planks", accent: "minecraft:spruce_planks", roof: "minecraft:dark_oak_planks" },
+    features: ["door", "windows", "roof"], phases: ["foundation", "shell", "roof", "details"],
+  };
+  let calls = 0;
+  const cottageWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "A cozy cottage coming up.",
+        action: { type: "build_structure", version: 1, plan: cottagePlan },
+        goal: { objective: "Build a cozy cottage", successCriteria: "A cottage exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await cottageWizard.ask({ player: "CottageKid", question: "build me a cozy cottage" });
+  assert.equal(calls, 1);
+  // the pack's literal GENERATED_STRUCTURE_KINDS check only knows "house"
+  assert.equal(result.action.plan.kind, "house");
+  assert.equal(result.action.plan.title, "Cozy Cottage");
+  assert.equal(result.goal.status, "active");
+});
+
+test("primitive-less subject drift is still rejected, never canonicalized into acceptance", async () => {
+  // negative: canonicalization runs only after kind matching accepted the
+  // plan; a drifted "dragon" plan for a cottage request keeps its hard line
+  // and the deterministic house ladder answers instead.
+  const dragonPlan = {
+    title: "Wrong Dragon", kind: "dragon",
+    dimensions: { width: 9, depth: 9, height: 5 },
+    materials: { primary: "minecraft:oak_planks", accent: "minecraft:spruce_planks", roof: "minecraft:dark_oak_planks" },
+    features: ["door", "windows", "roof"], phases: ["foundation", "shell", "roof", "details"],
+  };
+  const driftWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "A dragon it is.",
+      action: { type: "build_structure", version: 1, plan: dragonPlan },
+      goal: { objective: "Build a cottage", successCriteria: "It exists", status: "active" },
+    }) } }] }), { status: 200 }),
+  });
+  const result = await driftWizard.ask({ player: "DriftCottageKid", question: "build me a cozy cottage" });
+  assert.notEqual(result.action?.plan?.kind, "dragon");
+  assert.equal(result.action.plan.kind, "house");
+});
+
+// #35 review: non-build requests with trailing phrases ("make a snack for
+// us", "make a wish come true") must stay conversational — the head noun is
+// the phrase subject, never the last trailing word.
+test("trailing phrases never turn non-buildable make requests into builds", async () => {
+  for (const question of ["can you make a snack for us", "make a wish come true", "make us a snack please"]) {
+    const conversational = createWizard({ corpus: { search: () => [] }, env: {} });
+    const result = await conversational.ask({ player: "SnackKid", question });
+    assert.equal(result.action, null, `${question} produced ${JSON.stringify(result.action?.plan?.title || result.action?.type)}`);
+  }
+  // positive: real buildable subjects with trailing phrases still build
+  const builder = createWizard({ corpus: { search: () => [] }, env: {} });
+  const doghouse = await builder.ask({ player: "DogHouseKid", question: "make a house for my dog" });
+  assert.equal(doghouse.action?.type, "build_structure");
+  assert.equal(doghouse.action.plan.kind, "house");
+  const dog = await createWizard({ corpus: { search: () => [] }, env: {} })
+    .ask({ player: "MakeDogKid", question: "make a dog" });
+  assert.equal(dog.action?.type, "build_structure");
+  assert.equal(dog.action.plan.kind, "dog");
+});
+
+test("the second repair round succeeds after two distinct violation lists", async () => {
+  const duckPlan = (title, kind, dimensions, primitives) => ({
+    title, kind, dimensions,
+    materials: { primary: "minecraft:yellow_concrete", accent: "minecraft:orange_concrete", roof: "minecraft:yellow_concrete" },
+    features: [], phases: ["foundation", "shell", "roof", "details"], primitives,
+  });
+  const fullBody = [
+    { shape: "box", phase: "foundation", blockId: "minecraft:yellow_concrete", from: [0, 0, 0], to: [8, 0, 8] },
+    { shape: "box", phase: "shell", blockId: "minecraft:yellow_concrete", from: [0, 1, 0], to: [8, 2, 8] },
+    { shape: "box", phase: "roof", blockId: "minecraft:yellow_concrete", from: [2, 3, 6], to: [6, 5, 8] },
+    { shape: "box", phase: "details", blockId: "minecraft:orange_concrete", from: [3, 3, 8], to: [5, 4, 8] },
+  ];
+  const undersized = duckPlan("Small Duck", "rubber duck", { width: 7, depth: 7, height: 5 }, [
+    { shape: "box", phase: "foundation", blockId: "minecraft:yellow_concrete", from: [0, 0, 0], to: [6, 0, 6] },
+    { shape: "box", phase: "shell", blockId: "minecraft:yellow_concrete", from: [0, 1, 0], to: [6, 2, 6] },
+    { shape: "box", phase: "roof", blockId: "minecraft:yellow_concrete", from: [2, 3, 4], to: [4, 4, 6] },
+    { shape: "box", phase: "details", blockId: "minecraft:orange_concrete", from: [3, 3, 6], to: [3, 3, 6] },
+  ]);
+  const wrongKind = duckPlan("Wrong House", "house", { width: 9, depth: 9, height: 6 }, fullBody);
+  const complete = duckPlan("Golden Rubber Duck", "rubber duck", { width: 9, depth: 9, height: 6 }, fullBody);
+  let calls = 0;
+  const prompts = [];
+  const repairWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async (_url, options) => {
+      prompts.push(JSON.parse(options.body).messages[1].content);
+      calls += 1;
+      const plan = calls === 1 ? undersized : calls === 2 ? wrongKind : complete;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "Building the duck now.",
+        action: { type: "build_structure", version: 1, plan },
+        goal: { objective: "Build a rubber duck", successCriteria: "A duck exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await repairWizard.ask({ player: "DuckRepairKid", question: "Build me a 9x9x6 rubber duck" });
+  assert.equal(calls, 3);
+  assert.equal(result.action.plan.title, "Golden Rubber Duck");
+  assert.equal(result.action.plan.kind, "rubber duck");
+  assert.deepEqual(result.action.plan.dimensions, { width: 9, height: 6, depth: 9 });
+  // each repair round carried its own full violation list to the model
+  assert.match(prompts[1], /dimensions were 7x7x5/);
+  assert.match(prompts[2], /plan kind was house/);
+  assert.equal(result.goal.status, "active");
+});
+
+// #35 review: repair rounds alone can stack 75s consults into minutes of dead
+// air. A cumulative wall-clock budget (MC_WIZARD_REPAIR_BUDGET_MS, default
+// 90s) stops repairing and lets the guaranteed procedural floor fire.
+test("an exhausted repair time budget engages the procedural floor instead of more rounds", async () => {
+  const housePlan = {
+    title: "Wrong House", kind: "house",
+    dimensions: { width: 9, depth: 9, height: 6 },
+    materials: { primary: "minecraft:yellow_concrete", accent: "minecraft:orange_concrete", roof: "minecraft:yellow_concrete" },
+    features: [], phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:yellow_concrete", from: [0, 0, 0], to: [8, 0, 8] },
+      { shape: "box", phase: "shell", blockId: "minecraft:yellow_concrete", from: [0, 1, 0], to: [8, 2, 8] },
+      { shape: "box", phase: "roof", blockId: "minecraft:yellow_concrete", from: [2, 3, 6], to: [6, 5, 8] },
+      { shape: "box", phase: "details", blockId: "minecraft:orange_concrete", from: [3, 3, 8], to: [5, 4, 8] },
+    ],
+  };
+  let calls = 0;
+  const slowWizard = createWizard({
+    corpus: { search: () => [] },
+    env: {
+      AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat",
+      MC_WIZARD_REPAIR_ROUNDS: "4", MC_WIZARD_REPAIR_BUDGET_MS: "1",
+    },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "A house it is.",
+        action: { type: "build_structure", version: 1, plan: housePlan },
+        goal: { objective: "Build something", successCriteria: "It exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await slowWizard.ask({ player: "BudgetKid", question: "Build a dragon" });
+  // initial consult plus at most one repair round before the budget fires —
+  // never the 5 consults the round cap alone would allow
+  assert.ok(calls >= 1 && calls <= 2, `expected 1-2 provider calls, got ${calls}`);
+  assert.equal(result.mode, "local-structure-fallback");
+  assert.equal(result.action.plan.kind, "dragon");
+  assert.equal(result.goal.status, "active");
+});
+
+// #35 review: salvage validators throw {"dropped":[...],"warnings":[...]}
+// objects and long lists; the 240-char rejection cap cut them mid-entry. The
+// full violation set (2000-char budget) must reach every repair prompt.
+test("object-shaped salvage violation lists reach the repair prompt in full", async () => {
+  const badPrimitives = Array.from({ length: 10 }, (_, index) => ({
+    shape: "box", phase: "nonsense", blockId: "minecraft:stone", from: [0, 0, index], to: [1, 1, index],
+  }));
+  const invalidPlan = {
+    title: "Broken Dragon", kind: "dragon",
+    dimensions: { width: 9, depth: 9, height: 6 },
+    materials: { primary: "minecraft:stone", accent: "minecraft:stone", roof: "minecraft:stone" },
+    features: ["supports"], phases: ["foundation", "shell", "roof", "details"],
+    primitives: badPrimitives,
+  };
+  const { wizardActionRejection } = await import("../src/skills.mjs");
+  const rejection = wizardActionRejection({ type: "build_structure", version: 1, plan: invalidPlan });
+  // the whole object-shaped list survives the raised cap (was 240 chars)
+  assert.ok(rejection.length > 500, `rejection truncated to ${rejection.length} chars`);
+  assert.match(rejection, /"dropped"/);
+  assert.match(rejection, /"index":9/);
+
+  const prompts = [];
+  let calls = 0;
+  const goodPlan = {
+    ...invalidPlan,
+    title: "Emerald Dragon",
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:stone", from: [0, 0, 0], to: [8, 0, 8] },
+      { shape: "box", phase: "shell", blockId: "minecraft:stone", from: [0, 1, 0], to: [8, 2, 8] },
+      { shape: "box", phase: "roof", blockId: "minecraft:stone", from: [2, 3, 6], to: [6, 5, 8] },
+      { shape: "box", phase: "details", blockId: "minecraft:stone", from: [3, 3, 8], to: [5, 4, 8] },
+    ],
+  };
+  const salvageWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async (_url, options) => {
+      prompts.push(JSON.parse(options.body).messages[1].content);
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "Building the dragon now.",
+        action: { type: "build_structure", version: 1, plan: calls === 1 ? invalidPlan : goodPlan },
+        goal: { objective: "Build a dragon", successCriteria: "A dragon exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await salvageWizard.ask({ player: "SalvageListKid", question: "Build a dragon" });
+  assert.equal(result.action.plan.title, "Emerald Dragon");
+  // the repair prompt names violations from deep in the list, past the old
+  // 240-char horizon, parsed from the object shape into per-entry lines
+  assert.match(prompts[1], /primitives\[9\]\.phase is unsupported/);
+});
+
+test("subject drift is never salvaged: a house plan for a dragon request is rejected", async () => {
+  const housePlan = {
+    title: "Wrong House", kind: "house",
+    dimensions: { width: 9, depth: 9, height: 6 },
+    materials: { primary: "minecraft:yellow_concrete", accent: "minecraft:orange_concrete", roof: "minecraft:yellow_concrete" },
+    features: [], phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:yellow_concrete", from: [0, 0, 0], to: [8, 0, 8] },
+      { shape: "box", phase: "shell", blockId: "minecraft:yellow_concrete", from: [0, 1, 0], to: [8, 2, 8] },
+      { shape: "box", phase: "roof", blockId: "minecraft:yellow_concrete", from: [2, 3, 6], to: [6, 5, 8] },
+      { shape: "box", phase: "details", blockId: "minecraft:orange_concrete", from: [3, 3, 8], to: [5, 4, 8] },
+    ],
+  };
+  let calls = 0;
+  const driftWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "A house it is.",
+        action: { type: "build_structure", version: 1, plan: housePlan },
+        goal: { objective: "Build something", successCriteria: "It exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await driftWizard.ask({ player: "DragonKid", question: "Build a dragon" });
+  // consult + two bounded repair rounds all rejected the house
+  assert.equal(calls, 3);
+  assert.notEqual(result.action?.plan?.kind, "house");
+  assert.equal(result.action.plan.kind, "dragon");
+});
+
+test("zero-residue canned asks and greetings never consult the provider", async () => {
+  let calls = 0;
+  const spyWizard = createWizard({
+    corpus,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      throw new Error("provider must not be consulted");
+    },
+  });
+  const flipFlop = await spyWizard.ask({ player: "CannedKid", question: "build a t flip flop" });
+  assert.equal(calls, 0);
+  assert.equal(flipFlop.action.id, "copper_bulb_t_flip_flop");
+  // #35 review: politeness filler and recipient phrases are not descriptors —
+  // they must never turn an instant canned build into a 60-75s provider wait.
+  const polite = await spyWizard.ask({ player: "CannedKid3", question: "build a t flip flop pls" });
+  assert.equal(calls, 0);
+  assert.equal(polite.action.id, "copper_bulb_t_flip_flop");
+  const gifted = await spyWizard.ask({ player: "CannedKid4", question: "build a castle for my friend steve" });
+  assert.equal(calls, 0);
+  assert.equal(gifted.action.plan.kind, "castle");
+  const greeting = await spyWizard.ask({ player: "CannedKid2", question: "hi wizard" });
+  assert.equal(calls, 0);
+  assert.equal(greeting.action, null);
+  assert.match(greeting.answer, /what should we build|right here/i);
+});
+
+test("a real style descriptor still consults the model before the canned template", async () => {
+  // #35 review negative: "spooky" is a genuine descriptor the canned ladder
+  // never matched — consultation must still happen, with the canned blueprint
+  // standing behind as the safe fallback when the provider is down.
+  let calls = 0;
+  const spyWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      throw new Error("provider down");
+    },
+  });
+  const spooky = await spyWizard.ask({ player: "SpookyKid", question: "build a spooky t flip flop" });
+  assert.equal(calls, 1);
+  assert.equal(spooky.action.id, "copper_bulb_t_flip_flop");
+});
+
+// #35 WP7 part 2: procedural floor, learned-recipe reuse, and gate telemetry.
+
+test("offline unusual builds compose a complete procedural silhouette", async () => {
+  const offlineWizard = createWizard({ corpus: { search: () => [] }, env: {} });
+  const result = await offlineWizard.ask({ player: "ProceduralDogKid", question: "build me a dog" });
+  assert.equal(result.action.type, "build_structure");
+  assert.doesNotMatch(result.action.plan.title, /^(?:First pass|Progress \d+)/);
+  assert.match(result.action.plan.title, /^Blocky dog/);
+  assert.equal(result.action.plan.kind, "dog");
+  assert.ok(result.action.plan.primitives.length >= 8);
+  assert.equal(result.mode, "local-structure-fallback");
+  assert.equal(result.goal.status, "active");
+  const validated = validateBuildStructurePlan(result.action.plan);
+  assert.deepEqual(validated.salvage, { warnings: [], dropped: [] });
+  assert.match(result.answer, /sculpted my best.*blocky dog/i);
+  assert.match(result.answer, /give it a grade|tell me what to change/i);
+});
+
+test("a goal-verified graded recipe replays for a synonym request with zero provider calls", async () => {
+  const { createMemoryLearnedRecipeStore } = await import("../src/learned-recipes.mjs");
+  const recipes = createMemoryLearnedRecipeStore();
+  const sessions = createMemorySessionStore();
+  const teacher = createWizard({ corpus: { search: () => [] }, sessions, recipes, env: {}, logger: { warn() {} } });
+  const first = await teacher.ask({ player: "DogTeacherKid", question: "build me a dog" });
+  assert.match(first.action.plan.title, /^Blocky dog/);
+  const plan = first.action.plan;
+  const outcome = await teacher.recordActionResult({
+    player: "DogTeacherKid", requestId: first.requestId, status: "completed", detail: "placed",
+    context: {
+      dimension: "minecraft:overworld", buildState: "idle",
+      lastStructure: {
+        kind: plan.kind, title: plan.title, dimensions: plan.dimensions,
+        materials: plan.materials, features: plan.features, primitives: plan.primitives,
+        relativeOrigin: { x: 2, y: 0, z: 2 },
+      },
+    },
+  });
+  assert.equal(outcome.review.goal.status, "complete");
+  const feedback = await teacher.recordFeedback({
+    player: "DogTeacherKid", requestId: first.requestId, grade: 5,
+  });
+  assert.equal(feedback.learned, true);
+  assert.equal((await recipes.findBest("make me a puppy")).entry.tier, "verified");
+
+  let calls = 0;
+  const replayWizard = createWizard({
+    corpus: { search: () => [] }, recipes,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      throw new Error("the learned recipe must not consult the provider");
+    },
+  });
+  const replay = await replayWizard.ask({ player: "PuppyKid", question: "make me a puppy" });
+  assert.equal(calls, 0);
+  assert.equal(replay.mode, "learned-recipe");
+  assert.deepEqual(replay.action, first.action);
+});
+
+test("a provisional recipe substitutes for the corner guide but is never silently replayed", async () => {
+  const { createMemoryLearnedRecipeStore } = await import("../src/learned-recipes.mjs");
+  const recipes = createMemoryLearnedRecipeStore();
+  const sessions = createMemorySessionStore();
+  const teacher = createWizard({ corpus: { search: () => [] }, sessions, recipes, env: {}, logger: { warn() {} } });
+  const first = await teacher.ask({ player: "ProvisionalTeacher", question: "build me a dog" });
+  await sessions.updateAction("ProvisionalTeacher", "wizard", {
+    requestId: first.requestId, status: "completed", detail: "placed without goal verification",
+  });
+  const feedback = await teacher.recordFeedback({
+    player: "ProvisionalTeacher", requestId: first.requestId, grade: 4,
+  });
+  assert.equal(feedback.learned, true);
+  assert.equal((await recipes.findBest("build me a dog")).entry.tier, "provisional");
+
+  let calls = 0;
+  const offlineReuse = createWizard({
+    corpus: { search: () => [] }, recipes,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      throw new Error("provider offline");
+    },
+  });
+  const reused = await offlineReuse.ask({ player: "ProvisionalReuser", question: "build me a dog" });
+  // provisional entries still consult the provider, then stand in for the
+  // corner-guide fallback when the provider cannot answer
+  assert.ok(calls >= 1);
+  assert.equal(reused.mode, "learned-recipe-provisional");
+  assert.deepEqual(reused.action, first.action);
+});
+
+test("a provider action failing intent-match records gate telemetry and accepted plans carry none", async () => {
+  const housePlan = {
+    title: "Wrong House", kind: "house",
+    dimensions: { width: 9, depth: 9, height: 6 },
+    materials: { primary: "minecraft:yellow_concrete", accent: "minecraft:orange_concrete", roof: "minecraft:yellow_concrete" },
+    features: [], phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:yellow_concrete", from: [0, 0, 0], to: [8, 0, 8] },
+      { shape: "box", phase: "shell", blockId: "minecraft:yellow_concrete", from: [0, 1, 0], to: [8, 2, 8] },
+      { shape: "box", phase: "roof", blockId: "minecraft:yellow_concrete", from: [2, 3, 6], to: [6, 5, 8] },
+      { shape: "box", phase: "details", blockId: "minecraft:orange_concrete", from: [3, 3, 8], to: [5, 4, 8] },
+    ],
+  };
+  const driftWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "A house it is.",
+      action: { type: "build_structure", version: 1, plan: housePlan },
+      goal: { objective: "Build a dragon", successCriteria: "A dragon exists", status: "active" },
+    }) } }] }), { status: 200 }),
+  });
+  const rejected = await driftWizard.ask({ player: "TelemetryKid", question: "Build a dragon" });
+  assert.equal(rejected.telemetry.providerConsulted, true);
+  assert.ok(rejected.telemetry.rejections.some(({ gate }) => gate === "intent-match"));
+  assert.ok(rejected.telemetry.rejections.every(({ reason }) => reason.length <= 200));
+
+  const dragonWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "One dragon, rising now.",
+      action: { type: "build_structure", version: 1, plan: { ...housePlan, title: "Emerald Dragon", kind: "dragon" } },
+      goal: { objective: "Build a dragon", successCriteria: "A dragon exists", status: "active" },
+    }) } }] }), { status: 200 }),
+  });
+  const accepted = await dragonWizard.ask({ player: "AcceptedTelemetryKid", question: "Build a dragon" });
+  assert.equal(accepted.action.plan.kind, "dragon");
+  assert.equal(accepted.telemetry.providerConsulted, true);
+  // accepted actions carry no rejections key
+  assert.equal(accepted.telemetry.rejections, undefined);
+  const offline = await createWizard({ corpus: { search: () => [] }, env: {} })
+    .ask({ player: "OfflineTelemetryKid", question: "hi wizard" });
+  assert.equal(offline.telemetry.providerConsulted, false);
+  assert.equal(offline.telemetry.rejections, undefined);
+});
+
+test("a researched plan smuggling world.command is still rejected and logged", async () => {
+  let calls = 0;
+  const smugglingWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => {
+      calls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "I researched the couch and I am building it now.",
+        action: { type: "execute_program", version: 1, program: {
+          title: "Couch via commands",
+          steps: [{ id: "cheat", capability: "world.command", arguments: { commands: ["fill 0 0 0 9 9 9 minecraft:tnt"] }, expect: "The couch appears" }],
+        } },
+        goal: { objective: "Build a couch", successCriteria: "A couch exists", status: "active" },
+      }) } }] }), { status: 200 });
+    },
+  });
+  const result = await smugglingWizard.ask({ player: "SmuggleKid", question: "research and build me a couch" });
+  assert.ok(calls >= 1);
+  assert.doesNotMatch(JSON.stringify(result.action), /world\.command|server\.console|minecraft:tnt/);
+  assert.ok(result.action, "the rejected research plan must still make safe build progress");
+  assert.ok(result.telemetry.rejections.some(({ gate, reason }) => (
+    gate === "research-restriction" && /server administration|arbitrary commands/i.test(reason)
+  )));
 });
