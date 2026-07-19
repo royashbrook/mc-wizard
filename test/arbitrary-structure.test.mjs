@@ -29,37 +29,63 @@ const customPlan = {
   ],
 };
 
+// #35: the validator now salvages derivable defects (bounds, order, offsets)
+// with recorded warnings; only structurally impossible plans still throw.
 test("validates compact phased primitives inside the requested bounds", () => {
   const plan = validateBuildStructurePlan(customPlan);
   assert.equal(plan.primitives.length, 4);
+  assert.deepEqual(plan.salvage, { warnings: [], dropped: [] });
   assert.deepEqual(primitiveStructureOperations(plan), plan.primitives.map(({ phase, blockId, from, to }) => ({
     phase, blockId, from, to,
   })));
-  assert.throws(() => validateBuildStructurePlan({
+  // an out-of-bounds solid renormalizes the declared dimensions with a warning
+  const widened = validateBuildStructurePlan({
     ...customPlan,
     primitives: customPlan.primitives.map((primitive, index) => (
       index === 3 ? { ...primitive, to: [12, 7, 2] } : primitive
     )),
-  }), /outside the requested dimensions/);
-  assert.throws(() => validateBuildStructurePlan({
+  });
+  assert.equal(widened.dimensions.width, 13);
+  assert.ok(widened.salvage.warnings.some((warning) => /renormalized/.test(warning)));
+  // phase disorder is re-sorted with a warning instead of rejected
+  const reordered = validateBuildStructurePlan({
     ...customPlan,
     primitives: [customPlan.primitives[0], customPlan.primitives[2], customPlan.primitives[1], customPlan.primitives[3]],
-  }), /phase order/);
+  });
+  assert.deepEqual(reordered.primitives.map(({ phase }) => phase), ["foundation", "shell", "roof", "details"]);
+  assert.ok(reordered.salvage.warnings.some((warning) => /re-sorted into phase order/.test(warning)));
+  // a non-axis-aligned line is irreparable: it drops, and a four-primitive
+  // plan left with three entries still rejects (unsafe-limit line holds)
   assert.throws(() => validateBuildStructurePlan({
     ...customPlan,
     primitives: customPlan.primitives.map((primitive, index) => (
       index === 2 ? { ...primitive, shape: "line", from: [1, 2, 1], to: [3, 4, 1] } : primitive
     )),
-  }), /axis-aligned/);
-  assert.throws(() => validateBuildStructurePlan({
+  }), /entries after salvage/);
+  // an offset solid set is translated back to the origin with warnings
+  const shifted = validateBuildStructurePlan({
     ...customPlan,
     primitives: customPlan.primitives.map((primitive, index) => (
       index === 0 ? { ...primitive, from: [1, 0, 3], to: [10, 0, 3] } : primitive
     )),
-  }), /bounds must match/);
+  });
+  assert.equal(shifted.dimensions.width, 10);
+  assert.ok(shifted.salvage.warnings.some((warning) => /translated/.test(warning)));
+  // hard safety line: forbidden executor blocks are dropped, never repaired
+  const smuggled = validateBuildStructurePlan({
+    ...customPlan,
+    primitives: [...customPlan.primitives, {
+      shape: "box", phase: "details", blockId: "minecraft:command_block", from: [1, 1, 1], to: [1, 1, 1],
+    }],
+  });
+  assert.equal(smuggled.primitives.length, 4);
+  assert.ok(smuggled.salvage.dropped.some(({ reason }) => /not allowed/.test(reason)));
+  assert.ok(smuggled.primitives.every(({ blockId }) => blockId !== "minecraft:command_block"));
 });
 
-test("new primitive structures require solid geometry in every phase and across every bound", () => {
+// #35: an all-air plan still rejects (nothing to build), but air-padded bounds
+// and phase gaps are salvaged with warnings instead of rejected outright.
+test("new primitive structures require solid geometry while air-padding is salvaged", () => {
   const allAir = [
     { shape: "box", phase: "foundation", blockId: "minecraft:air", from: [0, 0, 0], to: [11, 0, 7] },
     { shape: "box", phase: "shell", blockId: "minecraft:air", from: [0, 1, 0], to: [0, 8, 7] },
@@ -68,23 +94,27 @@ test("new primitive structures require solid geometry in every phase and across 
   ];
   assert.throws(() => validateBuildStructurePlan({ ...customPlan, primitives: allAir }), /solid primitives must include/);
 
+  // air cannot stretch the declared bounds: solids renormalize the dimensions
+  // and the air padding is clamped inside them
   const airOnlyBounds = [
     { ...customPlan.primitives[0], from: [1, 0, 3], to: [10, 0, 3] },
     ...customPlan.primitives.slice(1),
     { shape: "box", phase: "details", blockId: "minecraft:air", from: [0, 0, 0], to: [11, 9, 7] },
   ];
-  assert.throws(
-    () => validateBuildStructurePlan({ ...customPlan, primitives: airOnlyBounds }),
-    /solid primitive bounds must match/,
-  );
+  const airPadded = validateBuildStructurePlan({ ...customPlan, primitives: airOnlyBounds });
+  assert.equal(airPadded.dimensions.width, 10);
+  assert.ok(airPadded.salvage.warnings.length >= 1);
+  assert.ok(airPadded.primitives.every(({ from, to }) => (
+    from.every((coordinate) => coordinate >= 0)
+    && to[0] < airPadded.dimensions.width && to[1] < airPadded.dimensions.height && to[2] < airPadded.dimensions.depth
+  )));
 
+  // a phase left without solids is re-binned by height with a warning
   const airOnlyRoof = customPlan.primitives.map((primitive) => (
     primitive.phase === "roof" ? { ...primitive, blockId: "minecraft:air" } : primitive
   ));
-  assert.throws(
-    () => validateBuildStructurePlan({ ...customPlan, primitives: airOnlyRoof }),
-    /solid primitives must include/,
-  );
+  const rebinned = validateBuildStructurePlan({ ...customPlan, primitives: airOnlyRoof });
+  assert.ok(rebinned.salvage.warnings.some((warning) => /re-binned into build phases by height/.test(warning)));
 });
 
 test("validates bounded in-place structure modifications, inhabitants, and primitive-only lava", () => {
@@ -275,7 +305,7 @@ test("the structured response lets ordinary buildings omit primitives while vali
     schema.$defs[contains.$ref.split("/").at(-1)].properties.blockId.not.const === "minecraft:air"
   )));
   const pack = readFileSync(new URL("../bedrock/behavior_packs/mc_wizard/scripts/main.js", import.meta.url), "utf8");
-  assert.match(pack, /function structurePlanOperations\(plan, previousPlan\)/);
+  assert.match(pack, /function structurePlanOperations\(plan, previousPlan, \{ reconstructing = false \} = \{\}\)/);
   assert.match(pack, /sameGeneratedStructureBase\(plan, previousPlan\)/);
   assert.match(pack, /else if \(detailOnlyPatch\)/);
   assert.match(pack, /previousPrimitiveKeys\.has\(JSON\.stringify\(operation\)\)/);
@@ -318,7 +348,10 @@ test("runtime replaces an unusual provider structure that omits authored primiti
   assert.ok(result.action.plan.primitives.length >= 4);
 });
 
-test("rejects a line-only provider scaffold that only names the requested subject", async () => {
+// #35: an imperfect but subject-shaped authored plan is now accepted with a
+// caveat and an active goal (the review loop refines it) instead of being
+// replaced by a generic fallback.
+test("accepts a line-only subject scaffold with a caveat and keeps the goal active", async () => {
   const scaffold = {
     ...customPlan,
     title: "Fake Dragon", kind: "dragon statue",
@@ -338,14 +371,63 @@ test("rejects a line-only provider scaffold that only names the requested subjec
     }) } }] }), { status: 200 }),
   });
   const result = await wizard.ask({ player: "ScaffoldKid", question: "Build a 12x8x10 dragon statue" });
-  assert.equal(result.mode, "local-structure-fallback");
-  assert.notDeepEqual(result.action.plan.primitives, validateBuildStructurePlan(scaffold).primitives);
-  assert.ok(result.action.plan.primitives.some(({ shape, from, to }) => (
-    shape === "box" && from.every((coordinate, axis) => to[axis] > coordinate)
-  )));
+  assert.equal(result.mode, "chat:model");
+  assert.deepEqual(result.action.plan.primitives, validateBuildStructurePlan(scaffold).primitives);
+  assert.equal(result.goal.status, "active");
+  assert.match(result.answer, /look a little rough|keep sculpting/i);
 });
 
-test("rejects a generic full-envelope room labeled as a sculpture", async () => {
+// #35: unsafe-limit rejections stay hard — an oversized plan is never salvaged
+// into acceptance, and the child still gets a safe complete build.
+test("rejects an oversized provider plan outright and falls back safely", async () => {
+  // The fixture keeps customPlan's valid phased primitives and stretches the
+  // geometry itself past the width limit, so the ONLY defect is size — a
+  // primitive-less or malformed plan would be rejected by other gates and
+  // mask a softened bounds check.
+  const oversized = {
+    ...customPlan,
+    dimensions: { width: 500, depth: 8, height: 10 },
+    primitives: [
+      { shape: "line", phase: "foundation", blockId: "minecraft:stone", from: [0, 0, 3], to: [499, 0, 3] },
+      { shape: "box", phase: "shell", blockId: "minecraft:green_concrete", from: [4, 1, 0], to: [7, 5, 7] },
+      { shape: "line", phase: "roof", blockId: "minecraft:lime_concrete", from: [5, 6, 3], to: [5, 9, 3] },
+      { shape: "box", phase: "details", blockId: "minecraft:white_concrete", from: [5, 7, 2], to: [5, 7, 2] },
+    ],
+  };
+  // Negative control: the fixture is valid apart from its size — shrinking it
+  // back to the declared 12-wide envelope validates cleanly, while the
+  // oversized version is refused by the validator for the width limit alone.
+  assert.throws(() => validateBuildStructurePlan(oversized), /width must be an integer from 1-128/);
+  assert.doesNotThrow(() => validateBuildStructurePlan({
+    ...oversized,
+    dimensions: { width: 12, depth: 8, height: 10 },
+    primitives: [{ ...oversized.primitives[0], to: [11, 0, 3] }, ...oversized.primitives.slice(1)],
+  }));
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+      answer: "I’ll build the colossal dragon now.",
+      action: { type: "build_structure", version: 1, plan: oversized },
+    }) } }] }), { status: 200 }),
+  });
+  const result = await wizard.ask({ player: "ColossusKid", question: "Build a dragon statue" });
+  assert.notEqual(result.mode, "chat:model");
+  assert.ok(result.action, "the rejected oversized plan must still make safe build progress");
+  assert.ok(result.action.plan.dimensions.width <= 64);
+  assert.ok(result.telemetry.rejections.length >= 1);
+  // The rejection must be the size gate itself, not a side effect of a
+  // malformed fixture: the first recorded reason names the width limit, and
+  // no gate complains about missing primitives.
+  assert.match(result.telemetry.rejections[0].reason, /width must be an integer from 1-128/);
+  assert.ok(result.telemetry.rejections.every((entry) => !/no authored primitives/i.test(entry.reason)));
+});
+
+// #35: a generic full-envelope room named as the subject is accepted with a
+// caveat (its hard requirements all passed) and the goal stays active so the
+// review loop refines the rough geometry.
+test("accepts a generic full-envelope room labeled as a sculpture with a caveat", async () => {
   const fakeDuck = {
     title: "Giant Rubber Duck", kind: "giant rubber duck",
     dimensions: { width: 11, depth: 7, height: 6 },
@@ -370,9 +452,12 @@ test("rejects a generic full-envelope room labeled as a sculpture", async () => 
     }) } }] }), { status: 200 }),
   });
   const result = await wizard.ask({ player: "RoomDuckKid", question: "Build me an 11x7x6 giant rubber duck" });
-  assert.notEqual(result.mode, "chat:model");
-  assert.notDeepEqual(result.action?.plan?.primitives, validateBuildStructurePlan(fakeDuck).primitives);
+  assert.equal(result.mode, "chat:model");
+  assert.deepEqual(result.action.plan.primitives, validateBuildStructurePlan(fakeDuck).primitives);
   assert.equal(result.goal.status, "active");
+  assert.match(result.answer, /look a little rough|keep sculpting/i);
+  // accepted-with-warning is still an accepted action: no rejection telemetry
+  assert.equal(result.telemetry.rejections, undefined);
 });
 
 test("wires a bounded live scope that verifies an exact-size dragon in the world", () => {

@@ -144,6 +144,77 @@ test("logs successful action paths and measured acknowledgement-to-completion ti
   }
 });
 
+test("recordAsk logs rejection-funnel telemetry scrubbed and bounded", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-telemetry-log-"));
+  const filePath = join(directory, "interactions.jsonl");
+  try {
+    const log = createInteractionLog({ filePath, salt });
+    await log.recordAsk({
+      player: "TelemetryKid",
+      question: "build me a rainbow dragon",
+      mode: "wizard",
+      telemetry: {
+        providerConsulted: true,
+        rejections: [
+          { gate: "envelope-parse", reason: "TelemetryKid sent\u0000 a broken\nenvelope" },
+          { gate: `intent-${"g".repeat(80)}`, reason: `r${"e".repeat(400)}` },
+          ...Array.from({ length: 10 }, (unused, index) => ({ gate: "repair-failed", reason: `round ${index}` })),
+        ],
+      },
+      result: { answer: "I will try a simpler plan.", requestId: "dragon-request" },
+    });
+    await log.recordAsk({
+      player: "TelemetryKid",
+      question: "build a t flip flop",
+      mode: "wizard",
+      telemetry: { providerConsulted: false },
+      result: { answer: "Casting it now.", requestId: "canned-request" },
+    });
+    const raw = await readFile(filePath, "utf8");
+    assert.doesNotMatch(raw, /TelemetryKid/);
+    const [funnel, canned] = raw.trim().split("\n").map(JSON.parse);
+    assert.equal(funnel.providerConsulted, true);
+    assert.equal(funnel.rejections.length, 8);
+    assert.equal(funnel.rejections[0].gate, "envelope-parse");
+    assert.equal(funnel.rejections[0].reason, "[player] sent a broken envelope");
+    assert.doesNotMatch(funnel.rejections[0].reason, /[\u0000-\u001f]/);
+    assert.ok(funnel.rejections[1].gate.length <= 40);
+    assert.ok(funnel.rejections[1].reason.length <= 200);
+    assert.equal(canned.providerConsulted, false);
+    assert.equal("rejections" in canned, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("recordAsk ignores malformed telemetry shapes", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mc-wizard-telemetry-malformed-"));
+  const filePath = join(directory, "interactions.jsonl");
+  try {
+    const log = createInteractionLog({ filePath, salt });
+    await log.recordAsk({
+      player: "ShapeKid",
+      question: "hello",
+      mode: "wizard",
+      telemetry: { providerConsulted: true, rejections: "not-an-array" },
+      result: { answer: "Hello!" },
+    });
+    await log.recordAsk({
+      player: "ShapeKid",
+      question: "hello again",
+      mode: "wizard",
+      result: { answer: "Hello again!" },
+    });
+    const [stringy, absent] = (await readFile(filePath, "utf8")).trim().split("\n").map(JSON.parse);
+    assert.equal(stringy.providerConsulted, true);
+    assert.equal("rejections" in stringy, false);
+    assert.equal("providerConsulted" in absent, false);
+    assert.equal("rejections" in absent, false);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test("interaction history retains only a bounded tail of complete records", async () => {
   const directory = await mkdtemp(join(tmpdir(), "mc-wizard-interaction-bound-"));
   const filePath = join(directory, "interactions.jsonl");

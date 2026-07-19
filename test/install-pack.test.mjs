@@ -25,13 +25,17 @@ before(async () => {
     JSON.stringify({ mc_wizard_url: "http://192.168.1.50:3000/v1/ask" }),
   );
   await run(process.execPath, [
-    "--env-file-if-exists=.env",
     "scripts/install-pack.mjs",
     serverRoot,
     "Family Lab",
   ], {
     cwd: repo,
-    env: { ...process.env, MC_WIZARD_LAN_IP: "", WIZARD_URL: "" },
+    env: {
+      ...process.env,
+      MC_WIZARD_LAN_IP: "",
+      WIZARD_URL: "",
+      BRIDGE_TOKEN: "test-only-bridge-token-0123456789abcdef",
+    },
   });
 });
 
@@ -59,4 +63,36 @@ test("standalone installs require and version the live Wizard appearance pack", 
   assert.match(properties, /^max-players=10$/m);
   assert.deepEqual(assignments.find((pack) => pack.pack_id === manifest.header.uuid)?.version, [0, 4, 0]);
   assert.equal(variables.mc_wizard_url, "http://192.168.1.50:3000/v1/ask");
+});
+
+test("default or short bridge tokens are refused for a non-loopback brain URL", async () => {
+  const guardedRoot = await mkdtemp(path.join(tmpdir(), "mc-wizard-install-guard-"));
+  try {
+    await mkdir(path.join(guardedRoot, "worlds", "Family Lab"), { recursive: true });
+    await mkdir(path.join(guardedRoot, "config", "4e8790fe-18dc-46d1-aa31-ec78a924b717"), { recursive: true });
+    await writeFile(path.join(guardedRoot, "server.properties"), "texturepack-required=false\nmax-players=10\n");
+    await writeFile(
+      path.join(guardedRoot, "config", "4e8790fe-18dc-46d1-aa31-ec78a924b717", "variables.json"),
+      JSON.stringify({ mc_wizard_url: "http://192.168.1.50:3000/v1/ask" }),
+    );
+    await assert.rejects(
+      run(process.execPath, [
+        "scripts/install-pack.mjs",
+        guardedRoot,
+        "Family Lab",
+      ], {
+        cwd: repo,
+        // BRIDGE_TOKEN deliberately empty: the script must fall back to its
+        // default token and refuse the non-loopback brain URL.
+        env: { ...process.env, MC_WIZARD_LAN_IP: "", WIZARD_URL: "", BRIDGE_TOKEN: "" },
+      }),
+      (error) => {
+        assert.notEqual(error.code, 0);
+        assert.match(String(error.stderr), /Refusing a default or short bridge token/);
+        return true;
+      },
+    );
+  } finally {
+    await rm(guardedRoot, { recursive: true, force: true });
+  }
 });

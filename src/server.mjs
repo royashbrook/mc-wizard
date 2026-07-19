@@ -381,8 +381,11 @@ export function validateActionResultBody(body) {
     error.status = 400;
     throw error;
   }
-  if (body.detail !== undefined && (typeof body.detail !== "string" || body.detail.length > 500)) {
-    const error = new Error("detail must be at most 500 characters");
+  // The pack slices action-result detail at 1600 characters so salvage drop
+  // records and violation lists arrive whole; the caps must match or the pack's
+  // terminal partial/failed reports are deterministically rejected with a 400.
+  if (body.detail !== undefined && (typeof body.detail !== "string" || body.detail.length > 1600)) {
+    const error = new Error("detail must be at most 1600 characters");
     error.status = 400;
     throw error;
   }
@@ -729,12 +732,14 @@ export function createHttpServer({
         question, player, playerId, mode, requestId, context,
         ...(goalId && { goalRetry: { goalId } }),
       });
+      // Gate telemetry is operator-only: log it, never send it to the pack (#35).
+      const { telemetry, ...clientResult } = result;
       if (result.mode !== "player-memory") {
         await recordInteraction(interactionLog, "recordAsk", {
-          question, player, mode, requestId, result: redactedPreferenceResult(result),
+          question, player, mode, requestId, telemetry, result: redactedPreferenceResult(clientResult),
         }, logger);
       }
-      sendJson(response, 200, result);
+      sendJson(response, 200, clientResult);
       logger.log("[mc-wizard] ask response sent; action="
         + (result.action?.id || result.action?.plan?.title || result.action?.type || "none"));
     } catch (error) {

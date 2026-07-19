@@ -270,7 +270,9 @@ export function runtimeProgramHasEvidence(steps) {
   const expectedBlocks = new Map(verifiers.flatMap(({ arguments: args }) => (
     args.blocks.map(({ target, typeId, expectedStates = {} }) => [target.join(","), { typeId, expectedStates }])
   )));
-  const blockChanges = steps.flatMap(({ capability, arguments: args }) => {
+  // Last write wins per coordinate: when a program re-mutates a target
+  // (scaffold-then-replace), only the final state needs runtime evidence.
+  const blockChanges = new Map(steps.flatMap(({ capability, arguments: args }) => {
     if (capability === "player.place-blocks") {
       return args.blocks.map(({ target, expectedType, expectedStates }) => (
         [target.join(","), { typeId: expectedType, expectedStates }]
@@ -280,8 +282,8 @@ export function runtimeProgramHasEvidence(steps) {
       return args.targets.map((target) => [target.join(","), { typeId: "minecraft:air", expectedStates: {} }]);
     }
     return [];
-  });
-  if (blockChanges.length && blockChanges.some(([target, expected]) => {
+  }));
+  if (blockChanges.size && [...blockChanges.entries()].some(([target, expected]) => {
     const observed = expectedBlocks.get(target);
     return observed?.typeId !== expected.typeId
       || Object.entries(expected.expectedStates).some(([state, value]) => observed.expectedStates?.[state] !== value);
@@ -298,6 +300,95 @@ export function runtimeProgramHasEvidence(steps) {
     "artifact.book", "player.use-item", "script.effect", "script.teleport", "server.configure", "server.console", "world.command",
   ].includes(capability));
   return mutatesWorld && (hasExplicitVerifier || selfCheckingMutation);
+}
+
+function blockExpectationFromTruth({ target, typeId, expectedStates }) {
+  return {
+    target: [...target],
+    typeId,
+    ...(Object.keys(expectedStates).length && { expectedStates: { ...expectedStates } }),
+  };
+}
+
+export function synthesizeRuntimeEvidence(steps) {
+  // Deterministic capabilities only: place/break/spawn declare their own expected
+  // outcome, so runtime evidence is derivable. world.command/server.* stay governed
+  // by the mutatesWorld/self-checking tail of runtimeProgramHasEvidence unchanged.
+  // Mutations are tracked per coordinate IN PROGRAM ORDER so verify steps stay
+  // position-correct: a verify before any mutation of its target is a
+  // precondition and must not be rewritten; a verify between two mutations
+  // expects the state as of its position; only the final state gets synthesized
+  // coverage when no verify already sits after the last mutation.
+  const mutationsByTarget = new Map();
+  const spawns = [];
+  steps.forEach(({ capability, arguments: args }, index) => {
+    const record = (target, typeId, expectedStates) => {
+      const key = target.join(",");
+      const events = mutationsByTarget.get(key) || [];
+      events.push({ index, truth: { target, typeId, expectedStates } });
+      mutationsByTarget.set(key, events);
+    };
+    if (capability === "player.place-blocks") {
+      for (const { target, expectedType, expectedStates } of args.blocks) {
+        record(target, expectedType, { ...expectedStates });
+      }
+    }
+    if (capability === "player.break-blocks") {
+      for (const target of args.targets) record(target, "minecraft:air", {});
+    }
+    if (capability === "script.spawn-entity") spawns.push(args);
+  });
+  if (!mutationsByTarget.size && !spawns.length) return steps;
+  const covered = new Set();
+  let synthesized = 0;
+  const synthStep = (capability, args) => ({
+    id: `synthesized_evidence_${++synthesized}`,
+    capability,
+    arguments: args,
+    expect: "The synthesized verification matches the mutation's declared outcome.",
+    onFailure: "replan",
+  });
+  const program = steps.map((step, stepIndex) => {
+    if (step.capability !== "verify.blocks") return step;
+    const blocks = step.arguments.blocks.map((expectation) => {
+      const key = expectation.target.join(",");
+      const events = mutationsByTarget.get(key);
+      if (!events) return expectation;
+      const prior = events.filter((event) => event.index < stepIndex);
+      // Precondition: this verify runs before any mutation of its target, so
+      // its expectation describes the pre-existing world and stays untouched.
+      if (!prior.length) return expectation;
+      // Only a verify positioned after the LAST mutation covers the final state.
+      if (prior.length === events.length) covered.add(key);
+      const truth = prior[prior.length - 1].truth;
+      const statesMatch = Object.entries(truth.expectedStates)
+        .every(([state, value]) => expectation.expectedStates?.[state] === value);
+      if (expectation.typeId === truth.typeId && statesMatch) return expectation;
+      return blockExpectationFromTruth(truth);
+    });
+    if (blocks.every((entry, index) => entry === step.arguments.blocks[index])) return step;
+    return { ...step, arguments: { blocks } };
+  });
+  const missing = [...mutationsByTarget.entries()]
+    .filter(([key]) => !covered.has(key))
+    .map(([, events]) => blockExpectationFromTruth(events[events.length - 1].truth));
+  for (let start = 0; start < missing.length; start += 400) {
+    program.push(synthStep("verify.blocks", { blocks: missing.slice(start, start + 400) }));
+  }
+  const entityChecks = program
+    .filter(({ capability }) => capability === "verify.entities")
+    .map(({ arguments: args }) => args);
+  for (const spawn of spawns) {
+    const verified = entityChecks.some((check) => (
+      check.typeId === spawn.typeId && check.minimum >= spawn.count
+        && check.location.join(",") === spawn.location.join(",")
+    ));
+    if (verified) continue;
+    const check = { typeId: spawn.typeId, location: [...spawn.location], minimum: spawn.count, maxDistance: 4 };
+    entityChecks.push(check);
+    program.push(synthStep("verify.entities", check));
+  }
+  return program;
 }
 
 export function newestProjectRecord(...records) {

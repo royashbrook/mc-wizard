@@ -86,6 +86,20 @@ export function isAllowedStructureMaterial(blockId) {
   return MATERIALS.has(blockId);
 }
 
+// Hard safety line: these are never repaired, mapped, or salvaged (#35).
+const FORBIDDEN_BLOCKS = new Set([
+  "minecraft:command_block",
+  "minecraft:repeating_command_block",
+  "minecraft:chain_command_block",
+  "minecraft:structure_block",
+  "minecraft:structure_void",
+  "minecraft:mob_spawner",
+  "minecraft:barrier",
+  "minecraft:tnt",
+]);
+
+const BLOCK_ID_PATTERN = /^minecraft:[a-z0-9_]+$/;
+
 const FEATURES = new Set([
   "floor",
   "walls",
@@ -143,69 +157,195 @@ function primitiveVolume(shape, from, to) {
     - size.map((length) => length - 2).reduce((total, length) => total * length, 1);
 }
 
-function validatePrimitives(value, dimensions, { partial = false } = {}) {
+const salvageRejection = (message, salvage) => new Error(
+  `${message}: ${JSON.stringify({ dropped: salvage.dropped, warnings: salvage.warnings })}`,
+);
+
+function rawVector(value, name) {
+  if (!Array.isArray(value) || value.length !== 3) throw new Error(`${name} must be an x,y,z vector`);
+  return value.map((coordinate) => {
+    const number = Number(coordinate);
+    if (!Number.isInteger(number)) throw new Error(`${name} must be an x,y,z vector`);
+    return number;
+  });
+}
+
+function parsePrimitive(primitive, index, dimensions, { partial, primaryMaterial, warnings }) {
+  if (!primitive || typeof primitive !== "object" || Array.isArray(primitive)) {
+    throw new Error(`primitives[${index}] must be an object`);
+  }
+  const shape = ["box", "line", "hollow_box"].includes(primitive.shape) ? primitive.shape : undefined;
+  if (!shape) throw new Error(`primitives[${index}].shape must be box, line, or hollow_box`);
+  const phaseIndex = STRUCTURE_PHASES.indexOf(primitive.phase);
+  if (phaseIndex < 0) throw new Error(`primitives[${index}].phase is unsupported`);
+  let blockId = String(primitive.blockId || "");
+  if (blockId !== "minecraft:air" && !PRIMITIVE_MATERIALS.has(blockId)) {
+    if (FORBIDDEN_BLOCKS.has(blockId) || !BLOCK_ID_PATTERN.test(blockId)) {
+      throw new Error(`primitives[${index}].blockId is not allowed`);
+    }
+    warnings.push(`primitives[${index}].blockId ${blockId} is not a known material; using ${primaryMaterial}`);
+    blockId = primaryMaterial;
+  }
+  // New plans read raw integer coordinates so the whole solid set can be
+  // renormalized to the origin later; modify patches keep the bounded margin.
+  const read = (input, name) => (partial ? vector(input, name, dimensions, 4) : rawVector(input, name));
+  const first = read(primitive.from, `primitives[${index}].from`);
+  const second = read(primitive.to, `primitives[${index}].to`);
+  const from = first.map((coordinate, axis) => Math.min(coordinate, second[axis]));
+  const to = first.map((coordinate, axis) => Math.max(coordinate, second[axis]));
+  if (shape === "line" && from.filter((coordinate, axis) => coordinate === to[axis]).length < 2) {
+    throw new Error(`primitives[${index}] line must be axis-aligned`);
+  }
+  if (shape === "hollow_box" && from.some((coordinate, axis) => to[axis] - coordinate < 2)) {
+    throw new Error(`primitives[${index}] hollow_box must be at least 3x3x3`);
+  }
+  return { index, shape, phase: primitive.phase, phaseIndex, blockId, from, to };
+}
+
+// Salvaging validator (#35): irreparable entries drop with a recorded reason,
+// derivable defects (order, bounds, unknown-but-inert materials) are repaired
+// with warnings, and only structural impossibilities reject the whole plan.
+function validatePrimitives(value, dimensions, { partial = false, primaryMaterial = "minecraft:stone" } = {}) {
   if (!Array.isArray(value) || value.length < (partial ? 1 : STRUCTURE_PHASES.length)
     || value.length > STRUCTURE_PRIMITIVE_LIMIT) {
     throw new Error(`primitives must contain ${partial ? 1 : STRUCTURE_PHASES.length}-${STRUCTURE_PRIMITIVE_LIMIT} entries`);
   }
-  const seenPhases = new Set();
-  const solidPhases = new Set();
-  let lastPhase = 0;
-  let totalVolume = 0;
-  const solidMin = [Infinity, Infinity, Infinity];
-  const solidMax = [-Infinity, -Infinity, -Infinity];
-  const primitives = value.map((primitive, index) => {
-    if (!primitive || typeof primitive !== "object" || Array.isArray(primitive)) {
-      throw new Error(`primitives[${index}] must be an object`);
+  const warnings = [];
+  const dropped = [];
+  const salvage = { warnings, dropped };
+  let entries = [];
+  let boundsClamped = false;
+  value.forEach((primitive, index) => {
+    try {
+      entries.push(parsePrimitive(primitive, index, dimensions, { partial, primaryMaterial, warnings }));
+    } catch (error) {
+      dropped.push({ index, reason: error.message });
     }
-    const shape = ["box", "line", "hollow_box"].includes(primitive.shape) ? primitive.shape : undefined;
-    if (!shape) throw new Error(`primitives[${index}].shape must be box, line, or hollow_box`);
-    const phaseIndex = STRUCTURE_PHASES.indexOf(primitive.phase);
-    if (phaseIndex < 0) throw new Error(`primitives[${index}].phase is unsupported`);
-    if (phaseIndex < lastPhase) throw new Error("primitives must stay in phase order");
-    lastPhase = phaseIndex;
-    seenPhases.add(primitive.phase);
-    const blockId = String(primitive.blockId || "");
-    if (blockId !== "minecraft:air" && !PRIMITIVE_MATERIALS.has(blockId)) {
-      throw new Error(`primitives[${index}].blockId is not allowed`);
-    }
-    const extension = partial ? 4 : 0;
-    const first = vector(primitive.from, `primitives[${index}].from`, dimensions, extension);
-    const second = vector(primitive.to, `primitives[${index}].to`, dimensions, extension);
-    const from = first.map((coordinate, axis) => Math.min(coordinate, second[axis]));
-    const to = first.map((coordinate, axis) => Math.max(coordinate, second[axis]));
-    if (shape === "line" && from.filter((coordinate, axis) => coordinate === to[axis]).length < 2) {
-      throw new Error(`primitives[${index}] line must be axis-aligned`);
-    }
-    if (shape === "hollow_box" && from.some((coordinate, axis) => to[axis] - coordinate < 2)) {
-      throw new Error(`primitives[${index}] hollow_box must be at least 3x3x3`);
-    }
-    totalVolume += primitiveVolume(shape, from, to);
-    if (blockId !== "minecraft:air") {
-      solidPhases.add(primitive.phase);
-      for (let axis = 0; axis < 3; axis += 1) {
-        solidMin[axis] = Math.min(solidMin[axis], from[axis]);
-        solidMax[axis] = Math.max(solidMax[axis], to[axis]);
-      }
-    }
-    return { shape, phase: primitive.phase, blockId, from, to };
   });
-  if (!partial && STRUCTURE_PHASES.some((phase) => !seenPhases.has(phase))) {
-    throw new Error(`primitives must include ${STRUCTURE_PHASES.join(", ")}`);
+  if (!entries.length) throw salvageRejection("structure plan has no buildable primitives", salvage);
+  // Fluid-safety rule: a lava (or water) primitive is only as safe as the
+  // containment geometry authored around it. If salvage dropped or clamped
+  // ANY primitive, that containment can no longer be trusted, so every
+  // surviving fluid primitive is dropped too with its own recorded reason.
+  // Fluids survive only when the salvage pass touched nothing.
+  const dropUncontainedFluids = () => {
+    if (!dropped.length && !boundsClamped) return;
+    const fluids = new Set(["minecraft:lava", "minecraft:water", "minecraft:flowing_lava", "minecraft:flowing_water"]);
+    entries = entries.filter((entry) => {
+      if (!fluids.has(entry.blockId)) return true;
+      dropped.push({
+        index: entry.index,
+        reason: `primitives[${entry.index}] ${entry.blockId} dropped: salvage removed or clamped other primitives, so its containment is no longer trusted`,
+      });
+      return false;
+    });
+  };
+  let resultDimensions = { ...dimensions };
+  let offset = [0, 0, 0];
+  const axes = [0, 1, 2];
+  if (!partial) {
+    const solids = entries.filter(({ blockId }) => blockId !== "minecraft:air");
+    if (!solids.length) {
+      throw salvageRejection(`solid primitives must include ${STRUCTURE_PHASES.join(", ")}`, salvage);
+    }
+    offset = axes.map((axis) => Math.min(...solids.map(({ from }) => from[axis])));
+    const extents = axes.map((axis) => Math.max(...solids.map(({ to }) => to[axis])) - offset[axis] + 1);
+    resultDimensions = {
+      width: dimension(extents[0], "width"),
+      height: dimension(extents[1], "height"),
+      depth: dimension(extents[2], "depth"),
+    };
+    if (offset.some((coordinate) => coordinate !== 0)) {
+      warnings.push(`primitives translated by [${offset.map((coordinate) => -coordinate).join(",")}] to start at the origin`);
+    }
+    if (["width", "height", "depth"].some((name) => resultDimensions[name] !== dimensions[name])) {
+      warnings.push("dimensions renormalized to the solid primitive bounds "
+        + `${resultDimensions.width}x${resultDimensions.depth}x${resultDimensions.height}`);
+    }
+    const limit = [resultDimensions.width, resultDimensions.height, resultDimensions.depth];
+    const kept = [];
+    for (const entry of entries) {
+      const from = entry.from.map((coordinate, axis) => coordinate - offset[axis]);
+      const to = entry.to.map((coordinate, axis) => coordinate - offset[axis]);
+      if (axes.some((axis) => from[axis] >= limit[axis] || to[axis] < 0)) {
+        dropped.push({ index: entry.index, reason: `primitives[${entry.index}] is outside the structure bounds` });
+        continue;
+      }
+      const clampedFrom = from.map((coordinate) => Math.max(coordinate, 0));
+      const clampedTo = to.map((coordinate, axis) => Math.min(coordinate, limit[axis] - 1));
+      if (axes.some((axis) => clampedFrom[axis] !== from[axis] || clampedTo[axis] !== to[axis])) {
+        if (entry.shape === "hollow_box" && axes.some((axis) => clampedTo[axis] - clampedFrom[axis] < 2)) {
+          dropped.push({ index: entry.index, reason: `primitives[${entry.index}] hollow_box must be at least 3x3x3` });
+          continue;
+        }
+        boundsClamped = true;
+        warnings.push(`primitives[${entry.index}] clamped to the structure bounds`);
+      }
+      entry.from = clampedFrom;
+      entry.to = clampedTo;
+      kept.push(entry);
+    }
+    entries = kept;
+    dropUncontainedFluids();
+    if (entries.length < STRUCTURE_PHASES.length) {
+      throw salvageRejection(
+        `primitives must contain ${STRUCTURE_PHASES.length}-${STRUCTURE_PRIMITIVE_LIMIT} entries after salvage`,
+        salvage,
+      );
+    }
+    const solidPhases = new Set(entries.filter(({ blockId }) => blockId !== "minecraft:air").map(({ phase }) => phase));
+    if (STRUCTURE_PHASES.some((phase) => !solidPhases.has(phase))) {
+      for (const entry of entries) {
+        if (entry.blockId === "minecraft:air") continue;
+        const center = (entry.from[1] + entry.to[1]) / 2;
+        const band = Math.min(
+          STRUCTURE_PHASES.length - 1,
+          Math.floor((center / limit[1]) * STRUCTURE_PHASES.length),
+        );
+        entry.phase = STRUCTURE_PHASES[band];
+        entry.phaseIndex = band;
+      }
+      warnings.push("solid primitives re-binned into build phases by height");
+      const rebinned = new Set(entries.filter(({ blockId }) => blockId !== "minecraft:air").map(({ phase }) => phase));
+      const missing = STRUCTURE_PHASES.filter((phase) => !rebinned.has(phase));
+      if (missing.length) warnings.push(`no solid primitives in ${missing.join(", ")}`);
+    }
+  } else {
+    dropUncontainedFluids();
+    if (!entries.length) throw salvageRejection("structure plan has no buildable primitives", salvage);
   }
-  if (!partial && STRUCTURE_PHASES.some((phase) => !solidPhases.has(phase))) {
-    throw new Error(`solid primitives must include ${STRUCTURE_PHASES.join(", ")}`);
+  if (entries.some((entry, position) => position && entries[position - 1].phaseIndex > entry.phaseIndex)) {
+    // Air primitives carve openings out of solids, so a re-sort must never
+    // move a carve ahead of the geometry it cuts (a mis-phased door carve
+    // would otherwise no-op on empty space and the wall would seal the
+    // doorway). Pin every air carve to the final phase before sorting; the
+    // stable sort keeps the authored relative order among air entries, and
+    // the tie-break keeps air after solids that share its phase.
+    const finalPhase = STRUCTURE_PHASES.length - 1;
+    let pinned = false;
+    for (const entry of entries) {
+      if (entry.blockId !== "minecraft:air" || entry.phaseIndex === finalPhase) continue;
+      entry.phase = STRUCTURE_PHASES[finalPhase];
+      entry.phaseIndex = finalPhase;
+      pinned = true;
+    }
+    entries.sort((first, second) => (first.phaseIndex - second.phaseIndex)
+      || ((first.blockId === "minecraft:air") - (second.blockId === "minecraft:air")));
+    warnings.push("primitives re-sorted into phase order");
+    if (pinned) warnings.push("air carve primitives moved to the details phase so they cut finished geometry");
   }
+  const totalVolume = entries.reduce((total, { shape, from, to }) => total + primitiveVolume(shape, from, to), 0);
   if (totalVolume > 2_000_000) throw new Error("primitive plan is too large");
-  const expectedMax = [dimensions.width - 1, dimensions.height - 1, dimensions.depth - 1];
-  if (!partial && (solidMin.some((coordinate) => coordinate !== 0)
-    || solidMax.some((coordinate, axis) => coordinate !== expectedMax[axis]))) {
-    throw new Error("solid primitive bounds must match the requested dimensions");
-  }
-  return primitives;
+  return {
+    primitives: entries.map(({ shape, phase, blockId, from, to }) => ({ shape, phase, blockId, from, to })),
+    dimensions: resultDimensions,
+    offset,
+    warnings,
+    dropped,
+  };
 }
 
-function validateEntities(value, dimensions) {
+function validateEntities(value, dimensions, offset = [0, 0, 0]) {
   if (!Array.isArray(value) || value.length > STRUCTURE_ENTITY_LIMIT) {
     throw new Error(`entities must contain 0-${STRUCTURE_ENTITY_LIMIT} entries`);
   }
@@ -215,9 +355,12 @@ function validateEntities(value, dimensions) {
     }
     const typeId = String(entity.typeId || "");
     if (!ENTITY_TYPES.has(typeId)) throw new Error(`entities[${index}].typeId is not allowed`);
+    const location = Array.isArray(entity.location) && entity.location.length === 3
+      ? entity.location.map((coordinate, axis) => coordinate - offset[axis])
+      : entity.location;
     return {
       typeId,
-      location: vector(entity.location, `entities[${index}].location`, dimensions),
+      location: vector(location, `entities[${index}].location`, dimensions),
     };
   });
 }
@@ -325,11 +468,27 @@ export function validateBuildStructurePlan(value) {
     phases: [...STRUCTURE_PHASES],
   };
   if (mode) plan.mode = mode;
+  const salvage = { warnings: [], dropped: [] };
+  let offset = [0, 0, 0];
   if (value.primitives !== undefined) {
-    plan.primitives = validatePrimitives(value.primitives, dimensions, { partial: mode === "modify" });
+    const salvaged = validatePrimitives(value.primitives, dimensions, {
+      partial: mode === "modify",
+      primaryMaterial: materials.primary,
+    });
+    plan.primitives = salvaged.primitives;
+    plan.dimensions = salvaged.dimensions;
+    salvage.warnings.push(...salvaged.warnings);
+    salvage.dropped.push(...salvaged.dropped);
+    offset = salvaged.offset;
   }
-  if (value.entities !== undefined) plan.entities = validateEntities(value.entities, dimensions);
-  validateCityGeometry(plan);
+  if (value.entities !== undefined) plan.entities = validateEntities(value.entities, plan.dimensions, offset);
+  // City-quality geometry is advisory after #35: shortfalls become warnings.
+  try {
+    validateCityGeometry(plan);
+  } catch (error) {
+    salvage.warnings.push(error.message);
+  }
+  plan.salvage = salvage;
   return plan;
 }
 
