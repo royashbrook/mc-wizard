@@ -25,9 +25,19 @@ const PLACE_ITEMS = Object.freeze({
   "minecraft:lever": "minecraft:lever",
   "minecraft:stone_button": "minecraft:stone_button",
   "minecraft:rail": "minecraft:rail",
+  "minecraft:golden_rail": "minecraft:golden_rail",
+  "minecraft:detector_rail": "minecraft:detector_rail",
+  "minecraft:activator_rail": "minecraft:activator_rail",
+  "minecraft:target": "minecraft:target",
+  "minecraft:stone_bricks": "minecraft:stone_bricks",
+  "minecraft:glass_pane": "minecraft:glass_pane",
+  "minecraft:oak_fence": "minecraft:oak_fence",
+  "minecraft:torch": "minecraft:torch",
+  "minecraft:farmland": "minecraft:farmland",
   "minecraft:sugar_cane": ["minecraft:sugar_cane", "minecraft:reeds"],
   "minecraft:bamboo": "minecraft:bamboo",
   "minecraft:cactus": "minecraft:cactus",
+  "minecraft:wheat": "minecraft:wheat",
 });
 
 const INTERACTION_ITEMS = Object.freeze({
@@ -46,11 +56,14 @@ const DIRECTIONAL_ITEMS = new Set([
   "minecraft:dropper", "minecraft:hopper", "minecraft:repeater", "minecraft:comparator",
 ]);
 const SCAFFOLD_ITEMS = new Set(["minecraft:smooth_stone", "minecraft:cobblestone"]);
+const RAIL_ITEMS = new Set([
+  "minecraft:rail", "minecraft:golden_rail", "minecraft:detector_rail", "minecraft:activator_rail",
+]);
 const BELOW_ONLY = new Set([
   "minecraft:redstone", "minecraft:redstone_torch", "minecraft:repeater", "minecraft:comparator",
-  "minecraft:rail", "minecraft:sugar_cane", "minecraft:bamboo", "minecraft:cactus",
+  ...RAIL_ITEMS, "minecraft:sugar_cane", "minecraft:bamboo", "minecraft:cactus", "minecraft:wheat",
 ]);
-const FARM_CROPS = new Set(["minecraft:sugar_cane", "minecraft:bamboo", "minecraft:cactus"]);
+const FARM_CROPS = new Set(["minecraft:sugar_cane", "minecraft:bamboo", "minecraft:cactus", "minecraft:wheat"]);
 
 const key = ([x, y, z]) => `${x},${y},${z}`;
 
@@ -170,6 +183,14 @@ function cropFarmPipeline(plan) {
   if (plant.itemId === "minecraft:sugar_cane" && !water.length) {
     throw new Error("minecraft:sugar_cane farms require adjacent water");
   }
+  if (plant.itemId === "minecraft:wheat") {
+    const farmlandBelow = plan.placements.some((placement) => placement.action !== "break"
+      && placement.itemId === "minecraft:farmland"
+      && key(placement.target) === key([plant.target[0], plant.target[1] - 1, plant.target[2]]));
+    if (!farmlandBelow || !water.length) {
+      throw new Error("minecraft:wheat farms require farmland directly below the crop and adjacent water");
+    }
+  }
   const collectionReference = collector?.block || water[0];
   const route = paths.sort((a, b) => (
     distance(a.path[0], collectionReference) - distance(b.path[0], collectionReference)
@@ -191,8 +212,73 @@ function cropFarmPipeline(plan) {
   };
 }
 
+function validatePlacement(placement, index, placed) {
+  if (placement?.action === "break") {
+    exactKeys(placement, ["action", "target"], `placements[${index}]`);
+    const target = vector(placement.target, `placements[${index}].target`);
+    const prior = placed.get(key(target));
+    if (!prior || !SCAFFOLD_ITEMS.has(prior.itemId)) {
+      throw new Error(`placements[${index}] may only break an earlier stone scaffold`);
+    }
+    placed.delete(key(target));
+    return { action: "break", target };
+  }
+
+  exactKeys(placement, ["itemId", "target", "support", "orientationTarget"], `placements[${index}]`);
+  const itemId = String(placement.itemId || "");
+  if (!PLACE_ITEMS[itemId]) throw new Error(`placements[${index}].itemId is not allowed`);
+  const target = vector(placement.target, `placements[${index}].target`);
+  const support = vector(placement.support, `placements[${index}].support`, { ground: true });
+  if (!touches(target, support)) throw new Error(`placements[${index}].support must touch its target`);
+  const supportIsGround = support[1] === -1 && target[1] === 0;
+  if (!supportIsGround && !placed.has(key(support))) {
+    throw new Error(`placements[${index}].support must be ground or an earlier placement`);
+  }
+  if (BELOW_ONLY.has(itemId)
+    && !(support[0] === target[0] && support[1] === target[1] - 1 && support[2] === target[2])) {
+    throw new Error(`placements[${index}].${itemId.split(":")[1]} requires support directly below`);
+  }
+  if (placed.has(key(target))) throw new Error(`placements[${index}].target is duplicated`);
+  const orientationTarget = placement.orientationTarget === null ? null
+    : vector(placement.orientationTarget, `placements[${index}].orientationTarget`);
+  if (DIRECTIONAL_ITEMS.has(itemId) && (!orientationTarget || !touches(target, orientationTarget))) {
+    throw new Error(`placements[${index}].orientationTarget must touch the directional block`);
+  }
+  if (!DIRECTIONAL_ITEMS.has(itemId) && orientationTarget) {
+    throw new Error(`placements[${index}].orientationTarget is only for directional blocks`);
+  }
+  const normalized = { itemId, target, support, orientationTarget };
+  placed.set(key(target), normalized);
+  return normalized;
+}
+
+function validateInteraction(interaction, index, placed, controls) {
+  exactKeys(interaction, ["action", "itemId", "block", "faceTarget"], `interactions[${index}]`);
+  if (interaction.action !== "use_item_on_block") throw new Error(`interactions[${index}].action is unsupported`);
+  const itemId = String(interaction.itemId || "");
+  if (!INTERACTION_ITEMS[itemId]) throw new Error(`interactions[${index}].itemId is not allowed`);
+  const block = vector(interaction.block, `interactions[${index}].block`, { ground: true });
+  const faceTarget = vector(interaction.faceTarget, `interactions[${index}].faceTarget`);
+  if (!touches(block, faceTarget)) throw new Error(`interactions[${index}].faceTarget must touch its block`);
+  if (itemId === "minecraft:stick" && !controls.has(key(block))) {
+    throw new Error(`interactions[${index}] may only toggle a planned lever`);
+  }
+  if (itemId !== "minecraft:water_bucket" && !placed.has(key(block))) {
+    throw new Error(`interactions[${index}].block must be a planned block`);
+  }
+  if (itemId === "minecraft:hopper_minecart" && !RAIL_ITEMS.has(placed.get(key(block))?.itemId)) {
+    throw new Error(`interactions[${index}].block must be a planned rail`);
+  }
+  if (itemId === "minecraft:flint_and_steel" && !portalInterior(placed, { block, faceTarget })) {
+    throw new Error(`interactions[${index}] requires a complete vertical obsidian portal frame around an empty interior`);
+  }
+  return { action: "use_item_on_block", itemId, block, faceTarget };
+}
+
 export function validateMachinePlan(value) {
-  exactKeys(value, ["title", "kind", "mode", "placements", "interactions"], "machine plan");
+  // "dropped" is tolerated on input so a brain-side validated plan (which
+  // carries its own drop records) can round-trip through pack-side revalidation.
+  exactKeys(value, ["title", "kind", "mode", "placements", "interactions", "dropped"], "machine plan");
   if (value.mode !== undefined && value.mode !== "modify") {
     throw new Error("machine plan mode must be modify when supplied");
   }
@@ -205,71 +291,43 @@ export function validateMachinePlan(value) {
   }
 
   const placed = new Map();
-  const placements = value.placements.map((placement, index) => {
-    if (placement?.action === "break") {
-      exactKeys(placement, ["action", "target"], `placements[${index}]`);
-      const target = vector(placement.target, `placements[${index}].target`);
-      const prior = placed.get(key(target));
-      if (!prior || !SCAFFOLD_ITEMS.has(prior.itemId)) {
-        throw new Error(`placements[${index}] may only break an earlier stone scaffold`);
-      }
-      placed.delete(key(target));
-      return { action: "break", target };
+  const dropped = [];
+  const placements = [];
+  value.placements.forEach((placement, index) => {
+    try {
+      placements.push(validatePlacement(placement, index, placed));
+    } catch (error) {
+      // Drop only the irreparable entry; anything supported by it cascades out
+      // naturally because the dropped entry never lands in `placed`. Never
+      // synthesize supports or reorder entries — machines are orientation- and
+      // order-sensitive, so repair stays out of scope here (#35).
+      dropped.push({ index, reason: error.message });
     }
-
-    exactKeys(placement, ["itemId", "target", "support", "orientationTarget"], `placements[${index}]`);
-    const itemId = String(placement.itemId || "");
-    if (!PLACE_ITEMS[itemId]) throw new Error(`placements[${index}].itemId is not allowed`);
-    const target = vector(placement.target, `placements[${index}].target`);
-    const support = vector(placement.support, `placements[${index}].support`, { ground: true });
-    if (!touches(target, support)) throw new Error(`placements[${index}].support must touch its target`);
-    const supportIsGround = support[1] === -1 && target[1] === 0;
-    if (!supportIsGround && !placed.has(key(support))) {
-      throw new Error(`placements[${index}].support must be ground or an earlier placement`);
-    }
-    if (BELOW_ONLY.has(itemId)
-      && !(support[0] === target[0] && support[1] === target[1] - 1 && support[2] === target[2])) {
-      throw new Error(`placements[${index}].${itemId.split(":")[1]} requires support directly below`);
-    }
-    if (placed.has(key(target))) throw new Error(`placements[${index}].target is duplicated`);
-    const orientationTarget = placement.orientationTarget === null ? null
-      : vector(placement.orientationTarget, `placements[${index}].orientationTarget`);
-    if (DIRECTIONAL_ITEMS.has(itemId) && (!orientationTarget || !touches(target, orientationTarget))) {
-      throw new Error(`placements[${index}].orientationTarget must touch the directional block`);
-    }
-    if (!DIRECTIONAL_ITEMS.has(itemId) && orientationTarget) {
-      throw new Error(`placements[${index}].orientationTarget is only for directional blocks`);
-    }
-    const normalized = { itemId, target, support, orientationTarget };
-    placed.set(key(target), normalized);
-    return normalized;
   });
+  const placementDrops = dropped.length;
 
   const controls = new Set([...placed.entries()]
     .filter(([, placement]) => placement.itemId === "minecraft:lever")
     .map(([location]) => location));
-  const interactions = value.interactions.map((interaction, index) => {
-    exactKeys(interaction, ["action", "itemId", "block", "faceTarget"], `interactions[${index}]`);
-    if (interaction.action !== "use_item_on_block") throw new Error(`interactions[${index}].action is unsupported`);
-    const itemId = String(interaction.itemId || "");
-    if (!INTERACTION_ITEMS[itemId]) throw new Error(`interactions[${index}].itemId is not allowed`);
-    const block = vector(interaction.block, `interactions[${index}].block`, { ground: true });
-    const faceTarget = vector(interaction.faceTarget, `interactions[${index}].faceTarget`);
-    if (!touches(block, faceTarget)) throw new Error(`interactions[${index}].faceTarget must touch its block`);
-    if (itemId === "minecraft:stick" && !controls.has(key(block))) {
-      throw new Error(`interactions[${index}] may only toggle a planned lever`);
+  const interactions = [];
+  value.interactions.forEach((interaction, index) => {
+    try {
+      interactions.push(validateInteraction(interaction, index, placed, controls));
+    } catch (error) {
+      // Interaction safety rules are hard gates: an unsafe interaction is
+      // dropped permanently, never repaired — fire is never salvaged.
+      dropped.push({ index, reason: error.message });
     }
-    if (itemId !== "minecraft:water_bucket" && !placed.has(key(block))) {
-      throw new Error(`interactions[${index}].block must be a planned block`);
-    }
-    if (itemId === "minecraft:hopper_minecart" && placed.get(key(block))?.itemId !== "minecraft:rail") {
-      throw new Error(`interactions[${index}].block must be a planned rail`);
-    }
-    if (itemId === "minecraft:flint_and_steel" && !portalInterior(placed, { block, faceTarget })) {
-      throw new Error(`interactions[${index}] requires a complete vertical obsidian portal frame around an empty interior`);
-    }
-    return { action: "use_item_on_block", itemId, block, faceTarget };
   });
+
+  // Survival floor: a plan that lost most of its placements, or every
+  // interaction it asked for, is a different machine — reject it whole with
+  // the violation list as the error message.
+  const floor = Math.max(4, Math.ceil(value.placements.length / 2));
+  if ((placementDrops > 0 && placements.length < floor)
+    || (value.interactions.length > 0 && interactions.length === 0)) {
+    throw new Error(JSON.stringify(dropped));
+  }
 
   return {
     title: clean(value.title, "Working Machine", 32),
@@ -277,6 +335,7 @@ export function validateMachinePlan(value) {
     ...(value.mode === "modify" ? { mode: "modify" } : {}),
     placements,
     interactions,
+    ...(dropped.length ? { dropped } : {}),
   };
 }
 
@@ -377,6 +436,7 @@ export function machinePlanSchemaPrompt() {
     + `This is the bounded player-action plan for a working farm or machine without a fixed skill. Use real inputs, outputs, supports, controls, and collection where the design needs them. Never use build_structure for a functional machine. For feedback on the active machine or fixed blueprint, set plan.mode="modify" and return the complete corrected bounded plan; the executor will rebuild it at the existing project origin. `
     + `Limits: ${MACHINE_PLAN_LIMITS.placements} placements, ${MACHINE_PLAN_LIMITS.interactions} interactions; x -${MACHINE_PLAN_LIMITS.x}..${MACHINE_PLAN_LIMITS.x}, y 0..${MACHINE_PLAN_LIMITS.y}, z 0..${MACHINE_PLAN_LIMITS.z}. `
     + `Every placement needs an adjacent ground or earlier support. Directional blocks require an adjacent orientationTarget; other blocks use null. A break placement may only remove earlier smooth-stone or cobblestone scaffolding. `
+    + `Crops need their support directly below; wheat must sit on farmland with a poured water_bucket nearby, and every farm needs a hopper path to an output chest. Invalid placements are dropped individually, but a plan losing most placements or all interactions is rejected. `
     + `For a Nether portal, place a complete full-corner vertical obsidian rectangle at least 4 blocks wide and 5 blocks tall, leave its interior empty, then use flint_and_steel on a frame block with faceTarget inside the frame. `
     + `Allowed placement items: ${Object.keys(PLACE_ITEMS).join(", ")}. Allowed interaction items: ${Object.keys(INTERACTION_ITEMS).join(", ")}.`;
 }

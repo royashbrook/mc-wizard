@@ -7,12 +7,22 @@ import { classifyAction, createWizard } from "../src/wizard.mjs";
 import {
   foldPlacementSteps,
   machineBlueprint,
+  machinePlanSchemaPrompt,
   validateMachinePlan,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/machine-plan.js";
 
 const place = (itemId, target, support, orientationTarget = null) => ({
   itemId, target, support, orientationTarget,
 });
+
+const captureError = (fn) => {
+  let error;
+  assert.throws(fn, (thrown) => {
+    error = thrown;
+    return true;
+  });
+  return error;
+};
 
 const sugarCanePlan = {
   title: "Sugar Cane Farm",
@@ -93,6 +103,11 @@ test("validates bounded player-action plans for long-tail farms and machines", (
   assert.equal(allowedWizardAction({ type: "build_machine", version: 1, plan: sugarCanePlan }).plan.kind, "sugar cane farm");
 });
 
+// #35: validateMachinePlan now drops invalid entries per-placement instead of
+// throwing on the first one. These cases still reject the WHOLE plan because
+// the drops breach the survival floor (fewer than max(4, 50%) placements
+// survive) or drop every requested interaction; the error message is now a
+// JSON violation list whose reasons still match the original patterns.
 test("rejects unsafe machine items, arbitrary breaking, and unbounded directions", () => {
   assert.throws(() => validateMachinePlan({
     ...sugarCanePlan,
@@ -160,6 +175,8 @@ test("folds ordered placement and break operations into final project state", ()
   ]), [place("minecraft:chest", [0, 0, 1], [0, -1, 1])]);
 });
 
+// #35: whole-plan rejection here now flows through the all-interactions-dropped
+// gate (flint_and_steel was the only interaction); the reason text is unchanged.
 test("rejects ignition without a complete bounded obsidian portal frame", () => {
   assert.throws(() => validateMachinePlan({
     ...netherPortalPlan,
@@ -172,6 +189,200 @@ test("rejects ignition without a complete bounded obsidian portal frame", () => 
       place("minecraft:smooth_stone", [2, 1, 2], [2, 0, 2]),
     ],
   }), /complete vertical obsidian portal frame/);
+});
+
+// #35: entry-drop validation — a single salvageable bad entry no longer
+// rejects the whole plan; it drops with {index, reason} and the rest survives.
+test("drops only the irreparable placement and keeps the surviving machine", () => {
+  const placements = [];
+  for (let z = 2; z <= 16; z += 1) placements.push(place("minecraft:smooth_stone", [0, 0, z], [0, -1, z]));
+  for (let z = 2; z <= 15; z += 1) placements.push(place("minecraft:smooth_stone", [0, 1, z], [0, 0, z]));
+  placements.push(place("minecraft:crafting_table", [5, 0, 18], [5, -1, 18]));
+  assert.equal(placements.length, 30);
+  const plan = validateMachinePlan({ title: "Long Wall", kind: "wall machine", placements, interactions: [] });
+  assert.equal(plan.placements.length, 29);
+  assert.equal(plan.dropped.length, 1);
+  assert.deepEqual(plan.dropped[0], { index: 29, reason: "placements[29].itemId is not allowed" });
+  // No reordering: survivors keep their original relative order.
+  assert.deepEqual(plan.placements[0].target, [0, 0, 2]);
+  assert.deepEqual(plan.placements.at(-1).target, [0, 1, 15]);
+});
+
+test("cascades drops through a dropped support without synthesizing repairs", () => {
+  const plan = validateMachinePlan({
+    title: "Tower",
+    kind: "tower machine",
+    placements: [
+      place("minecraft:smooth_stone", [0, 0, 2], [0, -1, 2]),
+      place("minecraft:smooth_stone", [0, 1, 2], [0, 0, 2]),
+      place("minecraft:tnt", [0, 2, 2], [0, 1, 2]),
+      place("minecraft:smooth_stone", [0, 3, 2], [0, 2, 2]),
+      place("minecraft:smooth_stone", [1, 0, 2], [1, -1, 2]),
+      place("minecraft:smooth_stone", [2, 0, 2], [2, -1, 2]),
+      place("minecraft:smooth_stone", [3, 0, 2], [3, -1, 2]),
+      place("minecraft:smooth_stone", [4, 0, 2], [4, -1, 2]),
+    ],
+    interactions: [],
+  });
+  assert.equal(plan.placements.length, 6);
+  assert.deepEqual(plan.dropped.map(({ index }) => index), [2, 3]);
+  assert.match(plan.dropped[0].reason, /itemId is not allowed/);
+  assert.match(plan.dropped[1].reason, /support must be ground or an earlier placement/);
+});
+
+test("rejects the whole plan with a full JSON violation list when most placements are invalid", () => {
+  const error = captureError(() => validateMachinePlan({
+    title: "Bad Machine",
+    kind: "bad machine",
+    placements: [
+      place("minecraft:smooth_stone", [0, 0, 2], [0, -1, 2]),
+      place("minecraft:smooth_stone", [1, 0, 2], [1, -1, 2]),
+      place("minecraft:tnt", [2, 0, 2], [2, -1, 2]),
+      place("minecraft:command_block", [3, 0, 2], [3, -1, 2]),
+      place("minecraft:mob_spawner", [4, 0, 2], [4, -1, 2]),
+      place("minecraft:barrier", [5, 0, 2], [5, -1, 2]),
+    ],
+    interactions: [],
+  }));
+  const violations = JSON.parse(error.message);
+  assert.equal(violations.length, 4);
+  assert.deepEqual(violations.map(({ index }) => index), [2, 3, 4, 5]);
+  for (const violation of violations) assert.match(violation.reason, /itemId is not allowed/);
+});
+
+test("permanently drops unsalvageable fire but keeps the plan when safe interactions survive", () => {
+  const brokenFrame = netherPortalPlan.placements.slice(0, -1);
+  const flint = {
+    action: "use_item_on_block",
+    itemId: "minecraft:flint_and_steel",
+    block: [1, 0, 2],
+    faceTarget: [1, 1, 2],
+  };
+  const water = {
+    action: "use_item_on_block",
+    itemId: "minecraft:water_bucket",
+    block: [5, -1, 2],
+    faceTarget: [5, 0, 2],
+  };
+  const plan = validateMachinePlan({
+    ...netherPortalPlan,
+    placements: brokenFrame,
+    interactions: [flint, water],
+  });
+  // Fire is never salvaged: the ignition drops for good, water survives.
+  assert.equal(plan.interactions.length, 1);
+  assert.equal(plan.interactions[0].itemId, "minecraft:water_bucket");
+  assert.equal(plan.dropped.length, 1);
+  assert.match(plan.dropped[0].reason, /complete vertical obsidian portal frame/);
+
+  // When the dropped ignition was the ONLY interaction, the whole plan fails.
+  const error = captureError(() => validateMachinePlan({
+    ...netherPortalPlan,
+    placements: brokenFrame,
+    interactions: [flint],
+  }));
+  const violations = JSON.parse(error.message);
+  assert.equal(violations.length, 1);
+  assert.equal(violations[0].index, 0);
+  assert.match(violations[0].reason, /complete vertical obsidian portal frame/);
+});
+
+test("accepts inert placement additions and hopper minecarts on rail variants", () => {
+  const plan = validateMachinePlan({
+    title: "Decor Depot",
+    kind: "rail depot",
+    placements: [
+      place("minecraft:smooth_stone", [0, 0, 2], [0, -1, 2]),
+      place("minecraft:target", [0, 1, 2], [0, 0, 2]),
+      place("minecraft:golden_rail", [1, 0, 2], [1, -1, 2]),
+      place("minecraft:detector_rail", [2, 0, 2], [2, -1, 2]),
+      place("minecraft:activator_rail", [3, 0, 2], [3, -1, 2]),
+      place("minecraft:stone_bricks", [4, 0, 2], [4, -1, 2]),
+      place("minecraft:glass_pane", [4, 1, 2], [4, 0, 2]),
+      place("minecraft:oak_fence", [5, 0, 2], [5, -1, 2]),
+      place("minecraft:torch", [5, 1, 2], [5, 0, 2]),
+    ],
+    interactions: [{
+      action: "use_item_on_block",
+      itemId: "minecraft:hopper_minecart",
+      block: [1, 0, 2],
+      faceTarget: [1, 1, 2],
+    }],
+  });
+  assert.equal(plan.placements.length, 9);
+  assert.equal(plan.interactions.length, 1);
+  assert.equal(plan.dropped, undefined);
+});
+
+test("command-adjacent items never enter the machine placement allowlist", () => {
+  const prompt = machinePlanSchemaPrompt();
+  for (const banned of [
+    "minecraft:command_block",
+    "minecraft:repeating_command_block",
+    "minecraft:chain_command_block",
+    "minecraft:structure_block",
+    "minecraft:mob_spawner",
+    "minecraft:barrier",
+    "minecraft:tnt",
+  ]) {
+    assert.equal(prompt.includes(banned), false, `${banned} must not be offered to the model`);
+    const plan = validateMachinePlan({
+      title: "Probe",
+      kind: "probe machine",
+      placements: [
+        place("minecraft:smooth_stone", [0, 0, 2], [0, -1, 2]),
+        place("minecraft:smooth_stone", [1, 0, 2], [1, -1, 2]),
+        place("minecraft:smooth_stone", [2, 0, 2], [2, -1, 2]),
+        place("minecraft:smooth_stone", [3, 0, 2], [3, -1, 2]),
+        place(banned, [4, 0, 2], [4, -1, 2]),
+      ],
+      interactions: [],
+    });
+    assert.equal(plan.placements.some(({ itemId }) => itemId === banned), false);
+    assert.match(plan.dropped[0].reason, /itemId is not allowed/);
+  }
+});
+
+test("validates a wheat farm with farmland, water, and a hopper path to a chest", () => {
+  const wheatFarmPlan = {
+    title: "Wheat Farm",
+    kind: "wheat farm",
+    placements: [
+      place("minecraft:smooth_stone", [0, 0, 1], [0, -1, 1]),
+      place("minecraft:hopper", [0, 0, 2], [0, 0, 1], [0, 0, 1]),
+      { action: "break", target: [0, 0, 1] },
+      place("minecraft:chest", [0, 0, 1], [0, -1, 1]),
+      place("minecraft:farmland", [0, 0, 3], [0, -1, 3]),
+      place("minecraft:wheat", [0, 1, 3], [0, 0, 3]),
+    ],
+    interactions: [{
+      action: "use_item_on_block",
+      itemId: "minecraft:water_bucket",
+      block: [1, -1, 3],
+      faceTarget: [1, 0, 3],
+    }],
+  };
+  const farm = machineBlueprint(wheatFarmPlan);
+  const pipeline = farm.verification.find(({ kind }) => kind === "crop_farm_pipeline");
+  assert.equal(pipeline.expectedOutput, "minecraft:wheat");
+  assert.deepEqual(pipeline.plantTypes, ["minecraft:wheat"]);
+  assert.deepEqual(pipeline.output, [0, 0, 1]);
+
+  // Wheat planted on plain dirt has no farmland below: the farm is rejected.
+  assert.throws(() => machineBlueprint({
+    ...wheatFarmPlan,
+    placements: wheatFarmPlan.placements.map((placement) => (
+      placement.itemId === "minecraft:farmland"
+        ? place("minecraft:dirt", placement.target, placement.support)
+        : placement
+    )),
+  }), /farmland directly below/);
+
+  // Wheat with no water collector at all is rejected like sugar cane.
+  assert.throws(() => machineBlueprint({
+    ...wheatFarmPlan,
+    interactions: [],
+  }), /water/);
 });
 
 test("uses the local sugar-cane fallback and accepts model-authored long-tail machines", async () => {
