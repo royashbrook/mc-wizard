@@ -649,7 +649,11 @@ test("supervises Bedrock, brain, provider, and corpus without secrets in status"
   assert.match(supervisorScript, /Math\.min\(30_000/);
   assert.match(supervisorScript, /function daemonPids\(\)/);
   assert.match(supervisorScript, /pgrep/);
-  assert.match(supervisorScript, /container", \["exec", "mc-wizard-bedrock", "true"\]/);
+  // #38: liveness is "the container is running" (from `container list`), not
+  // "exec succeeds", so a cold BDS boot is not deleted and recreated in a loop.
+  assert.match(supervisorScript, /containerListHasRunning/);
+  assert.match(supervisorScript, /container", \["list"\]/);
+  assert.doesNotMatch(supervisorScript, /container", \["exec", "mc-wizard-bedrock", "true"\]/);
   assert.match(supervisorScript, /corpusChunks/);
   assert.match(supervisorScript, /providerName/);
   assert.doesNotMatch(supervisorScript, /BRIDGE_TOKEN.*console|AI_API_KEY.*console/);

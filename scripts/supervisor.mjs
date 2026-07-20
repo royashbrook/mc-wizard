@@ -17,6 +17,31 @@ function run(command, args, options = {}) {
   });
 }
 
+function capture(command, args) {
+  return new Promise((resolve) => {
+    const child = spawn(command, args, { cwd: ROOT, stdio: ["ignore", "pipe", "ignore"], env: process.env });
+    let output = "";
+    child.stdout.on("data", (chunk) => { output += chunk; });
+    child.once("error", () => resolve(""));
+    child.once("exit", () => resolve(output));
+  });
+}
+
+// `container list` (running only) prints one row per running container, first
+// column the name, after a header row whose first column is "ID". A container
+// that is booting is already "running", so presence here is the correct
+// liveness signal; `container exec` fails for minutes during a cold BDS boot
+// and must not be used to decide whether to recreate.
+export function containerListHasRunning(listOutput, name) {
+  return String(listOutput)
+    .split(/\r?\n/)
+    .some((line) => line.trim().split(/\s+/)[0] === name);
+}
+
+async function containerRunning(name) {
+  return containerListHasRunning(await capture("container", ["list"]), name);
+}
+
 function daemonPids() {
   return new Promise((resolve) => {
     const child = spawn("pgrep", ["-f", DAEMON_PATTERN], { stdio: ["ignore", "pipe", "ignore"] });
@@ -56,11 +81,11 @@ async function status() {
     probe(`http://${process.env.HOST || "127.0.0.1"}:${process.env.PORT || 3000}/health`),
     probe(`http://127.0.0.1:${process.env.MTOK_PORT || 8790}/health`),
     probe(`http://${process.env.ADMIN_HOST || "127.0.0.1"}:${process.env.ADMIN_PORT || 3001}/health`),
-    run("container", ["exec", "mc-wizard-bedrock", "true"]),
+    containerRunning("mc-wizard-bedrock"),
   ]);
   const result = {
     supervisor: Boolean(pid),
-    bedrock: bedrockCode === 0,
+    bedrock: Boolean(bedrockCode),
     brain: Boolean(brain.ok),
     provider: Boolean(provider.ok),
     admin: Boolean(admin.ok),
@@ -118,10 +143,17 @@ async function daemon() {
   };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
+  // Recreate only when the container has actually stopped, and only after two
+  // consecutive misses so a transient `container list` hiccup or an in-progress
+  // boot never triggers a delete/recreate loop (see issue #38).
+  let downChecks = 0;
   setInterval(async () => {
-    if (!stopping && await run("container", ["exec", "mc-wizard-bedrock", "true"]) !== 0) {
-      await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
-    }
+    if (stopping) return;
+    if (await containerRunning("mc-wizard-bedrock")) { downChecks = 0; return; }
+    downChecks += 1;
+    if (downChecks < 2) return;
+    downChecks = 0;
+    await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
   }, 10_000).unref();
 }
 
@@ -162,10 +194,13 @@ async function stop() {
   return 0;
 }
 
-const command = process.argv[2] || "status";
-const exitCode = command === "daemon" ? await daemon()
-  : command === "start" ? await start()
-    : command === "stop" ? await stop()
-      : command === "status" ? await status()
-        : 2;
-process.exitCode = exitCode;
+const isMain = process.argv[1]
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  const command = process.argv[2] || "status";
+  process.exitCode = command === "daemon" ? await daemon()
+    : command === "start" ? await start()
+      : command === "stop" ? await stop()
+        : command === "status" ? await status()
+          : 2;
+}
