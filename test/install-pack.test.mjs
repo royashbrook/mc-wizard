@@ -65,6 +65,37 @@ test("standalone installs require and version the live Wizard appearance pack", 
   assert.equal(variables.mc_wizard_url, "http://192.168.1.50:3000/v1/ask");
 });
 
+test("reinstalling mirrors the source and purges stale cruft from the destination", async () => {
+  // Regression for issue #39: a stale Finder-duplicate directory left in the
+  // installed pack must not survive a reinstall, or the image's forced pack
+  // refresh aborts the whole BDS boot with "rm ...: Directory not empty".
+  const staleDir = path.join(serverRoot, "resource_packs", "mc_wizard", "models 2");
+  await mkdir(staleDir, { recursive: true });
+  await writeFile(path.join(staleDir, "entity"), "leftover\n");
+
+  await run(process.execPath, ["scripts/install-pack.mjs", serverRoot, "Family Lab"], {
+    cwd: repo,
+    env: {
+      ...process.env,
+      MC_WIZARD_LAN_IP: "",
+      WIZARD_URL: "",
+      BRIDGE_TOKEN: "test-only-bridge-token-0123456789abcdef",
+    },
+  });
+
+  await assert.rejects(readFile(path.join(staleDir, "entity")), /ENOENT/);
+  // The real pack content is still present after the mirror.
+  await readFile(path.join(serverRoot, "resource_packs", "mc_wizard", "manifest.json"));
+});
+
+test("the tracked source packs contain no Finder-duplicate entries", async () => {
+  const { stdout } = await run("find", [
+    path.join(repo, "bedrock"),
+    "(", "-name", "* 2", "-o", "-name", "* 3", "-o", "-name", "* 2.*", "-o", "-name", "* 3.*", ")",
+  ]);
+  assert.equal(stdout.trim(), "", `Finder-duplicate paths found under bedrock/:\n${stdout}`);
+});
+
 test("default or short bridge tokens are refused for a non-loopback brain URL", async () => {
   const guardedRoot = await mkdtemp(path.join(tmpdir(), "mc-wizard-install-guard-"));
   try {

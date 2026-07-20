@@ -1,4 +1,4 @@
-import { chmod, cp, mkdir, readFile, stat, writeFile } from "node:fs/promises";
+import { chmod, cp, mkdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { updateServerProperties } from "../src/server-control.mjs";
@@ -81,11 +81,17 @@ const packTarget = path.join(serverRoot, "behavior_packs", "mc_wizard");
 const resourcePackTarget = path.join(serverRoot, "resource_packs", "mc_wizard");
 await mkdir(path.dirname(packTarget), { recursive: true });
 await mkdir(configTarget, { recursive: true });
+// Mirror, don't merge: remove the destination first so stale files (e.g. a
+// Finder-duplicate "models 2" directory) can never survive an install and
+// later wedge the image's forced pack refresh (rm ...: Directory not empty).
+// See issue #39.
+await rm(packTarget, { recursive: true, force: true });
 await cp(path.join(ROOT, "bedrock", "behavior_packs", "mc_wizard"), packTarget, {
   recursive: true,
   force: true,
 });
 await mkdir(path.dirname(resourcePackTarget), { recursive: true });
+await rm(resourcePackTarget, { recursive: true, force: true });
 await cp(path.join(ROOT, "bedrock", "resource_packs", "mc_wizard"), resourcePackTarget, {
   recursive: true,
   force: true,
