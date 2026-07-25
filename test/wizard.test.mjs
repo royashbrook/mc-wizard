@@ -3684,3 +3684,47 @@ test("a bare continuation token never returns extractive documentation", async (
   }];
   assert.match(String(extractiveAnswer("how far does redstone dust carry a signal", redstone)), /15 blocks/);
 });
+
+// Issue #44: "never give up and never do nothing". A live child asked Wiz to
+// clear a 50x50 area; the planner answered "I can't safely clear a 50x50 area
+// with the available in-world action here" and attached no action, and the
+// system delivered that refusal unchanged. Nothing in the pipeline detected a
+// refusal, even though a fill-with-air run_commands action is fully allowed
+// and the system prompt explicitly forbids refusing achievable requests.
+test("a bare refusal on an actionable request never ships without an attempt", async () => {
+  const refusals = [
+    "I can't safely clear a 50x50 area with the available in-world action here.",
+    "I'm unable to do that with my current abilities.",
+    "That isn't something I can do in this world.",
+  ];
+  for (const refusal of refusals) {
+    const wizard = createWizard({
+      corpus: { search: () => [] },
+      env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+      fetchImpl: async () => new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ answer: refusal }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    });
+    const result = await wizard.ask({
+      player: "ClearKid",
+      question: "clear a 50x50 area around me, starting at the ground beneath this tree",
+    });
+    assert.doesNotMatch(
+      result.answer,
+      /\b(?:i\s*(?:can|could)(?:n['’]t| not)|i['’]m unable|isn['’]t something i can)\b/i,
+      `bare refusal shipped to the child: ${result.answer}`,
+    );
+  }
+});
+
+// Negative half: a genuinely answer-only question must still be allowed to say
+// it does not know. The never-give-up rule applies to in-world requests, not to
+// honest knowledge gaps, and must not force a spurious build.
+test("an honest knowledge gap is still allowed on a non-actionable question", async () => {
+  const wizard = createWizard({ corpus: { search: () => [] }, env: {} });
+  const result = await wizard.ask({
+    player: "AskKid",
+    question: "what is the airspeed velocity of an unladen swallow",
+  });
+  assert.equal(result.action, null);
+});

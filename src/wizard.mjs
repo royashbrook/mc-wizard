@@ -95,6 +95,17 @@ function answerPromisesAction(answer = "") {
       .test(answer);
 }
 
+// #44: "never give up and never do nothing". The planner sometimes declines an
+// in-world request it is fully permitted to perform (a fill-with-air
+// run_commands action passes the allowlist, and the system prompt forbids
+// refusing achievable requests). Detect the refusal so the turn can fall
+// through to the same recovery ladder an empty promise uses, instead of
+// handing a child "I can't do that" with no attempt.
+function answerRefusesAction(answer = "") {
+  return /\b(?:i\s*(?:can|could)(?:n['’]t| not)|i\s*am\s*(?:not\s*)?unable|i['’]m\s*(?:not\s*)?unable|isn['’]t\s+something\s+i\s+can|not\s+something\s+i\s+can|i\s+won['’]t\s+be\s+able)\b/i
+    .test(answer);
+}
+
 function answerOffersAction(answer = "") {
   return /\b(?:i\s+can|shall\s+i|should\s+i|would\s+you\s+like\s+me\s+to|want\s+me\s+to)\b.{0,180}\b(?:build|place|make|create|construct|set\s*up|start|add|decorate|change|put|give|bring|spawn|summon|show|rebuild|expand|upgrade|improve|finish|fix|repair|furnish|wire|assemble|install|craft|modify|update)\b/i
     .test(answer);
@@ -5057,8 +5068,11 @@ export function createWizard({
               responseMode = "local-recipe-fallback";
             }
           }
+          // #44: an empty promise and a bare refusal are the same failure from
+          // the child's side, so both enter the recovery ladder. answerOnly
+          // questions are excluded, keeping honest knowledge gaps intact.
           if (!general && !reviewRequest && !answerOnlyRequest
-            && answerPromisesAction(answer) && !selectedAction
+            && (answerPromisesAction(answer) || answerRefusesAction(answer)) && !selectedAction
             && !(buildRequest && providerActionRejection)) {
             selectedAction = classifyAction(question, actionHistory);
             if (!selectedAction) {
