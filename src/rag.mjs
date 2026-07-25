@@ -197,11 +197,23 @@ async function markdownFiles(root) {
 const COMMAND_TEXT = /(^|[\s(`"'[])\/[a-z]/i;
 const ANSWER_LIMIT = 420;
 
+// #42: words a child uses to tell Wiz to proceed, not to ask a question. A bare
+// "go" once matched 'world.sendMessage("All systems GO!")' in the scripting docs
+// and returned it to a child as an answer. These carry no informational intent,
+// so they must never drive retrieval on their own.
+const CONTINUATION_WORDS = new Set([
+  "go", "ok", "okay", "yes", "yeah", "yep", "sure", "now", "please", "do", "it",
+  "start", "begin", "continue", "proceed", "again", "more", "next", "ready",
+  "thanks", "thank", "cool", "nice", "hi", "hello", "hey",
+]);
+
 export function extractiveAnswer(question, hits) {
   const top = Array.isArray(hits) ? hits[0] : undefined;
   if (!top || typeof top.text !== "string" || !top.text) return null;
   const questionWords = new Set(tokenize(question || ""));
   if (!questionWords.size) return null;
+  // Every surviving token is a "keep going" word: there is no question to answer.
+  if ([...questionWords].every((word) => CONTINUATION_WORDS.has(word))) return null;
 
   const title = top.title || "spellbook";
   const budget = ANSWER_LIMIT - `Here's what my spellbook says:  (from my ${title} notes)`.length;

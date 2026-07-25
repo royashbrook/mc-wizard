@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { before, test } from "node:test";
-import { loadCorpus } from "../src/rag.mjs";
+import { extractiveAnswer, loadCorpus } from "../src/rag.mjs";
 import {
   startServer,
   validateActionResultBody,
@@ -3616,4 +3616,71 @@ test("a researched plan smuggling world.command is still rejected and logged", a
   assert.ok(result.telemetry.rejections.some(({ gate, reason }) => (
     gate === "research-restriction" && /server administration|arbitrary commands/i.test(reason)
   )));
+});
+
+// Issue #42: live child session on the fresh world. The child asked Wiz to
+// clear a 50x50 area; Wiz answered "got it - i'll clear and level a 50x50
+// area" and then stood there doing nothing. answerPromisesAction only knew
+// constructive verbs (build/place/make/...), so a promise built from terrain
+// verbs (clear/level/remove/dig/flatten) escaped the guard that exists
+// precisely to stop Wiz claiming an action it is not performing.
+test("a promise built from terrain verbs never ships without an executable action", async () => {
+  const promises = [
+    "got it — i’ll clear and level a 50×50 area, starting at the ground beneath the tree.",
+    "i’ll remove all the blocks above the ground there.",
+    "i’ll dig out the hillside for you.",
+    "i’ll flatten the mountains around this tree.",
+  ];
+  for (const promise of promises) {
+    const wizard = createWizard({
+      corpus: { search: () => [] },
+      env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+      fetchImpl: async () => new Response(JSON.stringify({
+        // The provider promises terrain work but attaches no action at all.
+        choices: [{ message: { content: JSON.stringify({ answer: promise }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } }),
+    });
+    const result = await wizard.ask({
+      player: "ClearKid",
+      question: "clear a 50x50 area around me, starting at the ground beneath this tree",
+    });
+    // Either Wiz performs something real, or he must not claim he is doing it.
+    if (!result.action) {
+      assert.doesNotMatch(
+        result.answer,
+        /\bi(?:['’]ll| will|['’]m going to| am going to)\s+(?:now\s+)?(?:clear|level|remove|dig|excavate|flatten|demolish|destroy|erase|wipe)\b/i,
+        `bare terrain promise leaked with no action: ${result.answer}`,
+      );
+    }
+  }
+});
+
+// Issue #42: after the empty promise the child typed "go". With no bound
+// pending action, the offline fallback ran extractive retrieval on the raw
+// two-letter token and returned scripting documentation ("All systems GO!"),
+// which is meaningless to a child.
+test("a bare continuation token never returns extractive documentation", async () => {
+  const scriptingDocs = [{
+    title: "Introduction to Scripting",
+    text: 'world.sendMessage("All systems GO!"); Go back to Minecraft, create a world with the behavior pack activated.',
+    url: "https://learn.microsoft.com/minecraft/creator/scripting",
+    version: "1.21+",
+    channel: "stable",
+  }];
+  for (const question of ["go", "ok", "yes", "do it", "now", "please"]) {
+    assert.equal(
+      extractiveAnswer(question, scriptingDocs),
+      null,
+      `continuation "${question}" produced extractive documentation`,
+    );
+  }
+  // Positive half: a real question still gets its extractive answer.
+  const redstone = [{
+    title: "Redstone basics",
+    text: "Redstone dust carries a signal up to 15 blocks before it needs a repeater to continue.",
+    url: "https://example/redstone",
+    version: "1.21+",
+    channel: "stable",
+  }];
+  assert.match(String(extractiveAnswer("how far does redstone dust carry a signal", redstone)), /15 blocks/);
 });

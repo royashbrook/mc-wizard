@@ -86,9 +86,12 @@ function isWeatherConversation(question) {
 }
 
 function answerPromisesAction(answer = "") {
-  return /\b(?:i(?:['’]ll| will| am going to|['’]m going to)|let me)\s+(?:now\s+)?(?:build|place|make|create|construct|set\s*up|start|add|decorate|change|put|give|bring|hand|spawn|summon|cast|drop|throw|demonstrate|show|rebuild|expand|enlarge|upgrade|improve|finish|fix|repair|furnish|wire|assemble|install|craft|complete|modify|update)\b/i
+  // #42: terrain verbs (clear/level/remove/dig/...) belong here too. A live
+  // child session got "got it - i'll clear and level a 50x50 area" with no
+  // action attached, because this guard only knew constructive verbs.
+  return /\b(?:i(?:['’]ll| will| am going to|['’]m going to)|let me)\s+(?:now\s+)?(?:build|place|make|create|construct|set\s*up|start|add|decorate|change|put|give|bring|hand|spawn|summon|cast|drop|throw|demonstrate|show|rebuild|expand|enlarge|upgrade|improve|finish|fix|repair|furnish|wire|assemble|install|craft|complete|modify|update|clear|level|remove|delete|dig|excavate|flatten|demolish|destroy|erase|wipe|empty|carve|tear\s+down)\b/i
     .test(answer)
-    || /\bi(?:['’]m| am)\s+(?:now\s+)?(?:building|placing|making|creating|constructing|setting\s*up|starting|adding|decorating|changing|putting|giving|bringing|handing|spawning|summoning|casting|dropping|throwing|demonstrating|showing|rebuilding|expanding|enlarging|upgrading|improving|finishing|fixing|repairing|furnishing|wiring|assembling|installing|crafting|completing|modifying|updating)\b/i
+    || /\bi(?:['’]m| am)\s+(?:now\s+)?(?:building|placing|making|creating|constructing|setting\s*up|starting|adding|decorating|changing|putting|giving|bringing|handing|spawning|summoning|casting|dropping|throwing|demonstrating|showing|rebuilding|expanding|enlarging|upgrading|improving|finishing|fixing|repairing|furnishing|wiring|assembling|installing|crafting|completing|modifying|updating|clearing|leveling|levelling|removing|deleting|digging|excavating|flattening|demolishing|destroying|erasing|wiping|emptying|carving|tearing\s+down)\b/i
       .test(answer);
 }
 
