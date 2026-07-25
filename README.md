@@ -351,6 +351,45 @@ The brain returns prose, provenance, a persisted goal, and an optional typed act
 
 The Bedrock adapter accepts only registered, versioned actions and validates every material, dimension, coordinate, interaction, entity, and operation bound before execution. It reports `started`, `completed`, or `failed` back to `/v1/action-result`; completed results include a bounded live-world snapshot for semantic goal review. Structure and machine corrections retain immutable goal lineage and the prior project location, and unrelated replacement actions are rejected.
 
+## Turn architecture: roles inside one turn
+
+The rule the brain is built around is "never give up and never do nothing": if a child asks for something the Wizard can actually do, the turn owes them a real attempt — never a bare refusal, never a promise with no action attached, never silence, never a documentation excerpt.
+
+A live session broke that rule three ways at once. A child asked twice to clear and level a 50x50 area and got nothing either time. Three independent causes, each reproduced separately against the shipped code:
+
+1. **The refusal detector never fired.** It did not match `I can't` or `I cannot`, so the model's refusal shipped to the child verbatim. The test that existed to catch this re-declared the production regex inline, inherited the identical blind spot, and stayed green. Tests here now import the matcher from the runtime module, or assert the property behaviourally, and never re-implement a predicate the code owns.
+2. **The recovery path threw, and the catch laundered the failure.** When the ladder was entered and found nothing it threw; the outer catch then reset the action to the same empty value the failure had already produced, and shipped it as a normal turn.
+3. **Every recovery floor was lexically inside `if (buildRequest ...)`.** Terrain is not a build request, so no floor was reachable at all for these turns.
+
+The turn is now assembled from small injected roles under `src/roles/`, each unit-tested on its own with stub dependencies:
+
+| Module | Responsibility |
+| --- | --- |
+| `turn-state.mjs` | The turn blackboard. `action` and `responseMode` are written only in pairs through `adopt()`, because the pack's planning-deferred retry keys on that pair and drift between them changes in-world behaviour. |
+| `intent.mjs` | The frozen turn record. Adds `actionableIntent` (the generalization of `buildRequest` that unlocks the floor for terrain, travel, gift and effect turns) and `consultModel`, the single cost gate. |
+| `terrain.mjs` | The deterministic terrain rung: a terrain verb plus a terrain noun in one clause compiles to y-sliced `fill … air` commands, re-validated through the executor allowlist. |
+| `critic.mjs` | Four fixed tiers — safety, existence, fidelity, completeness — over the file's own validated predicates. The existence tier fires on `!action && actionableIntent` first, so detection does not depend on recognizing the model's prose. |
+| `escalation.mjs` | One ordered ladder replacing the two divergent floor sites, walked with a monotonic index and an append-only rejected set. |
+| `orchestrator.mjs` | Transitions, budgets, and the terminal assertion. It contains no regex, no Minecraft vocabulary and no allowlist, so it cannot widen a safety boundary. |
+
+Every role takes its dependencies by injection and none of them imports `src/wizard.mjs`, so there is no import cycle and no validated predicate moved out of the file that owns it.
+
+No action type was added, and the `started` / `completed` / `failed` and review/replan/retry vocabulary the pack dispatches on is unchanged. One new `responseMode` value, `local-offer-floor`, was added for the bound-offer floor. The pack treats `responseMode` as opaque apart from `planning-deferred` and `player-memory`, so no result is dispatched differently because of it — but it is a new string on the wire and is named here rather than left to be found later.
+
+**No safety regex was widened by this work, and none needed to be.** That is a consequence of where the deterministic rungs sit, not a lucky outcome. The terrain rung is deterministic, not model-authored, so the model-policing gates — `providerActionMatchesRequest`, `providerPowerMatchesRequest` and its guarded-command table, subject fidelity, the research ban — never see it and were not edited; widening the guarded-command vocabulary to let a fill-with-air through would have loosened a gate that exists to police model output. The rung is also placed after the "the child only asked for an explanation" bail, so `just explain how to clear a 50x50 area` still explains rather than digging. The one safety surface it does cross is the one it must: every candidate it authors is re-validated through `allowedWizardAction`, and it returns that gatekeeper's output rather than the object it built. `test/never-empty.test.mjs` re-runs the allowlist over whatever action actually ships and requires the two to be identical.
+
+Two suites are the executable form of the rule. `test/never-empty.test.mjs` crosses roughly forty hostile child prompts — including the verbatim live turns — with five provider behaviours (refuses, promises without acting, returns invalid JSON, throws, times out), and requires every one of the 200+ cells to be non-empty, free of the provider's own refusal or promise text, and, on actionable turns, to ship a real action, an offer that a following bare `yes` actually converts into work, or the planning-deferred terminal the pack already retries. `test/cost-gate.test.mjs` counts provider calls: zero for the canned turns and the whole terrain rung, exactly one for a turn that genuinely needs the model, and never more than `1 + MC_WIZARD_REPAIR_ROUNDS` for a hostile turn.
+
+### What this does not do
+
+This is an orchestrator **inside a single turn**, not a unified agent loop. There are still three loops in the system, and this work removed none of them:
+
+- the six recursive `api.ask` calls in `src/wizard.mjs` (follow-ups, refinements, goal review, replan), which re-enter the whole turn rather than iterating the orchestrator;
+- the pack-side result dispatcher in `bedrock/behavior_packs/mc_wizard/scripts/main.js`, which owns review, replan, retry and their caps; and
+- the pack's own planning-deferred retry, which re-asks after a deferred turn.
+
+Collapsing the recursive calls into orchestrator iterations is deliberately deferred: it changes how many times `sessions.reserve` fires and therefore supersede semantics, the pack owns the other half of the loop, and the container acceptance suites cannot be run offline. The reward there is tidiness; the reliability wins are the ones above.
+
 ## Why this differs from the reference bot
 
 [`danshorstein/minecraft-ai-bot`](https://github.com/danshorstein/minecraft-ai-bot) is an MIT-licensed Java/Paper companion built around Mineflayer, a large prompt cookbook, OpenRouter tool calls, and OP slash commands. Its strongest transferable idea is its continuous goal runner: plan once, execute a step, scan the world, ask an independent QA role whether the criteria pass, and continue at a fixed anchor. It also relies on deterministic city/castle skills and a broad raw-command escape hatch; it is not a RAG or Minecraft-documentation system.
@@ -365,6 +404,8 @@ Mineflayer, Paper setup, Java NBT/commands, and raw OP command execution do not 
 - The simulated player attempts normal placement and interaction first. Large surfaces use bounded fill operations, and a rejected Bedrock placement can be repaired directly after visible player attempts; therefore the current runtime does not guarantee that every final block was accepted through the player-placement API.
 - Goal QA observes validated plans, project memory, nearby blocks/entities, weather, time, and action-specific acceptance results. It is not visual scene understanding yet. Automatic continuation is capped at six actions under one immutable goal; the goal stays active and the Wizard asks for child feedback rather than silently claiming success at the cap.
 - Novel builds now reach a passable result offline through the procedural silhouette builder, but the silhouettes are blocky approximations, not detailed models, and the quality floor is proven by unit tests and the validator matrix rather than by a live child grade. A real iPad/BDS run is still the pending proof that unprogrammed requests grade 3 or better in play. When a salvaged plan drops some pieces, the build reports a partial status and reopens for review instead of claiming full completion.
+- The never-empty rule is gated on intent, and intent recognition is still lexical. A terrain work order is recognized only when a terrain verb and a terrain noun appear in the same clause, so `clear a 50x50 area`, `flatten this hill` and `wiz can you clear the trees around here` compile to real work, while `dig out a big hole here` (no recognized noun) and `make this flat` (no recognized verb, and deliberately pinned as non-actionable so the rung cannot steal a build) still fall through to an answer rather than an action. Those turns are not empty — they never ship a refusal, a promise with no action, or silence — but they are not yet the favorable result the project is aiming at. The matrix in `test/never-empty.test.mjs` records them explicitly rather than hiding them.
+- The floor deliberately does not fire on review, answer-only, superseded, or plainly conversational turns. "Do something anyway" on a review would silently replace a child's finished build, and an honest "I don't know that yet" on a knowledge question has to stay honest.
 - Official Microsoft documentation is not a complete gameplay encyclopedia. Fill gaps with versioned, self-authored mechanic cards backed by reproducible Bedrock tests. Do not ingest the community wiki by default without accepting its attribution, noncommercial, and share-alike requirements.
 - The operator desk is not a parental-control or child-chat-audit system. Dialogue sessions are bounded and stored under hashed player keys for continuity and regression promotion, but there is no retention/consent policy, per-world protected region, semantic cache, embedding index, or broad retrieval evaluation set yet.
 

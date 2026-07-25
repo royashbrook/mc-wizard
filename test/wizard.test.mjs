@@ -16,7 +16,14 @@ import {
   unsafeCommandAnswer,
 } from "../src/command-safety.mjs";
 import { reusableLearnedAction, safeNovelAction } from "../src/learned-recipes.mjs";
-import { classifyAction, createWizard, instantConversationAnswer, providerTimeoutMs } from "../src/wizard.mjs";
+import {
+  answerOffersAction,
+  answerRefusesAction,
+  classifyAction,
+  createWizard,
+  instantConversationAnswer,
+  providerTimeoutMs,
+} from "../src/wizard.mjs";
 import { validateConsoleCommand } from "../src/admin.mjs";
 import { readRuntimeSettings, validateRuntimeSettings, writeRuntimeSettings } from "../src/runtime-settings.mjs";
 import {
@@ -3699,10 +3706,17 @@ test("a bare refusal on an actionable request never ships without an attempt", a
   const refusals = [
     "I can't safely clear a 50x50 area with the available in-world action here.",
     "I cannot do that here.",
+    "I cannot do that in this world.",
+    "I can not do that here.",
     "I couldn't build that for you.",
     "I'm unable to do that with my current abilities.",
     "That isn't something I can do in this world.",
   ];
+  // The production matcher itself, imported rather than re-declared, so this
+  // assertion can never drift back into sharing the code's blind spot.
+  for (const refusal of refusals) {
+    assert.equal(answerRefusesAction(refusal), true, `refusal not detected: ${refusal}`);
+  }
   for (const refusal of refusals) {
     const wizard = createWizard({
       corpus: { search: () => [] },
@@ -3716,11 +3730,206 @@ test("a bare refusal on an actionable request never ships without an attempt", a
       question: "clear a 50x50 area around me, starting at the ground beneath this tree",
     });
     // The refusal sentence itself must not reach the child verbatim.
+    assert.notEqual(result.answer, refusal);
     assert.ok(
       !result.answer.includes(refusal),
       `bare refusal shipped to the child: ${result.answer}`,
     );
+    // And the turn must be a real attempt, not merely different prose.
+    assert.ok(
+      result.action !== null || answerOffersAction(result.answer),
+      `no attempt and no bound offer: ${result.mode} / ${result.answer}`,
+    );
   }
+});
+
+// Issue #44 acceptance: the reported live session, both actionable turns, with
+// the provider behaving exactly as it did that day. Before this work turn 1
+// shipped the refusal verbatim (mode "chat:model") and turn 2 threw into the
+// offline catch (mode "offline-fallback"); both delivered action === null.
+test("the reported live terrain session produces real in-world work", async () => {
+  const cases = [
+    ["clear a 50x50 area around me, starting at the ground beneath this tree",
+      "I can't safely clear a 50x50 area with the available in-world action here."],
+    ["just level the ground, remove all blocks in a 50x50 area",
+      "Got it - I'll clear and level a 50x50 area for you."],
+  ];
+  for (const [question, providerAnswer] of cases) {
+    let providerCalls = 0;
+    const wizard = createWizard({
+      corpus: { search: () => [] },
+      env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+      logger: { warn() {} },
+      fetchImpl: async () => {
+        providerCalls += 1;
+        return new Response(JSON.stringify({
+          choices: [{ message: { content: JSON.stringify({ answer: providerAnswer }) } }],
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      },
+    });
+    const result = await wizard.ask({ player: "LiveKid", question });
+    assert.ok(result.action, `no action for the live turn: ${question}`);
+    assert.equal(result.action.type, "run_commands");
+    assert.deepEqual(result.action.commands, ["fill ~-25 ~0 ~-25 ~25 ~11 ~25 air"]);
+    // The deterministic rung answers it outright, so the turn costs nothing.
+    assert.equal(providerCalls, 0, `terrain turn consulted the provider: ${question}`);
+    assert.ok(!result.answer.includes(providerAnswer));
+  }
+});
+
+// Issue #44 negative: the never-empty floor must not fire where "do something
+// anyway" would be wrong. A superseded turn is not a planning failure — a newer
+// request already won — and a review that neither completes nor corrects must
+// still fail closed rather than replace a child's finished build.
+test("the never-empty floor stays silent on superseded and failed-review turns", async () => {
+  const sessions = createMemorySessionStore();
+  let releaseFirst;
+  let firstStarted;
+  const firstSeen = await new Promise((resolve) => {
+    firstStarted = new Promise((started) => resolve(started));
+  });
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    sessions,
+    fetchImpl: async (_url, options) => {
+      const input = JSON.parse(options.body).messages[1].content;
+      if (input.includes("first castle")) {
+        firstSeen();
+        await new Promise((resolve) => { releaseFirst = resolve; });
+      }
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ answer: "Building it now.", action: null }) } }],
+      }), { status: 200, headers: { "content-type": "application/json" } });
+    },
+  });
+  const stale = wizard.ask({ player: "RaceKid", question: "build me a first castle", requestId: "race-a" });
+  await firstStarted;
+  const winner = await wizard.ask({ player: "RaceKid", question: "build me a second castle", requestId: "race-b" });
+  assert.ok(winner.action);
+  releaseFirst();
+  const superseded = await stale;
+  assert.equal(superseded.superseded, true);
+  assert.equal(superseded.action, null);
+  assert.equal(superseded.mode, "superseded");
+  // The floor did not rewrite a superseded reply into an offer.
+  assert.notEqual(superseded.mode, "local-offer-floor");
+
+  // A goal review whose verdict is neither completion nor a related correction
+  // fails closed: no action, and no escalation rung invents one.
+  const reviewWizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    logger: { warn() {} },
+    fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            answer: "Looks fine to me.",
+            goal: { summary: "castle", status: "active", criteria: ["it stands"] },
+          }),
+        },
+      }],
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  await reviewWizard.ask({ player: "ReviewKid", question: "build me a castle", requestId: "rev-1" });
+  const review = await reviewWizard.ask({
+    player: "ReviewKid",
+    question: "Review the completed in-world attempt",
+    goalReview: { goalId: "rev-1" },
+  });
+  assert.equal(review.action, null, "a failed review invented an action");
+  assert.notEqual(review.mode, "local-offer-floor");
+  assert.notEqual(review.mode, "planning-deferred");
+});
+
+// Issue #44: the deterministic terrain rung. A live child asked twice for a
+// 50x50 clear and got nothing both times, because classifyAction had no terrain
+// rung at all. Every phrasing below was verified against the shipped code as a
+// no-action turn before this rung existed.
+test("terrain work orders compile to a validated fill-with-air action", () => {
+  const phrasings = [
+    "clear a 50x50 area around me, starting at the ground beneath this tree",
+    "just level the ground, remove all blocks in a 50x50 area",
+    "wiz can you clear the trees around here",
+    "remove all blocks in a 50x50 area",
+    "level the ground here",
+    "flatten this hill please",
+  ];
+  for (const question of phrasings) {
+    const action = classifyAction(question);
+    assert.ok(action, `no action for terrain request: ${question}`);
+    assert.equal(action.type, "run_commands", `wrong action type for: ${question}`);
+    assert.ok(action.commands.length >= 1 && action.commands.length <= 8);
+    for (const command of action.commands) {
+      assert.match(command, /^fill ~-\d+ ~\d+ ~-\d+ ~\d+ ~\d+ ~\d+ air$/);
+      assert.ok(command.length <= 500);
+      assert.ok(!/[\r\n\0]/.test(command));
+      // No selector, no second command, no guarded block ever appears.
+      assert.ok(!/@[aeprs]\b|command_block|tnt|lava|structure_block|mob_spawner/i.test(command));
+    }
+  }
+  // "flatten this hill" names no size, so the default footprint carries it.
+  const defaulted = classifyAction("flatten this hill please");
+  assert.deepEqual(defaulted.commands, ["fill ~-8 ~0 ~-8 ~8 ~11 ~8 air"]);
+  // A 50x50 footprint is 51x51 = 2601 blocks a layer; 12 layers is 31212,
+  // under Bedrock's 32768 per-fill cap, so it stays ONE command.
+  const fifty = classifyAction("clear a 50x50 area around me");
+  assert.deepEqual(fifty.commands, ["fill ~-25 ~0 ~-25 ~25 ~11 ~25 air"]);
+});
+
+// Negative half: the rung must not steal a turn that already belongs to another
+// route. Every one of these returns exactly what it returned before the rung
+// existed (verified against the pre-change module).
+test("the terrain rung never steals a build, a lesson, a recipe or a question", () => {
+  // Placement after the refusesBuild bail is what makes this one hold.
+  assert.equal(classifyAction("just explain how to clear a 50x50 area"), null);
+  // Entangled with construction: stays a build request so subject fidelity
+  // still owns the castle, rather than clearing the ground and stopping.
+  assert.equal(classifyAction("clear the ground and build me a castle"), null);
+  assert.equal(classifyAction("what command clears an area"), null);
+  assert.equal(classifyAction("what happens if I dig straight down"), null);
+  // "make this flat" was pinned null here only because that was the behaviour
+  // before the rung existed, and that behaviour IS the do-nothing outcome the
+  // rung exists to remove. It is a levelling order with a pronoun in place of a
+  // noun, so it now reaches a fill like any other terrain request.
+  assert.equal(classifyAction("make this flat")?.type, "run_commands");
+  // The build-delivery form must still belong to the build path.
+  assert.equal(classifyAction("make me a flat roof house")?.type, "build_structure");
+  assert.equal(classifyAction("how do I craft a hopper")?.type, "show_recipe");
+  assert.equal(classifyAction("light up this area")?.type, "place_area_torches");
+  assert.equal(classifyAction("build me a house")?.type, "build_structure");
+});
+
+// Issue #44 symmetry repair: #42 taught answerPromisesAction the terrain verbs
+// but left answerOffersAction and offeredActionQuestion on the pre-#42
+// constructive-only list, so the bound-offer floor could never bind for terrain
+// and a child's bare "yes" after "I can level the ground" went nowhere.
+test("a terrain-verb offer is recognized as an offer and never as a refusal", () => {
+  const offers = [
+    "I can level the ground around you.",
+    "I can dig out a 20x20 pit here.",
+    "I can clear the trees around here for you.",
+    "Would you like me to flatten this hill?",
+  ];
+  for (const offer of offers) {
+    assert.equal(answerOffersAction(offer), true, `offer not detected: ${offer}`);
+    assert.equal(answerRefusesAction(offer), false, `offer misread as a refusal: ${offer}`);
+  }
+  // Negative half: prose with no offer framing and no verb must stay unmatched,
+  // and a refusal must never be mistaken for an offer.
+  for (const notAnOffer of [
+    "The ground here is already level.",
+    "Digging straight down is dangerous.",
+    "That patch of dirt has been there a long while.",
+  ]) {
+    assert.equal(answerOffersAction(notAnOffer), false, `false offer: ${notAnOffer}`);
+  }
+  // "I can't clear that" contains "i can" and so still reads as an offer to the
+  // shape matcher — which is exactly why the never-empty floor must consult
+  // answerRefusesAction alongside it and never treat a refusal as a bound offer.
+  assert.equal(answerRefusesAction("I can't clear that area."), true);
 });
 
 // Negative half: a genuinely answer-only question must still be allowed to say
