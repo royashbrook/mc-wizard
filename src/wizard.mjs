@@ -102,8 +102,11 @@ function answerPromisesAction(answer = "") {
 // through to the same recovery ladder an empty promise uses, instead of
 // handing a child "I can't do that" with no attempt.
 function answerRefusesAction(answer = "") {
-  return /\b(?:i\s*(?:can|could)(?:n['’]t| not)|i\s*am\s*(?:not\s*)?unable|i['’]m\s*(?:not\s*)?unable|isn['’]t\s+something\s+i\s+can|not\s+something\s+i\s+can|i\s+won['’]t\s+be\s+able)\b/i
-    .test(answer);
+  // The negation must be spelled out per form: "can" + "n't" only works when
+  // the apostrophe form keeps its own n ("can't", not "cann't").
+  return /\bi\s*(?:can['’]t|cannot|can\s+not|could\s*n['’]t|could\s+not|won['’]t\s+be\s+able|will\s+not\s+be\s+able)\b/i.test(answer)
+    || /\bi\s*(?:am|['’]m)\s*(?:not\s+)?unable\b/i.test(answer)
+    || /\b(?:isn['’]t|is\s+not|not)\s+something\s+i\s+can\b/i.test(answer);
 }
 
 function answerOffersAction(answer = "") {

@@ -3692,8 +3692,14 @@ test("a bare continuation token never returns extractive documentation", async (
 // refusal, even though a fill-with-air run_commands action is fully allowed
 // and the system prompt explicitly forbids refusing achievable requests.
 test("a bare refusal on an actionable request never ships without an attempt", async () => {
+  // #44 follow-up: this test previously asserted with the SAME regex the
+  // implementation used, so a defect in that regex made the test green while
+  // the bug shipped ("I can't ..." never matched). Assert on the literal
+  // refusal text instead, so the test can never share the code's blind spot.
   const refusals = [
     "I can't safely clear a 50x50 area with the available in-world action here.",
+    "I cannot do that here.",
+    "I couldn't build that for you.",
     "I'm unable to do that with my current abilities.",
     "That isn't something I can do in this world.",
   ];
@@ -3709,9 +3715,9 @@ test("a bare refusal on an actionable request never ships without an attempt", a
       player: "ClearKid",
       question: "clear a 50x50 area around me, starting at the ground beneath this tree",
     });
-    assert.doesNotMatch(
-      result.answer,
-      /\b(?:i\s*(?:can|could)(?:n['’]t| not)|i['’]m unable|isn['’]t something i can)\b/i,
+    // The refusal sentence itself must not reach the child verbatim.
+    assert.ok(
+      !result.answer.includes(refusal),
       `bare refusal shipped to the child: ${result.answer}`,
     );
   }
