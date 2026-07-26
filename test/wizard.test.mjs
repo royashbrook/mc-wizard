@@ -23,6 +23,7 @@ import {
   classifyAction,
   createWizard,
   instantConversationAnswer,
+  parseRequestedDimensions,
   providerTimeoutMs,
 } from "../src/wizard.mjs";
 import { validateConsoleCommand } from "../src/admin.mjs";
@@ -4375,4 +4376,22 @@ test("a plain delivery for an enchantment request still says so", async () => {
   assert.ok(result.action?.items?.length, "nothing was delivered at all");
   assert.equal(result.action.items[0].enchantments, undefined);
   assert.match(result.answer, /arrives plain/i);
+});
+
+// A child asked for a wizard tower "100 blocks tall at least" and got a plain
+// 9x9x16 box. Two request-level defects fed that: the height pattern only
+// matched two digits, so a 3-digit height parsed as NO height at all, and an
+// over-large request was passed through unclamped for the planner to author
+// and the validator to then reject wholesale. Size the request down instead,
+// which is what the terrain rung already does for a 100x100 sweep.
+test("a three-digit height is parsed instead of being silently ignored", () => {
+  // "100 blocks tall" matched a two-digit pattern and parsed as NO height at
+  // all, so nothing downstream ever knew the request needed sizing down. The
+  // TRUE size is returned here; sizing down happens where the plan is built,
+  // so the wizard can still say what was asked for versus what it is building.
+  assert.equal(parseRequestedDimensions("build a wizard tower 100 blocks tall at least")?.height, 100);
+  assert.deepEqual(parseRequestedDimensions("a 200x200 castle"), { width: 200, depth: 200 });
+  assert.deepEqual(parseRequestedDimensions("a 12x12 house 30 blocks high"), { width: 12, depth: 12, height: 30 });
+  assert.deepEqual(parseRequestedDimensions("a tower 40 blocks tall"), { height: 40 });
+  assert.equal(parseRequestedDimensions("build me a castle"), undefined);
 });

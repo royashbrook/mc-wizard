@@ -253,21 +253,27 @@ export function parseRequestedDimensions(question) {
   const square = text.match(/\b(?:size|sized)\s+(\d{1,3})\b/);
   const width = text.match(/\b(\d{1,3})\s+blocks?\s+wide\b/);
   const depth = text.match(/\b(\d{1,3})\s+blocks?\s+(?:deep|long)\b/);
-  const height = text.match(/\b(\d{1,2})\s+blocks?\s+(?:tall|high)\b/);
+  // Three digits, not two: "100 blocks tall" used to parse as NO height at all,
+  // so nothing downstream ever knew the request needed sizing down.
+  const height = text.match(/\b(\d{1,3})\s+blocks?\s+(?:tall|high)\b/);
   if (!size && !square && !width && !depth && !height) return undefined;
+  // The TRUE requested size is returned, not a clamped one: callers need the
+  // original to say "you asked for 500 by 500, I am doing 64 by 64". Sizing
+  // down belongs where the plan is built, not here.
+  const sized = (value) => Number(value);
   if (size) return {
-    width: Number(size[1]),
-    depth: Number(size[2]),
-    ...(size[3] || height ? { height: Number(size[3] || height[1]) } : {}),
+    width: sized(size[1], "width"),
+    depth: sized(size[2], "depth"),
+    ...(size[3] || height ? { height: sized(size[3] || height[1], "height") } : {}),
   };
   if (square) return {
-    width: Number(square[1]), depth: Number(square[1]),
-    ...(height ? { height: Number(height[1]) } : {}),
+    width: sized(square[1], "width"), depth: sized(square[1], "depth"),
+    ...(height ? { height: sized(height[1], "height") } : {}),
   };
   return {
-    ...(width ? { width: Number(width[1]) } : {}),
-    ...(depth ? { depth: Number(depth[1]) } : {}),
-    ...(height ? { height: Number(height[1]) } : {}),
+    ...(width ? { width: sized(width[1], "width") } : {}),
+    ...(depth ? { depth: sized(depth[1], "depth") } : {}),
+    ...(height ? { height: sized(height[1], "height") } : {}),
   };
 }
 
