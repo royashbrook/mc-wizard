@@ -266,7 +266,45 @@ function validatePrimitives(value, dimensions, { partial = false, primaryMateria
       throw salvageRejection(`solid primitives must include ${STRUCTURE_PHASES.join(", ")}`, salvage);
     }
     offset = axes.map((axis) => Math.min(...solids.map(({ from }) => from[axis])));
-    const extents = axes.map((axis) => Math.max(...solids.map(({ to }) => to[axis])) - offset[axis] + 1);
+    // A planner asked for a 100-block tower authored primitives up to y=99, and
+    // the recomputed extents threw before any salvage could run, discarding the
+    // whole authored tower. Drop the primitives that sit past the limit and
+    // keep the rest, so the child gets the tallest allowed version of the tower
+    // they asked for instead of a generic substitute.
+    const limits = { 0: STRUCTURE_LIMITS.width, 1: STRUCTURE_LIMITS.height, 2: STRUCTURE_LIMITS.depth };
+    const outOfRange = entries.filter(({ to, from, blockId }) => blockId !== "minecraft:air"
+      && axes.some((axis) => Math.max(to[axis], from[axis]) - offset[axis] + 1 > limits[axis]));
+    if (outOfRange.length) {
+      // Salvage only when the surviving solids still cover every phase the plan
+      // already had. Dropping an entire phase (a 199-wide foundation and shell,
+      // say) would leave a roof floating over nothing, so that still fails
+      // closed on the original hard-cap message.
+      const phasesOf = (list) => new Set(list.filter(({ blockId }) => blockId !== "minecraft:air").map(({ phase }) => phase));
+      const before = phasesOf(entries);
+      const after = phasesOf(entries.filter((entry) => !outOfRange.includes(entry)));
+      if (after.size < before.size) {
+        const axis = axes.find((index) => outOfRange.some(({ to, from }) => (
+          Math.max(to[index], from[index]) - offset[index] + 1 > limits[index])));
+        const name = ["width", "height", "depth"][axis];
+        throw new Error(`${name} must be an integer from 1-${STRUCTURE_LIMITS[name]}`);
+      }
+      const keep = new Set(entries.filter((entry) => !outOfRange.includes(entry)));
+      for (const entry of outOfRange) {
+        dropped.push({
+          index: entry.index,
+          reason: `primitives[${entry.index}] reaches past the tallest shape my wand can raise, so it was left off`,
+        });
+      }
+      entries = entries.filter((entry) => keep.has(entry));
+      warnings.push(`the shape reached past my limit, so I built the largest piece of it I safely can`);
+      if (!entries.some(({ blockId }) => blockId !== "minecraft:air")) {
+        throw salvageRejection("every solid primitive sat outside the buildable bounds", salvage);
+      }
+      offset = axes.map((axis) => Math.min(...entries
+        .filter(({ blockId }) => blockId !== "minecraft:air").map(({ from }) => from[axis])));
+    }
+    const solidsInRange = entries.filter(({ blockId }) => blockId !== "minecraft:air");
+    const extents = axes.map((axis) => Math.max(...solidsInRange.map(({ to }) => to[axis])) - offset[axis] + 1);
     resultDimensions = {
       width: dimension(extents[0], "width"),
       height: dimension(extents[1], "height"),

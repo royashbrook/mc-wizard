@@ -349,3 +349,33 @@ test("a structure with unusable dimensions is still refused", () => {
     assert.throws(() => validateBuildStructurePlan({ ...base, dimensions }), /dimension|width|depth|height/i);
   }
 });
+
+// The declared-dimension clamp is not enough on its own: the extents are
+// recomputed from the primitives, so a planner that authored a genuinely
+// 100-tall tower still threw "height must be an integer from 1-64" and lost
+// the whole authored plan. That is the live wizard-tower failure.
+test("primitives taller than the limit are clamped rather than throwing", () => {
+  const tall = [];
+  for (let y = 0; y < 100; y += 1) {
+    tall.push({
+      shape: "box",
+      phase: y === 0 ? "foundation" : y >= 99 ? "roof" : "shell",
+      blockId: "minecraft:stone_bricks",
+      from: [0, y, 0],
+      to: [8, y, 8],
+    });
+  }
+  tall.push({ shape: "box", phase: "details", blockId: "minecraft:stone_bricks", from: [4, 1, 0], to: [4, 1, 0] });
+  const plan = {
+    kind: "tower",
+    title: "Wizardy Tower",
+    dimensions: { width: 9, depth: 9, height: 100 },
+    materials: { primary: "minecraft:stone_bricks", accent: "minecraft:cobblestone", roof: "minecraft:deepslate_bricks" },
+    features: ["walls", "roof"],
+    phases: ["foundation", "shell", "roof", "details"],
+    primitives: tall.slice(0, 96),
+  };
+  const validated = validateBuildStructurePlan(plan);
+  assert.ok(validated.dimensions.height <= 64, `height was not clamped: ${validated.dimensions.height}`);
+  assert.ok(validated.primitives.length > 0, "every primitive was dropped");
+});
