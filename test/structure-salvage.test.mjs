@@ -291,3 +291,61 @@ test("renormalized dimensions stay hard-capped at the structure limits", () => {
     { shape: "box", phase: "details", blockId: "minecraft:glowstone", from: [0, 5, 0], to: [0, 5, 0] },
   ], { dimensions: { width: 100, depth: 11, height: 6 } })), /width must be an integer from 1-128/);
 });
+
+// A child asked for a wizard tower "100 blocks tall at least" and got a plain
+// 9x9x16 box. The planner's tower was discarded whole because height 100
+// exceeds the 64 bound, and the local fallback then threw the style away too.
+// The terrain rung already handles this correctly by clamping a 100x100 sweep
+// to 64x64 and saying so; a structure must do the same rather than lose the
+// entire authored plan over one out-of-range number.
+test("an over-tall structure is clamped with a warning instead of discarded", () => {
+  const plan = {
+    kind: "tower",
+    title: "Wizardy Tower",
+    dimensions: { width: 9, depth: 9, height: 100 },
+    materials: { primary: "minecraft:stone_bricks", accent: "minecraft:stone_bricks", roof: "minecraft:stone_bricks" },
+    features: ["walls", "roof"],
+    phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:stone_bricks", from: [0, 0, 0], to: [8, 0, 8] },
+      { shape: "hollow_box", phase: "shell", blockId: "minecraft:stone_bricks", from: [0, 1, 0], to: [8, 62, 8] },
+      { shape: "box", phase: "roof", blockId: "minecraft:stone_bricks", from: [0, 63, 0], to: [8, 63, 8] },
+      { shape: "box", phase: "details", blockId: "minecraft:stone_bricks", from: [4, 62, 0], to: [4, 62, 0] },
+    ],
+  };
+  const validated = validateBuildStructurePlan(plan);
+  assert.equal(validated.dimensions.height, 64, "the tower was not clamped to the tallest allowed height");
+  assert.ok(
+    (validated.salvage?.warnings || []).some((warning) => /height/i.test(warning)),
+    `the clamp was not reported: ${JSON.stringify(validated.salvage)}`,
+  );
+  // The authored geometry survives: this is a clamp, not a substitution.
+  assert.equal(validated.primitives.length, 4);
+  assert.ok(validated.primitives.some((entry) => entry.shape === "hollow_box"));
+});
+
+// Negative half: the clamp is not a licence to ignore real limits. A dimension
+// that is not a usable number at all is still refused, and the volume ceiling
+// still holds.
+test("a structure with unusable dimensions is still refused", () => {
+  const base = {
+    kind: "tower",
+    title: "Broken",
+    materials: { primary: "minecraft:stone_bricks", accent: "minecraft:stone_bricks", roof: "minecraft:stone_bricks" },
+    features: ["walls"],
+    phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:stone_bricks", from: [0, 0, 0], to: [1, 0, 1] },
+      { shape: "box", phase: "shell", blockId: "minecraft:stone_bricks", from: [0, 1, 0], to: [1, 1, 1] },
+      { shape: "box", phase: "roof", blockId: "minecraft:stone_bricks", from: [0, 2, 0], to: [1, 2, 1] },
+      { shape: "box", phase: "details", blockId: "minecraft:stone_bricks", from: [0, 2, 0], to: [0, 2, 0] },
+    ],
+  };
+  for (const dimensions of [
+    { width: 0, depth: 9, height: 9 },
+    { width: "tall", depth: 9, height: 9 },
+    { width: 9, depth: 9, height: -5 },
+  ]) {
+    assert.throws(() => validateBuildStructurePlan({ ...base, dimensions }), /dimension|width|depth|height/i);
+  }
+});

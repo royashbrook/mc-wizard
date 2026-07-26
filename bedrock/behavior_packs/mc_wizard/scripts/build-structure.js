@@ -137,6 +137,23 @@ function dimension(value, name) {
   return number;
 }
 
+// A child asking for a 100-block tower should get the tallest tower allowed,
+// not lose the whole authored plan over one number. An unusable value (not a
+// positive integer) still throws; only an over-large one is clamped, and the
+// clamp is reported so the wizard can say it out loud. Mirrors the terrain
+// rung, which already clamps a 100x100 sweep to 64x64 and narrates it.
+function clampedDimension(value, name, notes) {
+  const number = Number(value);
+  if (!Number.isInteger(number) || number < 1) {
+    throw new Error(`${name} must be an integer from 1-${STRUCTURE_LIMITS[name]}`);
+  }
+  if (number > STRUCTURE_LIMITS[name]) {
+    notes.push(`${name} ${number} is taller than my wand can raise in one spell, so I am building ${STRUCTURE_LIMITS[name]}`);
+    return STRUCTURE_LIMITS[name];
+  }
+  return number;
+}
+
 function vector(value, name, dimensions, horizontalMargin = 0) {
   if (!Array.isArray(value) || value.length !== 3) throw new Error(`${name} must be an x,y,z vector`);
   const limits = [dimensions.width, dimensions.height, dimensions.depth];
@@ -442,10 +459,11 @@ export function validateBuildStructurePlan(value) {
   if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error("structure plan must be an object");
   const mode = value.mode === undefined ? undefined : String(value.mode);
   if (mode !== undefined && mode !== "modify") throw new Error("mode must be modify when provided");
+  const clampNotes = [];
   const dimensions = {
-    width: dimension(value.dimensions?.width, "width"),
-    depth: dimension(value.dimensions?.depth, "depth"),
-    height: dimension(value.dimensions?.height, "height"),
+    width: clampedDimension(value.dimensions?.width, "width", clampNotes),
+    depth: clampedDimension(value.dimensions?.depth, "depth", clampNotes),
+    height: clampedDimension(value.dimensions?.height, "height", clampNotes),
   };
   const materials = Object.fromEntries(["primary", "accent", "roof"].map((name) => {
     const itemId = String(value.materials?.[name] || "");
@@ -468,7 +486,7 @@ export function validateBuildStructurePlan(value) {
     phases: [...STRUCTURE_PHASES],
   };
   if (mode) plan.mode = mode;
-  const salvage = { warnings: [], dropped: [] };
+  const salvage = { warnings: [...clampNotes], dropped: [] };
   let offset = [0, 0, 0];
   if (value.primitives !== undefined) {
     const salvaged = validatePrimitives(value.primitives, dimensions, {
