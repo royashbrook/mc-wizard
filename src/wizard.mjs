@@ -15,6 +15,10 @@ import { createTurnState } from "./roles/turn-state.mjs";
 import { createIntent } from "./roles/intent.mjs";
 import { createCritic } from "./roles/critic.mjs";
 import { createTerrainPlanner } from "./roles/terrain.mjs";
+import { createGiftDetector } from "./roles/gift.mjs";
+import { createTravelDetector } from "./roles/travel.mjs";
+import { createEffectDetector } from "./roles/effect.mjs";
+import { createAdminDetector } from "./roles/admin.mjs";
 import { createEscalator, RUNG } from "./roles/escalation.mjs";
 import { createOrchestrator, createTurnBudget } from "./roles/orchestrator.mjs";
 import {
@@ -1637,6 +1641,14 @@ function commandAction(question) {
     const direct = clause.replace(/^(?:(?:hey|hi)[, ]+)?(?:(?:wizard|wiz)[,:]?\s*)?/i, "");
     const effectOnly = direct.replace(effect[0], "").replace(/\bplease\b/gi, "").replace(/[.!?]/g, "").trim() === "";
     return /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:give|grant|add)\s+me\b/i.test(direct)
+      // #44: the wizard's own bound offer is spoken in the second person ("I can
+      // give you night vision"), and a bare "yes" replays that clause verbatim
+      // as the next request. Reading it back costs no authority: every branch
+      // below emits `effect @s <id>`, which reaches the requester and nobody
+      // else, and the effect ids are unchanged. Anchored at the head of the
+      // clause and requiring the whole word "you", so "give your friend speed"
+      // and "what if i give you night vision" still match nothing here.
+      || /^(?:please\s+)?(?:give|grant|add)\s+you\b/i.test(direct)
       || /^(?:can|could|may)\s+i\s+(?:please\s+)?(?:get|have|receive)\b/i.test(direct)
       || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?(?:apply|cast)\b.{0,80}\b(?:to|on|for)\s+me\b/i.test(direct)
       || /^(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?put\b.{0,80}\b(?:on|for)\s+me\b/i.test(direct)
@@ -1938,6 +1950,102 @@ const terrainPlanner = createTerrainPlanner({
 });
 const { terrainIntent, terrainAction } = terrainPlanner;
 
+// #44: the four remaining non-build detectors (src/roles/{gift,travel,effect,
+// admin}.mjs). Same posture as the terrain planner above:
+//   * every dependency is INJECTED, so no role imports this file (no cycle);
+//   * every one of them AUTHORS NOTHING PRIVILEGED — each hands a normalised
+//     request to the SAME already-validated builder the ladder calls today
+//     (giveItemsAction, localTravelAction, dimensionTravelAction, commandAction,
+//     worldControlAction, trustedAdminAction) and re-validates the result
+//     through allowedWizardAction. Detection widens; authority does not. The
+//     gift allowlist, the effect ids, the teleport consent path and the
+//     server.console policy are untouched by this wiring.
+const giftDetector = createGiftDetector({
+  giveItemsAction,
+  allowedWizardAction,
+  explicitlyRequestsBuild,
+  explicitlyRequestsCommand,
+  isRecipeRequest,
+  isOrdinaryConversation,
+});
+const { giftIntent, giftAction } = giftDetector;
+
+// THE QUANTITY BOUND DOES NOT MOVE. The detector clamps an over-large amount
+// DOWN and announces the clamp, which is right for phrasings the existing
+// builder never read — but the existing builder REFUSES an impossible amount
+// outright ("give me 10001 torches", "give me -1 torches"), and recognising
+// more phrasings must never turn a refusal into a delivery. requestedItemAmount
+// is the existing parser and stays the only authority on what a child may ask
+// for; a null from it stops the gift rung dead, at every site that has one.
+const giftAmountIsImpossible = (question) => requestedItemAmount(question) === null;
+
+// Detail the local builder cannot express, but a model can: an enchantment or a
+// custom item name. The deterministic ladder YIELDS those turns rather than
+// spending them on a plain substitute — the cost gate would otherwise skip the
+// consultation entirely because an action already existed. Nothing is lost if
+// the model never delivers: RUNG.GIFT runs the same detector with no such gate,
+// so the floor still hands over the plain item with its honest caveat.
+const GIFT_DETAIL_BEYOND_LOCAL = /\benchant(?:ed|ing|ment|ments)?\b|\bnamed\b|\bcalled\b|\bname\s*tags?\b/i;
+
+// The floor's gift rung: the quantity bound still holds — it holds at every
+// site — but nothing is yielded to a model that has already had its turn and
+// produced nothing. A plain iron pickaxe with an honest caveat beats silence.
+const floorGiftAction = (question) => (giftAmountIsImpossible(question) ? null : giftAction(question));
+// The deterministic ladder's gift rung, which runs BEFORE the model is consulted.
+const localGiftAction = (question) => (
+  GIFT_DETAIL_BEYOND_LOCAL.test(question) ? null : floorGiftAction(question));
+
+const travelDetector = createTravelDetector({
+  localTravelAction,
+  dimensionTravelAction,
+  allowedWizardAction,
+  explicitlyRequestsBuild,
+  explicitlyRequestsCommand,
+  isRecipeRequest,
+  isOrdinaryConversation,
+});
+const { travelIntent, travelAction } = travelDetector;
+
+// "make me fly" and "make me fast" are the two commonest child phrasings for an
+// effect, and both were measured MISSES. The cause is not the detector: it is
+// that explicitlyRequestsBuild treats a bare "make me <x>" as a build request
+// (see the pronoun clause below its `made` match), so the detector's
+// hand-the-turn-to-the-build-path bail fired on exactly the turns it exists to
+// serve — while the build ladder itself resolves those turns to nothing,
+// because there is no noun in them to build.
+//
+// This wrapper does NOT weaken explicitlyRequestsBuild, which is untouched and
+// still the sole authority everywhere else. It asks the same predicate the same
+// question a second time with the bare pronoun removed: if the clause still
+// registers as a build ("make me a castle", "make me pixel art") the detector
+// bails exactly as before; if the only thing holding it up was the pronoun, the
+// build path has nothing to lose. It can only ever make the detector fire on
+// turns the build ladder would have answered with silence.
+const explicitlyRequestsBuildBeyondPronoun = (question) => explicitlyRequestsBuild(question)
+  && explicitlyRequestsBuild(String(question || "").replace(/\bmake\s+(?:me|us)\s+(?!an?\b|some\b)/gi, "make "));
+
+const effectDetector = createEffectDetector({
+  commandAction,
+  allowedWizardAction,
+  explicitlyRequestsBuild: explicitlyRequestsBuildBeyondPronoun,
+  explicitlyRequestsCommand,
+  isRecipeRequest,
+  isOrdinaryConversation,
+});
+const { effectIntent, effectAction } = effectDetector;
+
+const adminDetector = createAdminDetector({
+  worldControlAction,
+  trustedAdminAction,
+  allowedWizardAction,
+  explicitlyRequestsBuild,
+  explicitlyRequestsCommand,
+  isRecipeRequest,
+  isOrdinaryConversation,
+  isPotionRainRequest,
+});
+const { adminIntent, adminAction } = adminDetector;
+
 export function classifyAction(question, history = []) {
   question = normalizeActionRequest(question);
   const refusesBuild = /\b(?:don't|dont|do not|never|without)\b.{0,30}\b(?:build|building|construct|create|make|place|demo|demonstrate|show)\b/i.test(question)
@@ -1970,6 +2078,34 @@ export function classifyAction(question, history = []) {
   // keeps "just explain how to clear a 50x50 area" from producing a fill.
   const terrain = terrainAction(question);
   if (terrain) return terrain;
+  // #44: the four non-build detectors sit BEHIND the builders they delegate to,
+  // never in front of them. Each one is reached only once the existing builder
+  // has already declined the child's own wording, so this ladder is strictly
+  // additive: no rung above loses a turn it owns today, and every action that
+  // leaves here is still the value the existing builder + allowedWizardAction
+  // produced.
+  const travel = travelAction(question);
+  // The same hard stop the INVALID_LOCAL_TRAVEL check above makes:
+  // localTravelAction's sentinel means "this destination must not be aimed at",
+  // and it ends the whole ladder rather than becoming a different destination.
+  if (typeof travel === "symbol") return null;
+  if (travel) return travel;
+  // The gift rung sits AHEAD of the effect rung: a request that names a real
+  // item is a delivery even when the reason for wanting it is an effect the
+  // wizard could also cast. "give me a torch to see in the dark" is a torch.
+  const gift = localGiftAction(question);
+  if (gift) return gift;
+  const effect = effectAction(question);
+  if (effect) return effect;
+  // The settings detector sits AHEAD of worldControlAction, and only here does
+  // a detector precede the builder it delegates to. It has to: "make it stop
+  // raining" reads as RAIN to the builder's keyword scan and as CLEAR to the
+  // child who asked for it to stop, and the detector is the piece that knows
+  // the difference. It re-uses the builder's own literal whenever the two
+  // agree, and its framing bails are stricter, so a turn it declines still
+  // falls through to the builder immediately below.
+  const adminSetting = adminAction(question);
+  if (adminSetting) return adminSetting;
   const worldControl = worldControlAction(question);
   if (worldControl) return worldControl;
   const placedBlock = simpleBlockPlacementAction(question);
@@ -2133,6 +2269,18 @@ function hasUnmatchedDescriptors(question, action) {
   });
 }
 
+// #44: the four rungs this file adds beside RUNG.TERRAIN. They are named here
+// rather than in src/roles/escalation.mjs because RUNG_ORDER /
+// createStandardEscalator describe that module's own canonical R0..R6 ladder,
+// which this file does not use and must not reshape. createEscalator rejects a
+// duplicate rung name, so these can never collide with the imported ones.
+const ACTIONABLE_RUNG = Object.freeze({
+  TRAVEL: "travel",
+  EFFECT: "effect",
+  ADMIN: "admin",
+  GIFT: "gift",
+});
+
 const PLANNING_DEFERRED_ANSWER = "I’m keeping this as our active project, but I don’t have a safe executable change yet. Tell me one specific block or behavior to change and I’ll continue from there.";
 
 // #44 the never-empty floor's last resort. It offers (so a bare "yes" binds), it
@@ -2184,7 +2332,11 @@ function localAnswer(question, hits, action, history = []) {
     return "I’ll build a complete automatic smelter nearby, with one chest for things to smelt, one for fuel, and one for finished items. I’ll check every hopper before I call it done.";
   }
   if (action?.type === "world_control") {
-    const changes = [action.time && `make it ${action.time}`, action.weather && `bring ${action.weather}`].filter(Boolean).join(" and ");
+    // #44: "bring clear" is what a child now hears for "stop the rain", which
+    // the settings rung made a common turn. Clearing the sky gets its own words.
+    const weather = action.weather === "clear" ? "clear the sky"
+      : action.weather === "thunder" ? "roll in a thunderstorm" : `bring ${action.weather}`;
+    const changes = [action.time && `make it ${action.time}`, action.weather && weather].filter(Boolean).join(" and ");
     return `One flick of the wand—I’ll ${changes} now.`;
   }
   if (action?.type === "run_commands") {
@@ -2196,6 +2348,14 @@ function localAnswer(question, hits, action, history = []) {
       const verb = terrain.mode === "level" ? "level" : "clear";
       const opening = `Stand back—I’m about to ${verb} a ${terrain.width} by ${terrain.depth} patch around you, ${terrain.height} blocks up from your feet, so you get open ground to build on.`;
       return terrain.caveat ? `${opening} ${terrain.caveat}` : opening;
+    }
+    // #44: an effect grant says which effect, and — where the wand cannot do
+    // literally what was asked ("make me fly") — says what it is casting
+    // instead. The generic line below never told the child either.
+    const effect = effectIntent(question);
+    if (effect) {
+      const opening = `Wand up—I’m casting ${effect.label} on you now.`;
+      return effect.caveat ? `${opening} ${effect.caveat}` : opening;
     }
     return "I know that spell. I’m casting it here now instead of handing you a command to type.";
   }
@@ -2219,7 +2379,14 @@ function localAnswer(question, hits, action, history = []) {
       `${amount}x ${itemId.replace("minecraft:", "").replaceAll("_", " ")}`
     )).join(", ");
     const recipient = action.recipient && action.recipient !== "requester" ? ` to ${action.recipient}` : " to you";
-    return `Item delivery! I’ll carry ${items}${recipient} now.`;
+    const delivery = `Item delivery! I’ll carry ${items}${recipient} now.`;
+    // #44: a delivery the child did not ask for word for word says so. The
+    // detector already wrote the honest sentence (an alias it substituted, an
+    // enchantment it cannot cast, an amount it clamped); the refusal guard is
+    // the one thing it must never trip, because an action IS being taken.
+    const caveat = giftIntent(question)?.caveat;
+    return caveat && !answerRefusesAction(caveat)
+      ? `${delivery} ${caveat[0].toUpperCase()}${caveat.slice(1)}` : delivery;
   }
   if (action?.type === "show_recipe") {
     return `I’ll lay out the ${action.itemId.replace("minecraft:", "").replaceAll("_", " ")} recipe as a giant crafting grid nearby, with the real ingredients in the right squares.`;
@@ -4383,12 +4550,17 @@ const turnIntent = createIntent({
   boundPendingOffer,
   isActionConfirmation,
   pendingActionTurn,
-  // Without this the non-build actionable detector defaults to "no", so
-  // intent.terrainIntent is always null: RUNG.TERRAIN can never fire and a
-  // terrain order on a turn that counts as a build request is rejected by the
-  // build-advance gate. The other four detectors do not exist yet and continue
-  // to default to "no".
+  // Without these the non-build actionable detectors default to "no", so
+  // intent.<x>Intent is always null: their rung can never fire and a terrain,
+  // travel, gift, effect or settings order issued on a turn that counts as a
+  // build request is rejected by the build-advance gate. Wiring all five is
+  // what finally generalises intent.actionableIntent beyond buildRequest, so the
+  // never-empty floor covers these categories too.
   terrainIntent,
+  travelIntent,
+  giftIntent,
+  effectIntent,
+  adminIntent,
 });
 
 // The tiered Critic (src/roles/critic.mjs). Every gate it runs is one of this
@@ -5334,14 +5506,93 @@ export function createWizard({
           answer: localAnswer(question, hits, candidate, actionHistory),
         };
       };
+      // The action types each non-build intent is allowed to own on a turn that
+      // also counts as a build request. Pairing the intent WITH the type is what
+      // keeps this from becoming a blanket exemption: an execute_program is
+      // exempt only for an operator request, never for a build step.
+      const nonBuildIntentOwns = (candidate) => {
+        const type = candidate?.type;
+        if (!type) return false;
+        if (intent.terrainIntent && type === "run_commands") return true;
+        if (intent.effectIntent && type === "run_commands") return true;
+        if (intent.travelIntent && (type === "local_travel" || type === "dimension_travel")) return true;
+        if (intent.giftIntent && type === "give_items") return true;
+        if (intent.adminIntent && type === "world_control") return true;
+        return Boolean(intent.adminIntent?.kind === "operator" && type === "execute_program");
+      };
       // R5. One in-character sentence naming ONE concrete step a rung can
       // actually produce. It satisfies answerOffersAction, fails
       // answerPromisesAction and answerRefusesAction, and is not a menu — so the
       // next bare "yes" binds and EXECUTES instead of asking again.
+      //
+      // EVERY branch below is checked by test/wizard.test.mjs against those
+      // three production predicates AND against classifyAction, which is what a
+      // bare "yes" replays. A branch that cannot name a real step still tells
+      // the truth rather than inventing one: there is no in-world step behind
+      // "turn on keep inventory", and the only thing worse than an empty turn is
+      // a promise the wizard cannot keep.
       const boundOfferAnswer = () => {
         const terrain = intent.terrainIntent;
         if (terrain) {
           return `I can ${terrain.mode === "level" ? "level" : "clear"} a ${terrain.width} by ${terrain.depth} patch of ground right where you are. Want me to?`;
+        }
+        const travel = intent.travelIntent;
+        if (travel) {
+          // An unsupported destination is NAMED, never silently swapped. The
+          // offer clause comes FIRST and the honest gap second, for two reasons:
+          // a child hears what will happen before what will not, and
+          // offeredActionQuestion replays the answer from its first offer verb
+          // onward — "the world spawn" contains one ("spawn"), so a leading
+          // caveat would hand the next "yes" a nonsense clause to bind.
+          // "I could not ..." is deliberately never said: answerRefusesAction
+          // reads it as a refusal, and it would be one.
+          const closest = travel.supported ? travel.label
+            : travel.mode === "home" ? "the nearest village" : "the surface";
+          const where = closest === "the surface" ? "up to the surface" : `to ${closest}`;
+          const gap = travel.supported ? ""
+            : `, which is the closest thing I can aim at — my travel magic has no marker for ${
+              travel.mode === "spawn" ? "the world spawn"
+                : travel.mode === "home" ? "your home" : travel.label}`;
+          return `I can bring us ${where}${gap}. Want me to?`;
+        }
+        const effect = intent.effectIntent;
+        if (effect) return `I can give you ${effect.label} right now. Want me to?`;
+        const admin = intent.adminIntent;
+        if (admin) {
+          if (admin.kind === "world") {
+            return admin.setting === "weather"
+              ? `I can change the weather to ${admin.value} for you. Want me to?`
+              : `I can change the sky to ${admin.value} for you. Want me to?`;
+          }
+          // Gamerules, difficulty, game mode and the operator badge have no
+          // builder behind them ON PURPOSE — a switch a grown-up owns is not
+          // this work's to hand out. The offer is the one true step left.
+          const setting = admin.kind === "operator" ? "Operator powers are"
+            : `${admin.label.replace(/^the /, "")} is`;
+          return `${setting[0].toUpperCase()}${setting.slice(1)} a world setting a grown-up flips, and my wand has no switch for it. I can show you exactly where they ${admin.step}. Want me to?`;
+        }
+        const gift = intent.giftIntent;
+        if (gift) {
+          const amount = gift.amount > 1 ? `${gift.amount} ` : "";
+          // "Is this thing stocked?" is asked of the BUILDER and the allowlist,
+          // never of this file, and it is asked without the recipient: an item
+          // the wizard has is still an item the wizard has when it does not know
+          // which player to hand it to.
+          const stocked = allowedWizardAction(giveItemsAction(`give me ${gift.amount} ${gift.item}`));
+          if (stocked) {
+            // A third party this rung cannot name is never guessed at and never
+            // quietly redirected — the swap to the requester is said out loud.
+            if (gift.recipient === null) {
+              return `I do not know your ${gift.recipientHint}'s exact player name yet, so my wand has nowhere to post it. I can give you ${amount}${gift.item} to hand over yourself. Want me to?`;
+            }
+            const target = gift.recipient === "requester" ? "you" : gift.recipient;
+            return `I can give ${target} ${amount}${gift.item}. Want me to?`;
+          }
+          // Not stocked. Nothing is substituted for it: the alternatives are
+          // named out loud and the child picks, which is why this shape asks a
+          // question a bare "yes" cannot answer.
+          const named = `${gift.item[0].toUpperCase()}${gift.item.slice(1)}`;
+          return `${named} is not in my spellbook yet, so I will not pretend to conjure one. I can give you a diamond pickaxe, 64 torches, or a stack of arrows instead. Which one would you like?`;
         }
         return null;
       };
@@ -5372,18 +5623,34 @@ export function createWizard({
           produce: () => buildFloor(localStructureFallback(question, actionHistory)),
           bypassCritique: true,
         },
-        {
-          name: RUNG.TERRAIN,
-          applies: (turn) => Boolean(turn?.terrainIntent),
+        // The five deterministic non-build rungs, in the same order their
+        // builders sit in classifyAction so no rung can take a turn another one
+        // already owns. Each fires only on its OWN intent, each re-runs the same
+        // code the ladder ran before the provider was consulted (which is the
+        // point: the provider may have destroyed a perfectly good local action),
+        // and each ships prose with an action, so like RUNG.TERRAIN before them
+        // they bypass the critique they never passed through.
+        ...[
+          [RUNG.TERRAIN, "terrainIntent", () => terrainAction(question)],
+          [ACTIONABLE_RUNG.TRAVEL, "travelIntent", () => travelAction(question)],
+          [ACTIONABLE_RUNG.EFFECT, "effectIntent", () => effectAction(question)],
+          [ACTIONABLE_RUNG.ADMIN, "adminIntent", () => adminAction(question)],
+          [ACTIONABLE_RUNG.GIFT, "giftIntent", () => floorGiftAction(question)],
+        ].map(([name, intentField, produceAction]) => ({
+          name,
+          applies: (turn) => Boolean(turn?.[intentField]),
           produce: () => {
-            const terrain = terrainAction(question);
-            return terrain ? {
-              action: terrain, responseMode: "local-skill",
-              answer: localAnswer(question, hits, terrain, actionHistory),
+            const produced = produceAction();
+            // travelAction can return the builder's hard-stop sentinel, which is
+            // never an action: it means "do not aim at that", so the rung
+            // produces nothing and the ladder walks on.
+            return produced && typeof produced !== "symbol" ? {
+              action: produced, responseMode: "local-skill",
+              answer: localAnswer(question, hits, produced, actionHistory),
             } : null;
           },
           bypassCritique: true,
-        },
+        })),
         {
           // Build turns keep their planning-deferred terminal, which the pack
           // already retries once on its own; the offer is for the actionable
@@ -5448,17 +5715,25 @@ export function createWizard({
           ),
           stillAdvances: (candidate) => {
             if (general || answerOnlyRequest || !buildRequest) return true;
-            // A terrain fill IS the work the child asked for, not a step in a
-            // build, so the build-advance test does not apply to it. Without
-            // this, a terrain order issued while a project is active was
-            // rejected here and fell through to the bound-offer floor.
-            if (intent.terrainIntent && candidate?.type === "run_commands") return true;
+            // A terrain fill, a delivery, a teleport, an effect or a world
+            // setting IS the work the child asked for, not a step in a build, so
+            // the build-advance test does not apply to any of them. Without
+            // this, such an order issued while a project is active was rejected
+            // here and fell through to the bound-offer floor. Generalised from
+            // the terrain-only exemption rather than special-cased per type: an
+            // action type is exempt only when THIS turn's matching intent
+            // actually recognised the request that produced it.
+            if (nonBuildIntentOwns(candidate)) return true;
             return Boolean(actionAdvancesBuildRequest(candidate, question, actionHistory));
           },
           emptyAnswer: () => localAnswer(question, hits, null, actionHistory),
         },
         critic: existenceCritic,
         escalator,
+        // The ladder is longer than the orchestrator's default seven rungs now
+        // that four non-build rungs sit beside RUNG.TERRAIN. Without this the
+        // walk would stop before the terminal rung it is supposed to end on.
+        maxEscalations: escalator.length,
         budget: createTurnBudget({ env }),
         assertions: {
           satisfiesOffer: (text) => answerOffersAction(text)

@@ -16,6 +16,7 @@ import {
   unsafeCommandAnswer,
 } from "../src/command-safety.mjs";
 import { reusableLearnedAction, safeNovelAction } from "../src/learned-recipes.mjs";
+import { allowedWizardAction } from "../src/skills.mjs";
 import {
   answerOffersAction,
   answerRefusesAction,
@@ -3942,4 +3943,316 @@ test("an honest knowledge gap is still allowed on a non-actionable question", as
     question: "what is the airspeed velocity of an unladen swallow",
   });
   assert.equal(result.action, null);
+});
+
+// ---------------------------------------------------------------------------
+// #44 WP-F — wiring the four remaining non-build detectors into the ladder,
+// the intent record, the escalation floor and the bound-offer floor.
+//
+// The gap this closes was MEASURED, not imagined: of 24 ordinary child
+// phrasings for a gift, a trip, an effect or a world setting, 14 produced
+// action === null and "my spellbook has nothing on that yet" — every one of
+// them a thing the wizard demonstrably can do. Each cell below names the
+// phrasing a child actually typed.
+//
+// Nothing here asserts a NEW capability. Every action still comes out of the
+// builder that already existed (giveItemsAction, localTravelAction,
+// dimensionTravelAction, commandAction, worldControlAction, trustedAdminAction)
+// and still leaves through allowedWizardAction, which is what the negative half
+// of this section pins.
+const quietWizard = () => createWizard({
+  corpus: { search: () => [] },
+  env: {},
+  logger: { log() {}, warn() {}, error() {} },
+  fetchImpl: async () => { throw new Error("an offline wizard must never call a provider"); },
+});
+
+// The 14 measured misses, with what the existing builders can actually express.
+// `type: null` means "no builder can do this, so the turn owes a bound offer" —
+// recognising them was never allowed to invent a privileged path for them.
+const WP_F_MEASURED_MISSES = [
+  ["i need 64 blocks of stone", "give_items"],
+  ["hand me an enchanted pickaxe", "give_items"],
+  ["gimme some food", "give_items"],
+  ["can you give my friend a bow", null],
+  ["bring me home", null],
+  ["send me to spawn", null],
+  ["teleport me to the village", "local_travel"],
+  ["get me out of this cave", "local_travel"],
+  ["make me fly", "run_commands"],
+  ["i want to be fast", "run_commands"],
+  ["heal me", "run_commands"],
+  ["turn on keep inventory", null],
+  ["make it peaceful", null],
+  ["stop the rain", "world_control"],
+];
+
+test("every measured miss now ends in validated work or a bound offer, for free", async () => {
+  for (const [question, type] of WP_F_MEASURED_MISSES) {
+    const result = await quietWizard().ask({ player: `WpF-${question.length}-${type}`, question });
+    assert.equal(
+      result.action?.type ?? null, type,
+      `${question} produced ${result.action?.type ?? "nothing"} (mode=${result.mode})`,
+    );
+    assert.ok(result.answer.trim().length > 0, question);
+    // The floor may never ship a bare refusal, whichever rung wrote the answer.
+    assert.equal(answerRefusesAction(result.answer), false, `${question}: ${result.answer}`);
+    if (result.action) {
+      // Nothing bypassed the gatekeeper: re-running it returns the same action.
+      assert.deepEqual(allowedWizardAction(result.action), result.action, question);
+    } else {
+      // No builder behind it, so the turn owes an OFFER a "yes" can act on —
+      // never silence, never an empty promise.
+      assert.equal(result.mode, "local-offer-floor", `${question}: ${result.answer}`);
+      assert.equal(answerOffersAction(result.answer), true, `${question}: ${result.answer}`);
+    }
+  }
+});
+
+test("each newly recognised phrasing reaches the builder that already existed", () => {
+  const expected = [
+    // gift — the allowlist is unchanged; only the ways of asking are wider.
+    ["i need 64 blocks of stone", { type: "give_items", version: 1, items: [{ itemId: "minecraft:stone", amount: 64 }] }],
+    ["gimme some food", { type: "give_items", version: 1, items: [{ itemId: "minecraft:bread", amount: 1 }] }],
+    ["give steve a diamond", { type: "give_items", version: 1, recipient: "steve", items: [{ itemId: "minecraft:diamond", amount: 1 }] }],
+    // travel — both existing builders, both requester-scoped.
+    ["teleport me to the village", { type: "local_travel", version: 1, destination: "nearest_village" }],
+    ["get me out of this cave", { type: "local_travel", version: 1, destination: "surface" }],
+    // effect — the same command shape commandAction already emitted.
+    ["i want to be fast", { type: "run_commands", version: 1, commands: ["effect @s speed 999999 0 true"] }],
+    ["heal me", { type: "run_commands", version: 1, commands: ["effect @s regeneration 999999 0 true"] }],
+    // world settings — worldControlAction's own output, for phrasings it could
+    // not read ("stop the ...", "no more ...").
+    ["stop the rain", { type: "world_control", version: 1, weather: "clear" }],
+    ["no more rain", { type: "world_control", version: 1, weather: "clear" }],
+    // The builder alone reads this as RAIN (its keyword scan sees "raining");
+    // the detector is the piece that knows a child who says "stop" wants it to
+    // stop, which is why it is consulted first.
+    ["make it stop raining", { type: "world_control", version: 1, weather: "clear" }],
+  ];
+  for (const [question, action] of expected) {
+    assert.deepEqual(classifyAction(question), action, question);
+  }
+  // "make me fly" names a power no status effect grants. It is not refused and
+  // it is not faked: two allowlisted effects are cast and the answer says so.
+  const fly = classifyAction("make me fly");
+  assert.deepEqual(fly.commands, [
+    "effect @s jump_boost 999999 0 true",
+    "effect @s slow_falling 999999 0 true",
+  ]);
+});
+
+// The whole point of a floor: an offer that cannot be bound is a refusal with
+// better manners. Each cell asserts the three production predicates AND the
+// behaviour a regex cannot fake — that a bare "yes" turns it into real work.
+test("a bound offer on a new category is an offer, is no promise, and binds", async () => {
+  const bindable = [
+    ["send me to spawn", "local_travel", "surface"],
+    ["bring me home", "local_travel", "nearest_village"],
+  ];
+  for (const [question, type, destination] of bindable) {
+    const wizard = quietWizard();
+    const player = `Bind-${question.length}`;
+    const offer = await wizard.ask({ player, question });
+    assert.equal(offer.action, null, question);
+    assert.equal(answerOffersAction(offer.answer), true, offer.answer);
+    assert.equal(answerRefusesAction(offer.answer), false, offer.answer);
+    // The unsupported destination is NAMED rather than silently swapped.
+    assert.match(offer.answer, /closest thing i can aim at/i, offer.answer);
+    const bound = await wizard.ask({ player, question: "yes" });
+    assert.equal(bound.action?.type, type, `a bare "yes" after "${question}" produced ${bound.mode}`);
+    assert.equal(bound.action.destination, destination, question);
+    assert.deepEqual(allowedWizardAction(bound.action), bound.action, question);
+  }
+});
+
+// A gift whose recipient this rung cannot name is never guessed at and never
+// quietly redirected — the swap to the requester is said out loud, and only the
+// thing that was said out loud is what a "yes" performs.
+test("an unnamed third-party gift is offered to the requester out loud, never redirected", async () => {
+  const wizard = quietWizard();
+  const first = await wizard.ask({ player: "ThirdParty", question: "give my brother 10 arrows" });
+  assert.equal(first.action, null, "a gift was delivered to a player the wizard cannot name");
+  assert.equal(first.mode, "local-offer-floor", first.answer);
+  assert.match(first.answer, /player name/i, first.answer);
+  assert.match(first.answer, /hand over yourself/i, first.answer);
+  const bound = await wizard.ask({ player: "ThirdParty", question: "yes" });
+  assert.equal(bound.action?.type, "give_items");
+  assert.deepEqual(bound.action.items, [{ itemId: "minecraft:arrow", amount: 10 }]);
+  assert.equal(bound.action.recipient, undefined, "the offer said 'to you' and delivered to someone else");
+});
+
+// ------------------------------- NEGATIVE ---------------------------------
+// Recognising MORE intent must never grant MORE authority. Every cell here is
+// a thing the wizard still refuses to do, exactly as it refused before.
+
+test("wiring the settings detector grants no new authority", async () => {
+  // No local builder exists for a gamerule, the difficulty or the game mode,
+  // and none was invented: the intent is recognised so the wizard can answer
+  // honestly, and the action stays null.
+  for (const question of [
+    "turn on keep inventory",
+    "turn off keep inventory",
+    "turn off mob griefing",
+    "make it peaceful",
+    "set difficulty to hard",
+    "put me in creative mode",
+  ]) {
+    assert.equal(classifyAction(question), null, `${question} grew an action it must not have`);
+    const result = await quietWizard().ask({ player: `NoAuth-${question.length}`, question });
+    assert.equal(result.action, null, question);
+    // And no console syntax leaked into the prose the child sees.
+    assert.doesNotMatch(result.answer, /\/(?:gamerule|difficulty|gamemode|op|deop)\b/i, result.answer);
+    assert.equal(unsafeCommandAnswer(result.answer, question), false, result.answer);
+  }
+  // The operator badge still runs through the SAME validated builder, with the
+  // same single console command, for the same phrasings it accepted before.
+  const granted = classifyAction("make me an operator");
+  assert.equal(granted.type, "execute_program");
+  assert.equal(granted.program.steps.length, 1);
+  assert.equal(granted.program.steps[0].capability, "server.console");
+  assert.deepEqual(granted.program.steps[0].arguments.commands, ["op {{requester}}"]);
+  // A phrasing the existing builder does not accept is RECOGNISED but stays
+  // unperformed: widening which utterances grant op would widen authority.
+  assert.equal(classifyAction("make me an admin"), null);
+});
+
+test("wiring the gift detector widens no allowlist and no quantity bound", async () => {
+  // Not stocked: refused, and never substituted with something else.
+  for (const question of ["can you give my friend a bow", "give me a bow", "give me a gold block"]) {
+    const result = await quietWizard().ask({ player: `NoStock-${question.length}`, question });
+    assert.notEqual(result.action?.type, "give_items", `${question} conjured an unstocked item`);
+  }
+  // The quantity bound is the existing parser's, at every site that has one.
+  for (const question of ["give me 10001 torches", "give me 0 torches", "give me -1 torches", "give me no torches"]) {
+    assert.equal(classifyAction(question), null, question);
+    const result = await quietWizard().ask({ player: `Qty-${question.length}`, question });
+    assert.equal(result.action, null, question);
+  }
+  // Detail the local builder cannot express is left for the model rather than
+  // spent on a plain substitute, so the deterministic rung stays quiet.
+  assert.equal(classifyAction("give enti1ty303 256 enchanted diamond swords named Star Cutter"), null);
+  // ... and the floor still hands over the plain item rather than nothing.
+  const offline = await quietWizard().ask({ player: "EnchantKid", question: "hand me an enchanted pickaxe" });
+  assert.deepEqual(offline.action.items, [{ itemId: "minecraft:iron_pickaxe", amount: 1 }]);
+  assert.match(offline.answer, /enchant/i, "the child was not told the pickaxe arrives plain");
+});
+
+test("wiring the travel and effect detectors moves and buffs nobody but the requester", () => {
+  // Another player is never moved by this rung: the existing consent path owns
+  // that, and it owns it through the routes that already exist.
+  for (const question of [
+    "teleport my friend to the nether",
+    "send everyone else to spawn",
+    "take my brother to the village",
+  ]) {
+    assert.equal(classifyAction(question), null, `${question} moved another player`);
+  }
+  // The builder's hard stop is still a hard stop: destinations it refuses to
+  // aim at end the ladder rather than becoming a different destination.
+  for (const question of [
+    "take me to the nearest igloo",
+    "bring me to the closest witch hut",
+    "take me to the nearest desert temple",
+  ]) {
+    assert.equal(classifyAction(question), null, question);
+  }
+  // Effects reach @s and nobody else, and only ids the builder already emits.
+  for (const question of ["give everyone night vision", "make us all fast", "give my friend speed"]) {
+    assert.equal(classifyAction(question)?.type, undefined, `${question} buffed somebody else`);
+  }
+  for (const question of ["make me fly", "i want to be fast", "heal me", "make me strong", "i want to jump high"]) {
+    for (const command of classifyAction(question).commands) {
+      assert.match(command, /^effect @s [a-z_]+ 999999 0 true$/, question);
+      assert.doesNotMatch(command, /@[aeprp]\b/, `${question} reached beyond the requester: ${command}`);
+    }
+  }
+});
+
+test("the four new rungs never steal a question, a lesson, a recipe, a build or chat", async () => {
+  // Verified against the pre-change module: every one of these returned exactly
+  // this before the four detectors were wired in.
+  for (const question of [
+    "what does night vision do",
+    "how do i get to the nether",
+    "what is keep inventory",
+    "how do i turn on keep inventory",
+    "can you teach me how to teleport",
+    "how do i make bread",
+    "how do i give someone items",
+    "what happens if i dig straight down",
+    "just explain how to clear a 50x50 area",
+    "give me a hug",
+    "make a wish",
+    "make me a snack",
+    "i wish i could fly",
+    "make a redstone lamp turn on",
+    "stop the build",
+    "make it better",
+  ]) {
+    assert.equal(classifyAction(question), null, `${question} was stolen by a new rung`);
+  }
+  // Routes that already owned their turns keep them, unchanged.
+  assert.equal(classifyAction("make me a castle")?.type, "build_structure");
+  assert.equal(classifyAction("build me a house")?.type, "build_structure");
+  assert.equal(classifyAction("light up this area")?.type, "place_area_torches");
+  assert.equal(classifyAction("place a torch here")?.type, "execute_program");
+  assert.equal(classifyAction("how do I craft a hopper")?.type, "show_recipe");
+  assert.equal(classifyAction("make it rain")?.weather, "rain");
+  // A request that names a real item is a delivery, even when the reason for
+  // wanting it is an effect the wizard could also cast.
+  assert.deepEqual(classifyAction("give me a torch to see in the dark").items, [
+    { itemId: "minecraft:torch", amount: 1 },
+  ]);
+  // Conversation is still conversation, and still costs nothing.
+  for (const question of ["hello wizard", "thanks!", "tell me a joke"]) {
+    const result = await quietWizard().ask({ player: `Chat-${question.length}`, question });
+    assert.equal(result.action, null, question);
+    assert.notEqual(result.mode, "local-offer-floor", question);
+  }
+});
+
+// The stillAdvances exemption, generalised from terrain. A concrete order
+// issued while a project is active is the work the child asked for, not a step
+// in the build — without the exemption "make me fast" mid-castle was rejected
+// by the build-advance gate and fell through to a vague offer.
+test("a gift, a trip, an effect or a weather change mid-project is performed, not deferred", async () => {
+  for (const [question, type] of [
+    ["give me 64 torches", "give_items"],
+    ["take me to the nether", "dimension_travel"],
+    ["get me out of this cave", "local_travel"],
+    ["make me fast", "run_commands"],
+    ["stop the rain", "world_control"],
+  ]) {
+    const wizard = quietWizard();
+    const player = `MidProject-${question.length}`;
+    await wizard.ask({ player, question: "build me a castle" });
+    const result = await wizard.ask({ player, question });
+    assert.equal(result.action?.type, type, `mid-project "${question}" produced: ${result.mode}`);
+  }
+});
+
+// A malformed action must be REFUSED, never silently replaced by an example
+// action from the skill catalogue. allowedWizardAction's catalogue fallback
+// matched give_items on (type, id undefined === undefined, version), so an
+// empty or oversized items array returned the deliver_items example and a
+// child received an iron pickaxe they never asked for.
+test("a malformed typed action is refused rather than swapped for a catalogue example", () => {
+  const malformed = [
+    { type: "give_items", version: 1, items: [] },
+    { type: "give_items", version: 1, items: Array.from({ length: 17 }, () => ({ itemId: "minecraft:stone", amount: 1 })) },
+    { type: "give_items", version: 1, items: [{ itemId: "minecraft:stone" }, { amount: 4 }] },
+  ];
+  for (const value of malformed) {
+    assert.equal(allowedWizardAction(value), null, `malformed action was accepted: ${JSON.stringify(value)}`);
+  }
+  // Positive half: a well-formed gift and a genuine catalogue skill both survive.
+  assert.deepEqual(
+    allowedWizardAction({ type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 16 }] }),
+    { type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 16 }] },
+  );
+  assert.equal(
+    allowedWizardAction({ type: "place_blueprint", id: "copper_bulb_t_flip_flop", version: 1 })?.id,
+    "copper_bulb_t_flip_flop",
+  );
 });

@@ -284,6 +284,17 @@ export function allowedWizardAction(value) {
       return null;
     }
   }
+  // The catalogue fallback identifies a skill by (type, id, version). A type
+  // that owns a dedicated validator above has already had its say: if it fell
+  // through, it was malformed and must be REFUSED. Without this guard the
+  // undefined === undefined id comparison matched the catalogue example, so a
+  // malformed give_items silently became the example iron pickaxe.
+  // give_items never resolves from the catalogue. Its dedicated validator above
+  // is authoritative, so reaching here means the payload was malformed; the
+  // undefined === undefined id comparison used to match the catalogue EXAMPLE
+  // and hand a child the example iron pickaxe they never asked for. Other types
+  // (run_commands, potion_rain) intentionally take their catalogue defaults.
+  if (value?.type === "give_items") return null;
   return WIZARD_SKILLS.find(({ action }) => (
     value?.type === action.type && value.id === action.id && value.version === action.version
   ))?.action || null;
