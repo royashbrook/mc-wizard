@@ -16,6 +16,15 @@ import {
 
 const RECIPE_ITEM_IDS = new Set(recipeItemIds());
 
+// Minecraft writes ids bare in its own commands, so the planner does too.
+// Add the default namespace when it is missing; anything that is not a plain
+// lowercase identifier is left untouched so the existing shape checks still
+// reject it rather than a normalised version silently passing.
+function namespacedId(value) {
+  const text = String(value ?? "");
+  return /^[a-z0-9_]+$/.test(text) ? `minecraft:${text}` : text;
+}
+
 export const LOCATABLE_STRUCTURES = Object.freeze({
   ancient_city: { label: "ancient city", dimensions: ["overworld"] },
   bastion_remnant: { label: "bastion remnant", dimensions: ["nether"] },
@@ -235,7 +244,10 @@ export function allowedWizardAction(value) {
     const items = value.items.map((item) => {
       if (!item || typeof item !== "object" || Array.isArray(item)
         || Object.keys(item).some((key) => !["itemId", "amount", "nameTag", "enchantments"].includes(key))) return null;
-      const itemId = String(item.itemId || "");
+      // Minecraft itself writes these bare ("/give @s diamond_pickaxe",
+      // "/enchant @s efficiency 5"), so the planner does too. Namespace them
+      // instead of discarding the whole action over a missing prefix.
+      const itemId = namespacedId(item.itemId);
       const amount = Number(item.amount);
       const nameTag = item.nameTag === undefined ? undefined : String(item.nameTag)
         .replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
@@ -244,7 +256,7 @@ export function allowedWizardAction(value) {
       const enchantments = item.enchantments === undefined ? undefined : Array.isArray(item.enchantments)
         && item.enchantments.length >= 1 && item.enchantments.length <= 16
         ? item.enchantments.map((enchantment) => {
-          const id = String(enchantment?.id || "");
+          const id = namespacedId(enchantment?.id);
           const level = Number(enchantment?.level);
           return /^minecraft:[a-z0-9_]+$/.test(id) && Number.isInteger(level) && level >= 1 && level <= 255
             ? { id, level } : null;

@@ -4256,3 +4256,86 @@ test("a malformed typed action is refused rather than swapped for a catalogue ex
     "copper_bulb_t_flip_flop",
   );
 });
+
+// A child asked for enchanted netherite armour and an enchanted diamond
+// pickaxe. The planner authored both correctly, but every enchantment id was
+// written the way Minecraft itself writes it ("efficiency", as in
+// /enchant @s efficiency 5). The validator demanded "minecraft:efficiency" and
+// discarded the WHOLE action, after which a local rung told the child
+// "Enchanting is beyond my wand" - which is false; the schema supports it.
+test("bare enchantment and item ids are namespaced rather than discarded", () => {
+  const enchantedSet = allowedWizardAction({
+    type: "give_items",
+    version: 1,
+    items: [
+      { itemId: "netherite_helmet", amount: 1, enchantments: [{ id: "protection", level: 4 }] },
+      { itemId: "minecraft:netherite_chestplate", amount: 1, enchantments: [{ id: "minecraft:protection", level: 4 }] },
+    ],
+  });
+  assert.ok(enchantedSet, "an enchanted armour set was discarded");
+  assert.equal(enchantedSet.items[0].itemId, "minecraft:netherite_helmet");
+  assert.deepEqual(enchantedSet.items[0].enchantments, [{ id: "minecraft:protection", level: 4 }]);
+  // Already-namespaced input is untouched.
+  assert.deepEqual(enchantedSet.items[1].enchantments, [{ id: "minecraft:protection", level: 4 }]);
+
+  // Negative half: normalising a prefix must not make anything else legal.
+  assert.equal(allowedWizardAction({
+    type: "give_items",
+    version: 1,
+    items: [{ itemId: "diamond_pickaxe", amount: 1, enchantments: [{ id: "efficiency", level: 999 }] }],
+  }), null, "an out-of-range enchantment level was accepted");
+  assert.equal(allowedWizardAction({
+    type: "give_items",
+    version: 1,
+    items: [{ itemId: "Diamond Pickaxe", amount: 1 }],
+  }), null, "a malformed item id was accepted");
+});
+
+// A child asked for "a set of enchanted netherite armor". The planner authored
+// the four correct pieces, but the intent gate required EVERY word of each item
+// id to appear in the question, and a child never says "helmet, chestplate,
+// leggings, boots". The whole set was discarded and the child was told netherite
+// armour "is not in my spellbook".
+test("a collective request accepts the pieces that make it up", async () => {
+  const set = {
+    answer: "Here is a full enchanted netherite set!",
+    action: {
+      type: "give_items",
+      version: 1,
+      items: ["netherite_helmet", "netherite_chestplate", "netherite_leggings", "netherite_boots"]
+        .map((itemId) => ({ itemId, amount: 1, enchantments: [{ id: "protection", level: 4 }] })),
+    },
+  };
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify(set) } }],
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const result = await wizard.ask({ player: "ArmourKid", question: "give me a set of enchanted netherite armor" });
+  assert.equal(result.action?.type, "give_items", `the armour set was discarded: ${result.answer}`);
+  assert.equal(result.action.items.length, 4);
+  for (const item of result.action.items) {
+    assert.match(item.itemId, /^minecraft:netherite_/);
+    assert.deepEqual(item.enchantments, [{ id: "minecraft:protection", level: 4 }]);
+  }
+});
+
+// Negative half: a collective request does NOT become a licence to deliver
+// anything. An item sharing no word with the request is still refused.
+test("a collective request still refuses an unrelated item", async () => {
+  const rogue = {
+    answer: "Here you go!",
+    action: { type: "give_items", version: 1, items: [{ itemId: "minecraft:diamond_sword", amount: 1 }] },
+  };
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify(rogue) } }],
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const result = await wizard.ask({ player: "RogueKid", question: "give me a set of netherite armor" });
+  assert.notEqual(result.action?.items?.[0]?.itemId, "minecraft:diamond_sword");
+});

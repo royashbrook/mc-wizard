@@ -218,8 +218,16 @@ test("rich item delivery supports exact connected recipients, names, enchantment
   assert.deepEqual(allowedWizardAction(action), action);
   assert.equal(allowedWizardAction({ ...action, recipient: "@a" }), null);
   assert.equal(allowedWizardAction({ ...action, items: [{ ...action.items[0], amount: 10_001 }] }), null);
-  assert.equal(allowedWizardAction({
+  // A bare enchantment id is NAMESPACED, not discarded. Minecraft writes it
+  // bare itself ("/enchant @s sharpness 5") and so does the planner; rejecting
+  // the whole action over the missing prefix is what left a child with a plain
+  // pickaxe and the false line "enchanting is beyond my wand".
+  assert.deepEqual(allowedWizardAction({
     ...action, items: [{ ...action.items[0], enchantments: [{ id: "sharpness", level: 5 }] }],
+  }), action);
+  // The level bound is a real constraint and still rejects.
+  assert.equal(allowedWizardAction({
+    ...action, items: [{ ...action.items[0], enchantments: [{ id: "sharpness", level: 256 }] }],
   }), null);
 });
 

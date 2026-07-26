@@ -36,14 +36,12 @@ const detector = createGiftDetector({
 // The four measured misses this rung exists to close.
 const MISSED_TURNS = [
   "i need 64 blocks of stone",
-  "hand me an enchanted pickaxe",
   "gimme some food",
   "can you give my friend a bow",
 ];
 
 const DELIVERED_PHRASES = [
   "i need 64 blocks of stone",
-  "hand me an enchanted pickaxe",
   "gimme some food",
   "give me 64 torches",
   "can i have some diamonds",
@@ -82,10 +80,12 @@ test("the three stocked misses deliver the exact items the allowlist stocks", ()
     version: 1,
     items: [{ itemId: "minecraft:stone", amount: 64 }],
   });
+  // give_items carries enchantments, so the PLANNER owns an enchantment
+  // request (see GIFT_DETAIL_BEYOND_LOCAL in src/wizard.mjs). The detector
+  // itself still resolves the plain item, because the post-model floor uses it
+  // to hand over something real rather than leaving the child empty-handed.
   assert.deepEqual(detector.giftAction("hand me an enchanted pickaxe"), {
-    type: "give_items",
-    version: 1,
-    items: [{ itemId: "minecraft:iron_pickaxe", amount: 1 }],
+    type: "give_items", version: 1, items: [{ itemId: "minecraft:iron_pickaxe", amount: 1 }],
   });
   assert.deepEqual(detector.giftAction("gimme some food"), {
     type: "give_items",
@@ -192,7 +192,9 @@ test("a clamped or reworded gift always says so on the intent", () => {
 
   const enchanted = detector.giftIntent("hand me an enchanted pickaxe");
   assert.equal(enchanted.item, "iron pickaxe");
-  assert.match(enchanted.caveat, /enchant/i);
+  // The caveat may describe the item swap, but must never claim the wizard
+  // cannot enchant: give_items supports enchantments and the planner owns it.
+  if (enchanted.caveat) assert.doesNotMatch(enchanted.caveat, /beyond my wand/i);
 
   const unstocked = detector.giftIntent("can you give my friend a bow");
   assert.equal(unstocked.deliverable, false);
@@ -494,4 +496,35 @@ test("history is accepted and changes nothing", () => {
     assert.deepEqual({ ...detector.giftIntent(question, history) },
       { ...detector.giftIntent(question) }, question);
   }
+});
+
+// A local rung must never deny a capability the system HAS. give_items
+// supports enchantments and any valid item id, so the local gift rung claiming
+// "enchanting is beyond my wand" (and offering a plain pickaxe instead) told a
+// child something false and preempted the planner that could have delivered
+// the enchanted item. When the local rung cannot express the request it must
+// step aside, not refuse on the whole system's behalf.
+test("an enchantment request is left to the planner instead of denied locally", () => {
+  for (const question of [
+    "give me an enchanted diamond pickaxe",
+    "give me a set of enchanted netherite armor",
+    "can i have an enchanted sword",
+  ]) {
+    const intent = detector.giftIntent(question);
+    if (intent?.caveat) {
+      assert.doesNotMatch(
+        intent.caveat,
+        /enchanting is beyond my wand|beyond my wand/i,
+        `a false capability denial survived: ${intent.caveat}`,
+      );
+    }
+  }
+});
+
+// Positive half: an ordinary unenchanted gift still resolves locally and
+// provider-free, exactly as before.
+test("an ordinary gift still resolves locally without the planner", () => {
+  const action = detector.giftAction("give me 16 torches");
+  assert.equal(action?.type, "give_items");
+  assert.equal(action.items[0].itemId, "minecraft:torch");
 });

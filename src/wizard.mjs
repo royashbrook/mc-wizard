@@ -3443,11 +3443,21 @@ function canonicalizeGeneratedPlanKind(action, question, history = []) {
   return allowedWizardAction({ ...action, plan: { ...action.plan, kind: requestedKind } }) || action;
 }
 
+// A child asking for "a set of netherite armour" or "a set of iron tools" never
+// names the pieces, so demanding every token of minecraft:netherite_helmet
+// appear in the question makes a correct set impossible. On a collective
+// request one shared token is enough; subject fidelity still holds, because an
+// item sharing NO word with the request is refused exactly as before.
+const COLLECTIVE_REQUEST = /\b(?:set|sets|kit|kits|suit|full|complete|armou?r|tools?|gear|equipment)\b/i;
+
 function namedItemMatchesQuestion(itemId, question) {
   const tokens = String(itemId || "").replace(/^minecraft:/, "").split("_")
     .map(normalizedWord).filter((word) => word.length > 2);
   const words = new Set(String(question || "").match(/[a-z0-9]+/gi)?.map(normalizedWord) || []);
-  return tokens.length > 0 && tokens.every((token) => words.has(token));
+  if (!tokens.length) return false;
+  return COLLECTIVE_REQUEST.test(String(question || ""))
+    ? tokens.some((token) => words.has(token))
+    : tokens.every((token) => words.has(token));
 }
 
 function providerGiftMatchesRequest(action, question) {

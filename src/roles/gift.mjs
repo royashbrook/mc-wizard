@@ -437,7 +437,15 @@ export function createGiftDetector(deps = {}) {
         notes.push(`the closest thing my spellbook stocks for "${gift.phrase}" is ${gift.canonicalPhrase}, so that is what I am bringing`);
       }
       if (gift.enchantRequested) {
-        notes.push("enchanting is beyond my wand, so it arrives plain and you can enchant it at a table");
+        // Honest, and NOT a capability denial: give_items does carry
+        // enchantments, and the planner gets first refusal on an enchantment
+        // request (GIFT_DETAIL_BEYOND_LOCAL in src/wizard.mjs). This note is
+        // only reached when the floor is handing over the plain item after the
+        // planner produced nothing, so it says what happened, not what the
+        // wizard supposedly cannot do.
+        // Phrased away from "I could not ...": answerRefusesAction reads that
+        // as a refusal and the whole honest sentence gets dropped (#44).
+        notes.push("the enchantment did not make it onto this one, so it arrives plain — ask me again and I will have another go");
       }
       if (gift.clampedFrom) {
         notes.push(`${gift.clampedFrom} is more than my wand can carry in one spell, so I am bringing ${MAX_GIFT_AMOUNT}`);
