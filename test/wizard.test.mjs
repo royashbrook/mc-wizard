@@ -4339,3 +4339,40 @@ test("a collective request still refuses an unrelated item", async () => {
   const result = await wizard.ask({ player: "RogueKid", question: "give me a set of netherite armor" });
   assert.notEqual(result.action?.items?.[0]?.itemId, "minecraft:diamond_sword");
 });
+
+// The gift caveat is written from the child's words, so it kept claiming "the
+// enchantment did not make it onto this one" even when the delivered action
+// carried enchantments. A caveat must describe what actually shipped.
+test("no enchantment caveat is attached when the delivered item is enchanted", async () => {
+  const enchanted = {
+    answer: "One enchanted pickaxe coming up!",
+    action: {
+      type: "give_items",
+      version: 1,
+      items: [{ itemId: "diamond_pickaxe", amount: 1, enchantments: [{ id: "efficiency", level: 5 }] }],
+    },
+  };
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => new Response(JSON.stringify({
+      choices: [{ message: { content: JSON.stringify(enchanted) } }],
+    }), { status: 200, headers: { "content-type": "application/json" } }),
+  });
+  const result = await wizard.ask({ player: "EnchKid", question: "give me an enchanted diamond pickaxe" });
+  assert.ok(result.action?.items?.[0]?.enchantments?.length, "the enchanted pickaxe was discarded");
+  assert.doesNotMatch(
+    result.answer,
+    /did not make it onto|arrives plain/i,
+    `an enchanted delivery was described as plain: ${result.answer}`,
+  );
+});
+
+// Positive half: when the item really does arrive plain, the child is still told.
+test("a plain delivery for an enchantment request still says so", async () => {
+  const offline = createWizard({ corpus: { search: () => [] }, env: {} });
+  const result = await offline.ask({ player: "PlainKid", question: "hand me an enchanted pickaxe" });
+  assert.ok(result.action?.items?.length, "nothing was delivered at all");
+  assert.equal(result.action.items[0].enchantments, undefined);
+  assert.match(result.answer, /arrives plain/i);
+});

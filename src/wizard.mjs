@@ -2384,7 +2384,14 @@ function localAnswer(question, hits, action, history = []) {
     // detector already wrote the honest sentence (an alias it substituted, an
     // enchantment it cannot cast, an amount it clamped); the refusal guard is
     // the one thing it must never trip, because an action IS being taken.
-    const caveat = giftIntent(question)?.caveat;
+    // The caveat is written from the child's words, so it must be checked
+    // against what ACTUALLY shipped: when the planner did land the enchantment,
+    // the "arrives plain" clause is simply untrue and is dropped.
+    const enchantedDelivery = action.items.some(({ enchantments }) => enchantments?.length);
+    const caveat = (giftIntent(question)?.caveat || "")
+      .split(/,\s+and\s+/)
+      .filter((note) => !(enchantedDelivery && /enchantment did not make it onto|arrives plain/i.test(note)))
+      .join(", and ");
     return caveat && !answerRefusesAction(caveat)
       ? `${delivery} ${caveat[0].toUpperCase()}${caveat.slice(1)}` : delivery;
   }
