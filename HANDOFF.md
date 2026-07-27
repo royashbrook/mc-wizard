@@ -173,11 +173,14 @@ Traps:
 
 ## 8. Useful artifacts from the analysis
 
-Saved under the session scratchpad (copy them somewhere durable if you want them):
+Committed to the repo under **`docs/analysis/`** (see its README for detail and caveats):
 
-- `orch-survey.json` a precise map of the current turn pipeline, every de facto role with file and line, and **41 safety gates enumerated with what each protects**. This is the most reusable artifact produced.
-- `orch-spec.json` the merged architecture spec for the role restructure.
-- `synthesis.json` the original ranked root-cause analysis of the bimodal quality problem.
+- `docs/analysis/orch-survey.json` a precise map of the current turn pipeline, every de facto role with file and line, and **41 safety gates enumerated with what each protects**. This is the most reusable artifact produced.
+- `docs/analysis/orch-spec.json` the merged architecture spec for the role restructure.
+- `docs/analysis/design-run-survey-and-designs.json` the raw design run: survey plus three competing architectures.
+- `docs/analysis/design-run-final-spec.json` the raw judging run that merged them, including what was cut and why.
+
+Line numbers inside these were accurate when generated and have drifted. Treat every file and line reference as a hint to verify. The original `synthesis.json` and `reports.json` were lost to session cleanup; their substance survives in the body of issue #35 and in section 2 above.
 
 ---
 
