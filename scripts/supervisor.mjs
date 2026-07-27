@@ -7,7 +7,10 @@ const ROOT = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const RUNTIME = path.join(ROOT, "runtime", "supervisor");
 const PID_FILE = path.join(RUNTIME, "mc-wizard.pid");
 const LOG_FILE = path.join(RUNTIME, "mc-wizard.log");
-const DAEMON_PATTERN = `${path.join(ROOT, "scripts", "supervisor.mjs")} daemon`.replace("/", "[/]");
+const SUPERVISOR_PATTERN = `${path.join(ROOT, "scripts", "supervisor.mjs")} (?:start|daemon)`.replace("/", "[/]");
+const BRAIN_PATTERN = path.join(ROOT, "src", "server.mjs").replace("/", "[/]");
+const PROVIDER_PATTERN = path.join(ROOT, "scripts", "local-ai-bridge.mjs").replace("/", "[/]");
+const DEFAULT_START_TIMEOUT_MS = 5 * 60_000;
 
 function run(command, args, options = {}) {
   return new Promise((resolve) => {
@@ -42,14 +45,18 @@ async function containerRunning(name) {
   return containerListHasRunning(await capture("container", ["list"]), name);
 }
 
-function daemonPids() {
+function matchingPids(pattern) {
   return new Promise((resolve) => {
-    const child = spawn("pgrep", ["-f", DAEMON_PATTERN], { stdio: ["ignore", "pipe", "ignore"] });
+    const child = spawn("pgrep", ["-f", pattern], { stdio: ["ignore", "pipe", "ignore"] });
     let output = "";
     child.stdout.on("data", (chunk) => { output += chunk; });
     child.once("error", () => resolve([]));
     child.once("exit", () => resolve(output.split(/\s+/).map(Number).filter((pid) => Number.isInteger(pid) && pid > 0)));
   });
+}
+
+function daemonPids() {
+  return matchingPids(SUPERVISOR_PATTERN);
 }
 
 async function currentPid() {
@@ -58,7 +65,7 @@ async function currentPid() {
     process.kill(pid, 0);
     return pid;
   } catch {
-    const [pid] = await daemonPids();
+    const pid = (await daemonPids()).find((candidate) => candidate !== process.pid);
     if (!pid) return undefined;
     await mkdir(RUNTIME, { recursive: true });
     await writeFile(PID_FILE, `${pid}\n`, { mode: 0o600 });
@@ -75,7 +82,31 @@ async function probe(url) {
   }
 }
 
-async function status() {
+function usesLocalProvider() {
+  return (process.env.AI_STYLE === "chat")
+    && /127\.0\.0\.1:(?:8790|\$\{?MTOK_PORT)/.test(process.env.AI_BASE_URL || "");
+}
+
+export function startupHealthy(result) {
+  return Boolean(result?.supervisor && result?.bedrock && result?.brain && result?.admin
+    && (!result?.providerRequired || result?.provider));
+}
+
+export function diagnoseStartupFailure(result, logText = "") {
+  const log = String(logText);
+  if (/listen EPERM|operation not permitted.*(?:listen|socket)/is.test(log)) {
+    return "macOS Local Network access was denied (EPERM). Grant Local Network access to the terminal or app launching MC Wizard, then retry.";
+  }
+  if (/EPERM.*(?:runtime|interactions|Documents)|operation not permitted.*(?:runtime|interactions|Documents)/is.test(log)) {
+    return "macOS runtime files access was denied (EPERM). Grant Files and Folders access to the terminal or app launching MC Wizard, then retry.";
+  }
+  const missing = ["supervisor", "bedrock", "brain", "admin"]
+    .filter((name) => !result?.[name]);
+  if (result?.providerRequired && !result?.provider) missing.push("provider");
+  return `startup did not become healthy; missing: ${missing.join(", ") || "unknown service"}`;
+}
+
+async function statusSnapshot() {
   const [pid, brain, provider, admin, bedrockCode] = await Promise.all([
     currentPid(),
     probe(`http://${process.env.HOST || "127.0.0.1"}:${process.env.PORT || 3000}/health`),
@@ -91,18 +122,51 @@ async function status() {
     admin: Boolean(admin.ok),
     corpusChunks: brain.corpusChunks || 0,
     providerName: provider.provider || brain.provider || "offline",
+    providerRequired: usesLocalProvider(),
   };
-  console.log(JSON.stringify(result, null, 2));
-  return Object.values(result).includes(false) ? 1 : 0;
+  result.healthy = startupHealthy(result);
+  return result;
 }
 
-async function daemon() {
+async function status() {
+  const result = await statusSnapshot();
+  console.log(JSON.stringify(result, null, 2));
+  return result.healthy ? 0 : 1;
+}
+
+async function recentLog() {
+  try {
+    const value = await readFile(LOG_FILE, "utf8");
+    return value.slice(-8_000);
+  } catch {
+    return "";
+  }
+}
+
+async function waitForHealthy(timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let result = await statusSnapshot();
+  while (Date.now() < deadline) {
+    if (startupHealthy(result)) return result;
+    const log = await recentLog();
+    if (/EPERM|operation not permitted/i.test(log)) {
+      throw new Error(diagnoseStartupFailure(result, log));
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    result = await statusSnapshot();
+  }
+  throw new Error(`${diagnoseStartupFailure(result, await recentLog())}. Check ${LOG_FILE}`);
+}
+
+async function daemon(onStarted) {
   if ((await daemonPids()).some((pid) => pid !== process.pid)) return;
   await mkdir(RUNTIME, { recursive: true });
   await writeFile(PID_FILE, `${process.pid}\n`, { mode: 0o600 });
-  const log = await open(LOG_FILE, "a", 0o600);
+  const log = await open(LOG_FILE, "w", 0o600);
   const children = new Map();
   let stopping = false;
+  let finish;
+  const finished = new Promise((resolve) => { finish = resolve; });
 
   function supervise(name, script, enabled = true) {
     if (!enabled) return;
@@ -126,23 +190,22 @@ async function daemon() {
     launch();
   }
 
-  const localProvider = (process.env.AI_STYLE === "chat")
-    && /127\.0\.0\.1:(?:8790|\$\{?MTOK_PORT)/.test(process.env.AI_BASE_URL || "");
+  const localProvider = usesLocalProvider();
   supervise("provider", path.join(ROOT, "scripts", "local-ai-bridge.mjs"), localProvider);
   supervise("brain", path.join(ROOT, "src", "server.mjs"));
   await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
 
-  const stop = async () => {
+  const shutdown = async () => {
     if (stopping) return;
     stopping = true;
     for (const child of children.values()) child.kill("SIGTERM");
     await run("sh", [path.join(ROOT, "scripts", "stop-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
     await rm(PID_FILE, { force: true });
     await log.close();
-    process.exit(0);
+    finish();
   };
-  process.on("SIGTERM", stop);
-  process.on("SIGINT", stop);
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
   // Recreate only when the container has actually stopped, and only after two
   // consecutive misses so a transient `container list` hiccup or an in-progress
   // boot never triggers a delete/recreate loop (see issue #38).
@@ -155,30 +218,33 @@ async function daemon() {
     downChecks = 0;
     await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
   }, 10_000).unref();
+  try {
+    if (onStarted) await onStarted();
+    await finished;
+    return 0;
+  } catch (error) {
+    await shutdown();
+    throw error;
+  }
 }
 
 async function start() {
-  await run(process.execPath, [path.join(ROOT, "scripts", "admin-service.mjs"), "start"], { stdio: "inherit" });
+  const adminCode = await run(process.execPath, [path.join(ROOT, "scripts", "admin-service.mjs"), "start"], { stdio: "inherit" });
+  if (adminCode !== 0) throw new Error("operator desk failed to start");
+  const timeoutMs = Math.max(5_000, Math.min(
+    10 * 60_000,
+    Number(process.env.WIZARD_START_TIMEOUT_MS) || DEFAULT_START_TIMEOUT_MS,
+  ));
   if (await currentPid()) {
-    console.log("MC Wizard supervisor is already running.");
+    const result = await waitForHealthy(timeoutMs);
+    console.log(`MC Wizard supervisor is already running and healthy (${result.corpusChunks} corpus chunks).`);
     return 0;
   }
-  await mkdir(RUNTIME, { recursive: true });
-  const child = spawn(process.execPath, [process.argv[1], "daemon"], {
-    cwd: ROOT,
-    detached: true,
-    env: process.env,
-    stdio: "ignore",
+  console.log("Starting MC Wizard in this terminal...");
+  return daemon(async () => {
+    const result = await waitForHealthy(timeoutMs);
+    console.log(`MC Wizard is healthy (${result.corpusChunks} corpus chunks). Leave this command running; use another terminal for wizard:status or wizard:stop.`);
   });
-  child.unref();
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    await new Promise((resolve) => setTimeout(resolve, 250));
-    if (await currentPid()) {
-      console.log("MC Wizard supervisor started.");
-      return 0;
-    }
-  }
-  throw new Error("supervisor did not start; check runtime/supervisor/mc-wizard.log");
 }
 
 async function stop() {
@@ -186,7 +252,13 @@ async function stop() {
   const pid = await currentPid();
   if (!pid) {
     await rm(PID_FILE, { force: true });
-    console.log("MC Wizard supervisor is not running.");
+    for (const pattern of [BRAIN_PATTERN, PROVIDER_PATTERN]) {
+      for (const orphan of await matchingPids(pattern)) {
+        try { process.kill(orphan, "SIGTERM"); } catch {}
+      }
+    }
+    await run("sh", [path.join(ROOT, "scripts", "stop-bedrock-container.sh")], { stdio: "inherit" });
+    console.log("MC Wizard supervisor was not running; orphaned services and Bedrock were stopped.");
     return 0;
   }
   process.kill(pid, "SIGTERM");
@@ -198,9 +270,14 @@ const isMain = process.argv[1]
   && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
 if (isMain) {
   const command = process.argv[2] || "status";
-  process.exitCode = command === "daemon" ? await daemon()
-    : command === "start" ? await start()
-      : command === "stop" ? await stop()
-        : command === "status" ? await status()
-          : 2;
+  try {
+    process.exitCode = command === "daemon" ? await daemon()
+      : command === "start" ? await start()
+        : command === "stop" ? await stop()
+          : command === "status" ? await status()
+            : 2;
+  } catch (error) {
+    console.error(`MC Wizard: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
 }

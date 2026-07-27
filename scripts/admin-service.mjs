@@ -10,6 +10,17 @@ const LOG_FILE = path.join(RUNTIME, "admin.log");
 const ADMIN_URL = `http://${process.env.ADMIN_HOST || "127.0.0.1"}:${process.env.ADMIN_PORT || 3001}`;
 const ADMIN_PATTERN = path.join(ROOT, "src", "admin.mjs").replace("/", "[/]");
 
+export function diagnoseAdminFailure(logText = "") {
+  const log = String(logText);
+  if (/listen EPERM|operation not permitted.*(?:listen|socket)/is.test(log)) {
+    return "macOS Local Network access was denied (EPERM). Grant Local Network access to the terminal or app launching MC Wizard, then retry.";
+  }
+  if (/EPERM.*(?:runtime|interactions|Documents)|operation not permitted.*(?:runtime|interactions|Documents)/is.test(log)) {
+    return "macOS runtime files access was denied (EPERM). Grant Files and Folders access to the terminal or app launching MC Wizard, then retry.";
+  }
+  return `operator desk did not start; check ${LOG_FILE}`;
+}
+
 function adminPids() {
   return new Promise((resolve) => {
     const child = spawn("pgrep", ["-f", ADMIN_PATTERN], { stdio: ["ignore", "pipe", "ignore"] });
@@ -48,10 +59,12 @@ async function start() {
     return 0;
   }
   await mkdir(RUNTIME, { recursive: true });
-  const log = await open(LOG_FILE, "a", 0o600);
+  const log = await open(LOG_FILE, "w", 0o600);
   const child = spawn(process.execPath, [path.join(ROOT, "src", "admin.mjs")], {
     cwd: ROOT,
-    detached: true,
+    // Keep the ordinary child process in the launcher's macOS permission
+    // context. A detached process group can lose Documents/network access.
+    detached: false,
     env: process.env,
     stdio: ["ignore", log.fd, log.fd],
   });
@@ -67,7 +80,9 @@ async function start() {
   }
   try { process.kill(child.pid, "SIGTERM"); } catch {}
   await rm(PID_FILE, { force: true });
-  throw new Error(`admin did not start; check ${LOG_FILE}`);
+  let logText = "";
+  try { logText = await readFile(LOG_FILE, "utf8"); } catch {}
+  throw new Error(diagnoseAdminFailure(logText));
 }
 
 async function stop() {
@@ -84,8 +99,17 @@ async function status() {
   return result.running && result.healthy ? 0 : 1;
 }
 
-const command = process.argv[2] || "status";
-process.exitCode = command === "start" ? await start()
-  : command === "stop" ? await stop()
-    : command === "status" ? await status()
-      : 2;
+const isMain = process.argv[1]
+  && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  const command = process.argv[2] || "status";
+  try {
+    process.exitCode = command === "start" ? await start()
+      : command === "stop" ? await stop()
+        : command === "status" ? await status()
+          : 2;
+  } catch (error) {
+    console.error(`MC Wizard admin: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
+}

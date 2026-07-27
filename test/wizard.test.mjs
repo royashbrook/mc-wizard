@@ -669,6 +669,12 @@ test("supervises Bedrock, brain, provider, and corpus without secrets in status"
   assert.match(supervisorScript, /start-bedrock-container\.sh/);
   assert.match(supervisorScript, /stop-bedrock-container\.sh/);
   assert.doesNotMatch(supervisorScript, /container", \["stop", "--time", "60"/);
+  assert.match(supervisorScript, /waitForHealthy/);
+  assert.match(supervisorScript, /result\.healthy/);
+  assert.doesNotMatch(supervisorScript, /detached:\s*true/);
+  assert.doesNotMatch(adminServiceScript, /detached:\s*true/);
+  assert.match(supervisorScript, /Leave this command running/);
+  assert.match(supervisorScript, /orphaned services and Bedrock were stopped/);
 });
 
 test("navigates into player reach for every placement and verifies scaffold removal", () => {

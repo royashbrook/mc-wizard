@@ -56,7 +56,7 @@ npm run wizard:status
 npm run wizard:stop
 ```
 
-Status reports service health, provider name, corpus size, and the active knowledge-graph revision/counts; it does not print tokens, prompts, player identifiers, or credentials.
+`wizard:start` does not report success merely because a supervisor PID exists. It waits for the brain, operator desk, Bedrock container, and any configured local provider to become healthy, then remains attached to that terminal so macOS keeps the launcher's Local Network and Files and Folders permissions. Leave it running and use another terminal for `wizard:status` or `wizard:stop`. A cold corpus build can take several minutes; adjust the bounded wait with `WIZARD_START_TIMEOUT_MS`. On failure it exits nonzero and reports a detected macOS permission denial. Status reports service health, provider name, corpus size, and the active knowledge-graph revision/counts; it does not print tokens, prompts, player identifiers, or credentials.
 
 ### Operator desk
 
