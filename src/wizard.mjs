@@ -588,6 +588,8 @@ function structureKind(question, history = []) {
 
 function requestedMaterialBlock(question) {
   const target = question.match(/\b(?:out\s+of|made\s+of|with|using|to)\s+([^,.!?]{1,48})/i)?.[1] || question;
+  const explicitId = target.match(/\bminecraft:([a-z0-9_]+)\b/)?.[0];
+  if (explicitId && isAllowedStructureMaterial(explicitId)) return explicitId;
   const concrete = target.match(/\b(black|blue|brown|cyan|gray|green|light blue|light gray|lime|magenta|orange|pink|purple|red|white|yellow)?\s*concrete\b/i)?.[1]
     ?.toLowerCase().replace(/\s+/g, "_") || (/\bconcrete\b/i.test(target)
       && !/\bconcrete\s+(?:action|answer|detail|example|idea|plan|step)\b/i.test(target) ? "white" : undefined);
@@ -595,6 +597,12 @@ function requestedMaterialBlock(question) {
   const requests = [
     ["minecraft:red_mushroom_block", /\b(?:red\s+)?mushroom(?:\s+blocks?)?\b/i],
     ["minecraft:brown_mushroom_block", /\bbrown\s+mushroom(?:\s+blocks?)?\b/i],
+    ["minecraft:amethyst_block", /\bamethyst(?:\s+blocks?)?\b/i],
+    ["minecraft:honey_block", /\bhoney(?:\s+blocks?)?\b/i],
+    ["minecraft:slime_block", /\bslime(?:\s+blocks?)?\b/i],
+    ["minecraft:magma", /\bmagma(?:\s+blocks?)?\b/i],
+    ["minecraft:calcite", /\bcalcite\b/i],
+    ["minecraft:mud", /\bmud(?:\s+blocks?)?\b/i],
     ["minecraft:polished_blackstone_bricks", /\b(?:polished\s+)?blackstone(?:\s+bricks?)?\b/i],
     ["minecraft:dark_prismarine", /\bdark\s+prismarine\b/i],
     ["minecraft:prismarine_bricks", /\bprismarine(?:\s+bricks?)?\b/i],
@@ -619,6 +627,40 @@ function requestedMaterialBlock(question) {
     ["minecraft:emerald_block", /\bemerald\b/i],
   ];
   return requests.find(([, pattern]) => pattern.test(target))?.[0];
+}
+
+function applyRequestedMaterialAction(action, question) {
+  const requested = requestedMaterialBlock(question);
+  if (!requested || action?.type !== "build_structure" || !action.plan) return action;
+  const roofOnly = /\broof\b/i.test(question);
+  const role = roofOnly ? "roof" : "primary";
+  const original = action.plan.materials?.[role];
+  const relevantPhases = roofOnly ? new Set(["roof"]) : new Set(["foundation", "shell"]);
+  let replaced = false;
+  const primitives = Array.isArray(action.plan.primitives)
+    ? action.plan.primitives.map((primitive) => {
+      if (primitive.blockId === "minecraft:air" || !relevantPhases.has(primitive.phase)) return primitive;
+      if (primitive.blockId === original) {
+        replaced = true;
+        return { ...primitive, blockId: requested };
+      }
+      return primitive;
+    })
+    : undefined;
+  if (primitives && !replaced) {
+    const index = primitives.findIndex((primitive) => (
+      primitive.blockId !== "minecraft:air" && relevantPhases.has(primitive.phase)
+    ));
+    if (index >= 0) primitives[index] = { ...primitives[index], blockId: requested };
+  }
+  return allowedWizardAction({
+    ...action,
+    plan: {
+      ...action.plan,
+      materials: { ...action.plan.materials, [role]: requested },
+      ...(primitives && { primitives }),
+    },
+  });
 }
 
 function materialPalette(question, kind) {
@@ -4082,10 +4124,10 @@ async function repairPlannerAction({
     const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
     lastEnvelope = repairedEnvelope;
     if (repairedEnvelope && !unusableWizardAnswer(repairedEnvelope.answer, question)) {
-      const repairedAction = bindProgramToActiveProject(
+      const repairedAction = applyRequestedMaterialAction(bindProgramToActiveProject(
         carryForwardStructurePrimitives(repairedEnvelope.action, history, question),
         projectFeedback, question, history,
-      );
+      ), question);
       const contract = (!researchRequired || reusableLearnedAction(repairedAction))
         && providerActionMatchesRequest(repairedAction, question, history, { buildRequest: true, projectFeedback })
         && repairedAction
@@ -5481,7 +5523,10 @@ export function createWizard({
             const projectBoundProviderCandidate = bindProgramToActiveProject(
               carriedProviderCandidate, projectFeedback, question, actionHistory,
             );
-            const providerCandidate = repairProviderGift(projectBoundProviderCandidate, question);
+            const providerCandidate = applyRequestedMaterialAction(
+              repairProviderGift(projectBoundProviderCandidate, question),
+              question,
+            );
             const repairedProviderGift = providerCandidate !== projectBoundProviderCandidate;
             // Every validated gameplay mechanism is available. C0 now checks
             // child-appropriate content, not whether the plan uses commands,
