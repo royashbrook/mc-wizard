@@ -4240,15 +4240,22 @@ test("a gift, a trip, an effect or a weather change mid-project is performed, no
 });
 
 // A malformed action must be REFUSED, never silently replaced by an example
-// action from the skill catalogue. allowedWizardAction's catalogue fallback
-// matched give_items on (type, id undefined === undefined, version), so an
-// empty or oversized items array returned the deliver_items example and a
-// child received an iron pickaxe they never asked for.
+// action from the skill catalogue. Catalogue fallback used to match payload
+// actions on (type, id undefined === undefined, version), so malformed values
+// silently became unrelated examples.
 test("a malformed typed action is refused rather than swapped for a catalogue example", () => {
   const malformed = [
     { type: "give_items", version: 1, items: [] },
     { type: "give_items", version: 1, items: Array.from({ length: 17 }, () => ({ itemId: "minecraft:stone", amount: 1 })) },
     { type: "give_items", version: 1, items: [{ itemId: "minecraft:stone" }, { amount: 4 }] },
+    { type: "run_commands", version: 1 },
+    { type: "run_commands", version: 1, commands: [] },
+    { type: "potion_rain", version: 1 },
+    { type: "potion_rain", version: 1, radius: 8 },
+    { type: "potion_rain", version: 1, durationSeconds: 8 },
+    { type: "build_structure", version: 1 },
+    { type: "build_machine", version: 1 },
+    { type: "build_plan", version: 1 },
   ];
   for (const value of malformed) {
     assert.equal(allowedWizardAction(value), null, `malformed action was accepted: ${JSON.stringify(value)}`);
@@ -4257,6 +4264,18 @@ test("a malformed typed action is refused rather than swapped for a catalogue ex
   assert.deepEqual(
     allowedWizardAction({ type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 16 }] }),
     { type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 16 }] },
+  );
+  assert.deepEqual(
+    allowedWizardAction({ type: "run_commands", version: 1, commands: ["effect @s night_vision 60"] }),
+    { type: "run_commands", version: 1, commands: ["effect @s night_vision 60"] },
+  );
+  assert.deepEqual(
+    allowedWizardAction({ type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 }),
+    { type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 },
+  );
+  assert.deepEqual(
+    allowedWizardAction({ type: "place_area_torches", version: 1 }),
+    { type: "place_area_torches", version: 1 },
   );
   assert.equal(
     allowedWizardAction({ type: "place_blueprint", id: "copper_bulb_t_flip_flop", version: 1 })?.id,

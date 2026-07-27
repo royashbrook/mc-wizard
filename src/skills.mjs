@@ -236,8 +236,11 @@ export function allowedWizardAction(value) {
     };
   }
   if (value?.type === "potion_rain" && value.version === 1) {
-    const radius = Math.min(12, Math.max(3, Math.floor(Number(value.radius) || 8)));
-    const durationSeconds = Math.min(15, Math.max(3, Math.floor(Number(value.durationSeconds) || 8)));
+    const rawRadius = Number(value.radius);
+    const rawDuration = Number(value.durationSeconds);
+    if (!Number.isFinite(rawRadius) || !Number.isFinite(rawDuration)) return null;
+    const radius = Math.min(12, Math.max(3, Math.floor(rawRadius)));
+    const durationSeconds = Math.min(15, Math.max(3, Math.floor(rawDuration)));
     return { type: "potion_rain", version: 1, radius, durationSeconds };
   }
   if (value?.type === "give_items" && value.version === 1 && Array.isArray(value.items)
@@ -275,6 +278,9 @@ export function allowedWizardAction(value) {
     && value.commands.length >= 1 && value.commands.length <= 8) {
     const commands = value.commands.map(allowedCommand);
     return commands.every(Boolean) ? { type: "run_commands", version: 1, commands } : null;
+  }
+  if (value?.type === "place_area_torches" && value.version === 1) {
+    return { type: "place_area_torches", version: 1 };
   }
   if (value?.type === "build_structure" && value.version === 1) {
     try {
@@ -325,19 +331,12 @@ export function allowedWizardAction(value) {
       return null;
     }
   }
-  // The catalogue fallback identifies a skill by (type, id, version). A type
-  // that owns a dedicated validator above has already had its say: if it fell
-  // through, it was malformed and must be REFUSED. Without this guard the
-  // undefined === undefined id comparison matched the catalogue example, so a
-  // malformed give_items silently became the example iron pickaxe.
-  // give_items never resolves from the catalogue. Its dedicated validator above
-  // is authoritative, so reaching here means the payload was malformed; the
-  // undefined === undefined id comparison used to match the catalogue EXAMPLE
-  // and hand a child the example iron pickaxe they never asked for. Other types
-  // (run_commands, potion_rain) intentionally take their catalogue defaults.
-  if (value?.type === "give_items") return null;
+  // Catalogue resolution is only for genuinely id-keyed fixed skills. Payload
+  // actions have dedicated validators above; falling through means malformed,
+  // never "replace this with the catalogue example".
   return WIZARD_SKILLS.find(({ action }) => (
-    value?.type === action.type && value.id === action.id && value.version === action.version
+    action.id !== undefined
+    && value?.type === action.type && value.id === action.id && value.version === action.version
   ))?.action || null;
 }
 
