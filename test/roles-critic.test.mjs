@@ -3,7 +3,7 @@
 // Fully hermetic: no network, no .env, no Bedrock container, no provider. Every
 // wizard-owned predicate is injected as a stub so the tier ORDER and the
 // verdict SHAPE are what is under test; the two genuinely safety-critical
-// checks (the action allowlist and the research restriction) are driven with
+// checks (the action allowlist and child-content policy) are driven with
 // the REAL src/skills.mjs and src/learned-recipes.mjs implementations, so the
 // forbidden-block and world.command cases are not stubbed into passing.
 import assert from "node:assert/strict";
@@ -12,9 +12,9 @@ import test from "node:test";
 import { safeNovelAction } from "../src/learned-recipes.mjs";
 import {
   ACTION_ALLOWLIST_REASON,
+  CONTENT_POLICY_REASON,
   CRITIC_SEVERITIES,
   INTENT_MISMATCH_REASON,
-  RESEARCH_RESTRICTION_REASON,
   REVIEW_VERDICT_REASON,
   createCritic,
 } from "../src/roles/critic.mjs";
@@ -50,7 +50,7 @@ const fillAction = {
   commands: ["fill ~-25 ~ ~-25 ~25 ~11 ~25 air"],
 };
 
-const BANNED_BLOCKS = [
+const POWERFUL_BLOCKS = [
   "minecraft:command_block",
   "minecraft:repeating_command_block",
   "minecraft:chain_command_block",
@@ -67,8 +67,7 @@ const bannedStructure = (blockId) => ({
     title: "Smuggled shell", kind: "couch",
     dimensions: { width: 3, depth: 3, height: 3 },
     materials: { primary: blockId, accent: blockId, roof: blockId },
-    features: ["decorations"], phases: ["foundation"],
-    primitives: [{ shape: "box", phase: "foundation", blockId, from: [0, 0, 0], to: [2, 2, 2] }],
+    features: ["decorations"], phases: ["foundation", "shell", "roof", "details"],
   },
 });
 
@@ -304,7 +303,7 @@ test("no C0 verdict ever carries a repair hint", () => {
       candidate: { action: { type: "build_structure", version: 1, plan: {} }, answer: "Building." },
       intent: { question: "build me a castle", buildRequest: true, actionableIntent: true },
     }],
-    ["research-restriction", createCritic(stubs({ safeNovelAction: () => false, plannerRepairDetail: detail })), {
+    ["content-policy", createCritic(stubs({ safeNovelAction: () => false, plannerRepairDetail: detail })), {
       candidate: { action: { type: "execute_program", version: 1, program: {} }, answer: "Working." },
       intent: { question: "build me a spiral tower", buildRequest: true, researchRequired: true, actionableIntent: true },
     }],
@@ -323,24 +322,20 @@ test("no C0 verdict ever carries a repair hint", () => {
   }
 });
 
-test("forbidden blocks still reject on an actionable NON-build turn, through the real allowlist", () => {
+test("powerful blocks pass the real allowlist on actionable turns", () => {
   const critic = safetyCritic();
   // buildRequest is false on purpose: this is the newly reachable path (a
   // terrain/administrative turn that escalated into an authored plan), and the
-  // hard block line must hold there exactly as it does on a build turn.
   const intent = { question: "clear a 50x50 area around me", actionableIntent: true, buildRequest: false };
-  for (const blockId of BANNED_BLOCKS) {
+  for (const blockId of POWERFUL_BLOCKS) {
     for (const candidate of [bannedStructure(blockId), bannedBuildPlan(blockId), bannedMachine(blockId)]) {
       const result = critic.critique({ action: candidate, answer: "On it." }, intent);
-      assert.equal(result.severity, "fatal", `${blockId} / ${candidate.type}`);
-      assert.equal(result.tier, "C0", `${blockId} / ${candidate.type}`);
-      assert.equal(result.gate, "action-allowlist", `${blockId} / ${candidate.type}`);
-      assert.equal("repairDetail" in result, false, `${blockId} / ${candidate.type}`);
+      assert.equal(result.severity, "none", `${blockId} / ${candidate.type}`);
     }
   }
 });
 
-test("a researchRequired program carrying world.command or server.console rejects with the verbatim text", () => {
+test("a researchRequired program may carry world.command or server.console", () => {
   const critic = safetyCritic();
   for (const capability of ["world.command", "server.console"]) {
     const action = researchedProgram(capability);
@@ -351,17 +346,22 @@ test("a researchRequired program carrying world.command or server.console reject
       { action, answer: "Researching that build now." },
       { question: "build me a medieval siege tower", buildRequest: true, researchRequired: true, actionableIntent: true },
     );
-    assert.equal(result.severity, "fatal", capability);
-    assert.equal(result.tier, "C0", capability);
-    assert.equal(result.gate, "research-restriction", capability);
-    assert.equal(result.reason, RESEARCH_RESTRICTION_REASON, capability);
-    assert.equal(
-      result.reason,
-      "web-researched build plans cannot contain server administration or arbitrary commands",
-      capability,
-    );
-    assert.equal("repairDetail" in result, false, capability);
+    assert.equal(result.severity, "none", capability);
   }
+});
+
+test("kid-inappropriate generated content is rejected regardless of mechanism", () => {
+  const critic = safetyCritic();
+  const action = researchedProgram("world.command");
+  action.program.title = "Nude body statue";
+  const result = critic.critique(
+    { action, answer: "Working." },
+    { question: "build a statue", buildRequest: true, researchRequired: true, actionableIntent: true },
+  );
+  assert.equal(result.severity, "fatal");
+  assert.equal(result.gate, "content-policy");
+  assert.equal(result.reason, CONTENT_POLICY_REASON);
+  assert.equal("repairDetail" in result, false);
 });
 
 test("the same program is accepted when the turn does not require research", () => {

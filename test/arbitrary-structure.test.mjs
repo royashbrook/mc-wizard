@@ -72,16 +72,16 @@ test("validates compact phased primitives inside the requested bounds", () => {
   });
   assert.equal(shifted.dimensions.width, 10);
   assert.ok(shifted.salvage.warnings.some((warning) => /translated/.test(warning)));
-  // hard safety line: forbidden executor blocks are dropped, never repaired
-  const smuggled = validateBuildStructurePlan({
+  // powerful executor blocks remain available inside the same bounded plan
+  const commandBuild = validateBuildStructurePlan({
     ...customPlan,
     primitives: [...customPlan.primitives, {
       shape: "box", phase: "details", blockId: "minecraft:command_block", from: [1, 1, 1], to: [1, 1, 1],
     }],
   });
-  assert.equal(smuggled.primitives.length, 4);
-  assert.ok(smuggled.salvage.dropped.some(({ reason }) => /not allowed/.test(reason)));
-  assert.ok(smuggled.primitives.every(({ blockId }) => blockId !== "minecraft:command_block"));
+  assert.equal(commandBuild.primitives.length, 5);
+  assert.deepEqual(commandBuild.salvage.dropped, []);
+  assert.ok(commandBuild.primitives.some(({ blockId }) => blockId === "minecraft:command_block"));
 });
 
 // #35: an all-air plan still rejects (nothing to build), but air-padded bounds
@@ -147,10 +147,11 @@ test("validates bounded in-place structure modifications, inhabitants, and primi
     primitives: [{ shape: "line", phase: "foundation", blockId: "minecraft:lava", from: [-1, 0, 0], to: [-1, 0, 7] }],
   });
   assert.equal(lavaMoat.primitives[0].blockId, "minecraft:lava");
-  assert.throws(() => validateBuildStructurePlan({
+  const lavaStructure = validateBuildStructurePlan({
     ...customPlan,
     materials: { ...customPlan.materials, primary: "minecraft:lava" },
-  }), /materials\.primary is not allowed/);
+  });
+  assert.equal(lavaStructure.materials.primary, "minecraft:lava");
 
   const generatedModification = validateBuildStructurePlan({
     ...customPlan,
@@ -166,9 +167,14 @@ test("validates bounded in-place structure modifications, inhabitants, and primi
     materials: { ...customPlan.materials, primary: "minecraft:air" },
   }), /materials\.primary is not allowed/);
   assert.throws(() => validateBuildStructurePlan({ ...customPlan, mode: "replace" }), /mode must be modify/);
-  assert.throws(() => validateBuildStructurePlan({
+  const zombiePlan = validateBuildStructurePlan({
     ...customPlan,
     entities: [{ typeId: "minecraft:zombie", location: [1, 1, 1] }],
+  });
+  assert.equal(zombiePlan.entities[0].typeId, "minecraft:zombie");
+  assert.throws(() => validateBuildStructurePlan({
+    ...customPlan,
+    entities: [{ typeId: "addon:zombie", location: [1, 1, 1] }],
   }), /typeId is not allowed/);
   assert.throws(() => validateBuildStructurePlan({
     ...customPlan,

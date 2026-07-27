@@ -1,8 +1,6 @@
 export const PLAN_LIMITS = Object.freeze({ maxBlocks: 128, x: 8, y: 12, z: 20 });
 
-// Inert, engine-supported vanilla blocks only. Never command_block, structure_block,
-// mob_spawner, barrier, or tnt — this allowlist is a safety boundary (#35 widened it
-// with decorative/structural blocks only).
+// Known aliases whose placed block type differs from the inventory item ID.
 const WOOL_AND_CONCRETE_COLORS = Object.freeze([
   "white", "orange", "magenta", "light_blue", "yellow", "lime", "pink", "gray",
   "light_gray", "cyan", "purple", "blue", "brown", "green", "red", "black",
@@ -48,6 +46,7 @@ const ITEMS = Object.freeze({
   "minecraft:lever": "minecraft:lever",
   "minecraft:stone_button": "minecraft:stone_button",
 });
+const ITEM_ID_PATTERN = /^minecraft:[a-z0-9_]+$/;
 
 const BELOW_ONLY_ITEMS = new Set(["minecraft:redstone", "minecraft:redstone_torch"]);
 const NEIGHBOR_OFFSETS = Object.freeze([
@@ -97,7 +96,7 @@ export function validateBuildPlan(value, { salvage = true } = {}) {
       return;
     }
     const itemId = String(block?.itemId || "");
-    const expectedType = ITEMS[itemId];
+    const expectedType = ITEMS[itemId] || (ITEM_ID_PATTERN.test(itemId) ? itemId : undefined);
     if (!expectedType) {
       drop(index, `blocks[${index}].itemId is not allowed`);
       return;
@@ -194,5 +193,5 @@ export function buildPlanSchemaPrompt() {
   return `build_validated_plan action={"type":"build_plan","version":1,"plan":{"title":"short title","blocks":[{"target":[x,y,z],"itemId":"minecraft:oak_planks"}]}}. `
     + `Limits: at most ${PLAN_LIMITS.maxBlocks} blocks; x -${PLAN_LIMITS.x}..${PLAN_LIMITS.x}; y 0..${PLAN_LIMITS.y}; z 0..${PLAN_LIMITS.z}. `
     + `Order and support are computed for you; just list blocks. Every block must connect to the ground at y=0 through adjacent blocks; redstone and redstone torches need a block directly below. `
-    + `Allowed item IDs: ${Object.keys(ITEMS).join(", ")}. Use this only when the player explicitly asks you to build a small structure not covered by another skill.`;
+    + `Use any namespaced vanilla Bedrock item/block ID. Common aliases are ${Object.keys(ITEMS).join(", ")}. Use this only when the player explicitly asks you to build a small structure not covered by another skill.`;
 }

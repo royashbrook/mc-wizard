@@ -39,6 +39,9 @@ const PLACE_ITEMS = Object.freeze({
   "minecraft:cactus": "minecraft:cactus",
   "minecraft:wheat": "minecraft:wheat",
 });
+const ITEM_ID_PATTERN = /^minecraft:[a-z0-9_]+$/;
+const expectedPlacementType = (itemId) => PLACE_ITEMS[itemId]
+  || (ITEM_ID_PATTERN.test(itemId) ? itemId : undefined);
 
 const INTERACTION_ITEMS = Object.freeze({
   "minecraft:water_bucket": { expectedFaceType: "minecraft:water" },
@@ -195,7 +198,7 @@ function cropFarmPipeline(plan) {
   const route = paths.sort((a, b) => (
     distance(a.path[0], collectionReference) - distance(b.path[0], collectionReference)
   ))[0];
-  const expected = PLACE_ITEMS[plant.itemId];
+  const expected = expectedPlacementType(plant.itemId);
   return {
     kind: "crop_farm_pipeline",
     plant: plant.target,
@@ -226,7 +229,7 @@ function validatePlacement(placement, index, placed) {
 
   exactKeys(placement, ["itemId", "target", "support", "orientationTarget"], `placements[${index}]`);
   const itemId = String(placement.itemId || "");
-  if (!PLACE_ITEMS[itemId]) throw new Error(`placements[${index}].itemId is not allowed`);
+  if (!expectedPlacementType(itemId)) throw new Error(`placements[${index}].itemId is not allowed`);
   const target = vector(placement.target, `placements[${index}].target`);
   const support = vector(placement.support, `placements[${index}].support`, { ground: true });
   if (!touches(target, support)) throw new Error(`placements[${index}].support must touch its target`);
@@ -344,7 +347,7 @@ export function machineBlueprint(value) {
   const farmPipeline = cropFarmPipeline(plan);
   const placements = plan.placements.map((placement) => placement.action === "break" ? placement : {
     ...placement,
-    expectedType: PLACE_ITEMS[placement.itemId],
+    expectedType: expectedPlacementType(placement.itemId),
     ...placement.orientationTarget && { orientationTarget: placement.orientationTarget },
   });
   const finalPlaced = new Map(foldPlacementSteps(plan.placements)
@@ -438,5 +441,5 @@ export function machinePlanSchemaPrompt() {
     + `Every placement needs an adjacent ground or earlier support. Directional blocks require an adjacent orientationTarget; other blocks use null. A break placement may only remove earlier smooth-stone or cobblestone scaffolding. `
     + `Crops need their support directly below; wheat must sit on farmland with a poured water_bucket nearby, and every farm needs a hopper path to an output chest. Invalid placements are dropped individually, but a plan losing most placements or all interactions is rejected. `
     + `For a Nether portal, place a complete full-corner vertical obsidian rectangle at least 4 blocks wide and 5 blocks tall, leave its interior empty, then use flint_and_steel on a frame block with faceTarget inside the frame. `
-    + `Allowed placement items: ${Object.keys(PLACE_ITEMS).join(", ")}. Allowed interaction items: ${Object.keys(INTERACTION_ITEMS).join(", ")}.`;
+    + `Placement itemId may be any namespaced vanilla Bedrock item/block ID; common aliases are ${Object.keys(PLACE_ITEMS).join(", ")}. Allowed interaction items: ${Object.keys(INTERACTION_ITEMS).join(", ")}.`;
 }

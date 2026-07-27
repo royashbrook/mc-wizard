@@ -55,9 +55,9 @@ test("salvages a shuffled plan with garbage supports into a ground-up ordering",
 
 test("drops disallowed-item entries and keeps the rest", () => {
   const plan = towerPlan();
-  plan.blocks[21] = block("minecraft:command_block", [0, 1, 1]);
-  plan.blocks[22] = block("minecraft:mob_spawner", [0, 1, 2]);
-  plan.blocks[23] = block("minecraft:tnt", [0, 1, 3]);
+  plan.blocks[21] = block("command_block", [0, 1, 1]);
+  plan.blocks[22] = block("mod:mob_spawner", [0, 1, 2]);
+  plan.blocks[23] = block("minecraft:TNT", [0, 1, 3]);
   const validated = validateBuildPlan(plan);
   assert.equal(validated.blocks.length, 37);
   assert.equal(validated.salvage.dropped.length, 3);
@@ -68,20 +68,23 @@ test("drops disallowed-item entries and keeps the rest", () => {
   assert.ok(!validated.blocks.some((entry) => /command_block|mob_spawner|tnt/.test(entry.itemId)));
 });
 
-test("banned block ids are always entry drops, never allowed through", () => {
-  for (const banned of [
+test("operator and destructive blocks are valid building materials", () => {
+  for (const powerful of [
     "minecraft:command_block",
+    "minecraft:repeating_command_block",
+    "minecraft:chain_command_block",
     "minecraft:structure_block",
+    "minecraft:structure_void",
     "minecraft:mob_spawner",
     "minecraft:barrier",
     "minecraft:tnt",
   ]) {
     const plan = towerPlan();
-    plan.blocks[25] = block(banned, [0, 1, 5]);
+    plan.blocks[25] = block(powerful, [0, 1, 5]);
     const validated = validateBuildPlan(plan);
-    assert.equal(validated.blocks.length, 39, banned);
-    assert.equal(validated.salvage.dropped.length, 1, banned);
-    assert.match(validated.salvage.dropped[0].reason, /not allowed/, banned);
+    assert.equal(validated.blocks.length, 40, powerful);
+    assert.equal(validated.salvage.dropped.length, 0, powerful);
+    assert.equal(validated.blocks.find(({ target }) => target.join() === "0,1,5").expectedType, powerful);
   }
 });
 
@@ -121,7 +124,7 @@ test("rejects an all-floating plan with the violation list as JSON", () => {
 test("rejects the whole plan when more than half the entries are disallowed", () => {
   const blocks = [];
   for (let z = 0; z < 4; z += 1) blocks.push(block("minecraft:stone", [0, 0, z]));
-  for (let z = 4; z < 10; z += 1) blocks.push(block("minecraft:command_block", [0, 0, z]));
+  for (let z = 4; z < 10; z += 1) blocks.push(block("mod:command_block", [0, 0, z]));
   let violations;
   assert.throws(() => validateBuildPlan({ blocks }), (error) => {
     violations = JSON.parse(error.message);
@@ -148,7 +151,7 @@ test("small plans reject when any entry drops", () => {
   assert.throws(() => validateBuildPlan({
     blocks: [
       block("minecraft:oak_planks", [0, 0, 1]),
-      block("minecraft:tnt", [0, 1, 1]),
+      block("mod:tnt", [0, 1, 1]),
     ],
   }), /not allowed/);
 });
@@ -210,7 +213,7 @@ test("widened palette accepts inert decorative blocks with correct expected type
 
 test("salvage:false keeps strict first-violation throw semantics", () => {
   assert.throws(() => validateBuildPlan({
-    blocks: [block("minecraft:tnt", [0, 0, 0], [0, -1, 0])],
+    blocks: [block("mod:tnt", [0, 0, 0], [0, -1, 0])],
   }, { salvage: false }), /not allowed/);
   assert.throws(() => validateBuildPlan({
     blocks: [block("minecraft:stone", [0, 5, 0], [0, 4, 0])],

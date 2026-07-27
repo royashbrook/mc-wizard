@@ -1198,7 +1198,7 @@ test("normalizes common model structure aliases and phase ordering before valida
   assert.ok(result.action.plan.primitives.every(({ blockId }) => blockId !== "minecraft:bricks"));
 });
 
-test("city compiler canonicalizes kind, fills partial dimensions, and replaces invalid materials", async () => {
+test("city compiler canonicalizes kind, fills dimensions, and preserves valid uncommon materials", async () => {
   const wizard = createWizard({
     corpus,
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
@@ -1223,7 +1223,7 @@ test("city compiler canonicalizes kind, fills partial dimensions, and replaces i
   });
   assert.equal(result.action.plan.kind, "city");
   assert.deepEqual(result.action.plan.dimensions, { width: 31, depth: 31, height: 18 });
-  assert.ok(Object.values(result.action.plan.materials).every((blockId) => blockId !== "minecraft:calcite"));
+  assert.ok(Object.values(result.action.plan.materials).every((blockId) => blockId === "minecraft:calcite"));
   assert.equal(result.action.plan.entities.length, 4);
   assert.ok(result.action.plan.primitives.filter(({ blockId }) => blockId === "minecraft:sea_lantern").length >= 4);
 });

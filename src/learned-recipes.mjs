@@ -1,7 +1,7 @@
 import { mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 
-import { isAllowedStructureMaterial } from "../bedrock/behavior_packs/mc_wizard/scripts/build-structure.js";
+import { isKidAppropriateAction } from "./content-policy.mjs";
 
 const STOP_WORDS = new Set([
   "a", "an", "and", "build", "can", "construct", "could", "create", "for", "hey", "look", "make", "me", "my",
@@ -32,21 +32,11 @@ for (const group of SUBJECT_SYNONYMS) {
 const canonicalToken = (token) => CANONICAL_SUBJECT.get(token) || token;
 const keyTokens = (key) => new Set(key.split(" ").filter(Boolean).map(canonicalToken));
 
-// #35: capability-safety acceptance for freshly researched novel actions.
-// Unlike reusableLearnedAction, staged titles and low work counts are quality
-// concerns for storage, not safety concerns for acceptance — only unlearned
-// action types, command/console/configure capabilities, and off-allowlist
-// structure materials reject a novel plan here.
+// Freshly planned actions may use every validated gameplay capability. This
+// gate is about child-appropriate content, not whether the mechanism is a
+// command, an operator action, a special block, or a Script API capability.
 export function safeNovelAction(action) {
-  if (!action || !LEARNED_ACTION_TYPES.has(action.type)) return false;
-  if (action.type === "execute_program") {
-    return Array.isArray(action.program?.steps) && action.program.steps.length > 0
-      && action.program.steps.every(({ capability }) => LEARNED_PROGRAM_CAPABILITIES.has(capability));
-  }
-  if (action.type !== "build_structure") return true;
-  return ["primary", "accent", "roof"].every((name) => (
-    isAllowedStructureMaterial(action.plan?.materials?.[name])
-  ));
+  return isKidAppropriateAction(action);
 }
 
 export function reusableLearnedAction(action) {

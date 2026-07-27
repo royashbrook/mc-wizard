@@ -108,10 +108,15 @@ test("validates bounded player-action plans for long-tail farms and machines", (
 // the drops breach the survival floor (fewer than max(4, 50%) placements
 // survive) or drop every requested interaction; the error message is now a
 // JSON violation list whose reasons still match the original patterns.
-test("rejects unsafe machine items, arbitrary breaking, and unbounded directions", () => {
-  assert.throws(() => validateMachinePlan({
+test("accepts powerful blocks but rejects arbitrary breaking and unbounded directions", () => {
+  assert.equal(validateMachinePlan({
     ...sugarCanePlan,
     placements: [place("minecraft:tnt", [0, 0, 2], [0, -1, 2])],
+    interactions: [],
+  }).placements[0].itemId, "minecraft:tnt");
+  assert.throws(() => validateMachinePlan({
+    ...sugarCanePlan,
+    placements: [place("mod:tnt", [0, 0, 2], [0, -1, 2])],
     interactions: [],
   }), /itemId is not allowed/);
   assert.throws(() => validateMachinePlan({
@@ -197,7 +202,7 @@ test("drops only the irreparable placement and keeps the surviving machine", () 
   const placements = [];
   for (let z = 2; z <= 16; z += 1) placements.push(place("minecraft:smooth_stone", [0, 0, z], [0, -1, z]));
   for (let z = 2; z <= 15; z += 1) placements.push(place("minecraft:smooth_stone", [0, 1, z], [0, 0, z]));
-  placements.push(place("minecraft:crafting_table", [5, 0, 18], [5, -1, 18]));
+  placements.push(place("mod:crafting_table", [5, 0, 18], [5, -1, 18]));
   assert.equal(placements.length, 30);
   const plan = validateMachinePlan({ title: "Long Wall", kind: "wall machine", placements, interactions: [] });
   assert.equal(plan.placements.length, 29);
@@ -215,7 +220,7 @@ test("cascades drops through a dropped support without synthesizing repairs", ()
     placements: [
       place("minecraft:smooth_stone", [0, 0, 2], [0, -1, 2]),
       place("minecraft:smooth_stone", [0, 1, 2], [0, 0, 2]),
-      place("minecraft:tnt", [0, 2, 2], [0, 1, 2]),
+      place("mod:tnt", [0, 2, 2], [0, 1, 2]),
       place("minecraft:smooth_stone", [0, 3, 2], [0, 2, 2]),
       place("minecraft:smooth_stone", [1, 0, 2], [1, -1, 2]),
       place("minecraft:smooth_stone", [2, 0, 2], [2, -1, 2]),
@@ -237,10 +242,10 @@ test("rejects the whole plan with a full JSON violation list when most placement
     placements: [
       place("minecraft:smooth_stone", [0, 0, 2], [0, -1, 2]),
       place("minecraft:smooth_stone", [1, 0, 2], [1, -1, 2]),
-      place("minecraft:tnt", [2, 0, 2], [2, -1, 2]),
-      place("minecraft:command_block", [3, 0, 2], [3, -1, 2]),
-      place("minecraft:mob_spawner", [4, 0, 2], [4, -1, 2]),
-      place("minecraft:barrier", [5, 0, 2], [5, -1, 2]),
+      place("mod:tnt", [2, 0, 2], [2, -1, 2]),
+      place("command_block", [3, 0, 2], [3, -1, 2]),
+      place("minecraft:Mob_Spawner", [4, 0, 2], [4, -1, 2]),
+      place("addon:barrier", [5, 0, 2], [5, -1, 2]),
     ],
     interactions: [],
   }));
@@ -314,9 +319,10 @@ test("accepts inert placement additions and hopper minecarts on rail variants", 
   assert.equal(plan.dropped, undefined);
 });
 
-test("command-adjacent items never enter the machine placement allowlist", () => {
+test("operator and destructive blocks enter bounded machine plans", () => {
   const prompt = machinePlanSchemaPrompt();
-  for (const banned of [
+  assert.match(prompt, /any namespaced vanilla Bedrock item\/block ID/);
+  for (const powerful of [
     "minecraft:command_block",
     "minecraft:repeating_command_block",
     "minecraft:chain_command_block",
@@ -325,7 +331,6 @@ test("command-adjacent items never enter the machine placement allowlist", () =>
     "minecraft:barrier",
     "minecraft:tnt",
   ]) {
-    assert.equal(prompt.includes(banned), false, `${banned} must not be offered to the model`);
     const plan = validateMachinePlan({
       title: "Probe",
       kind: "probe machine",
@@ -334,12 +339,12 @@ test("command-adjacent items never enter the machine placement allowlist", () =>
         place("minecraft:smooth_stone", [1, 0, 2], [1, -1, 2]),
         place("minecraft:smooth_stone", [2, 0, 2], [2, -1, 2]),
         place("minecraft:smooth_stone", [3, 0, 2], [3, -1, 2]),
-        place(banned, [4, 0, 2], [4, -1, 2]),
+        place(powerful, [4, 0, 2], [4, -1, 2]),
       ],
       interactions: [],
     });
-    assert.equal(plan.placements.some(({ itemId }) => itemId === banned), false);
-    assert.match(plan.dropped[0].reason, /itemId is not allowed/);
+    assert.equal(plan.placements.some(({ itemId }) => itemId === powerful), true);
+    assert.equal(plan.dropped, undefined);
   }
 });
 

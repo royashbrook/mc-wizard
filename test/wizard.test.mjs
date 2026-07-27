@@ -526,16 +526,17 @@ test("safeNovelAction accepts quality-poor but capability-safe novel builds", ()
     steps: [{ id: "step", capability, arguments: { commands: ["op {{requester}}"] }, expect: "done" }],
   } });
   assert.equal(safeNovelAction(program("player.place-blocks")), true);
-  assert.equal(safeNovelAction(program("world.command")), false);
-  assert.equal(safeNovelAction(program("server.console")), false);
-  assert.equal(safeNovelAction(program("server.configure")), false);
+  assert.equal(safeNovelAction(program("world.command")), true);
+  assert.equal(safeNovelAction(program("server.console")), true);
+  assert.equal(safeNovelAction(program("server.configure")), true);
   const offAllowlist = structuredClone(stagedTitle);
   offAllowlist.plan.materials.primary = "minecraft:command_block";
-  assert.equal(safeNovelAction(offAllowlist), false);
-  assert.equal(safeNovelAction({ type: "run_commands", version: 1, commands: ["/say hi"] }), false);
+  assert.equal(safeNovelAction(offAllowlist), true);
+  assert.equal(safeNovelAction({ type: "run_commands", version: 1, commands: ["/say hi"] }), true);
+  assert.equal(safeNovelAction({ type: "build_plan", plan: { title: "Nude body statue" } }), false);
 });
 
-test("a world.command research plan is rejected with the unchanged ban message", async () => {
+test("a world.command research plan may execute when it matches the request", async () => {
   let calls = 0;
   const banWizard = createWizard({
     corpus: { search: () => [] }, logger: { warn() {} },
@@ -557,12 +558,9 @@ test("a world.command research plan is rejected with the unchanged ban message",
     },
   });
   const result = await banWizard.ask({ player: "CommandBanKid", question: "research and build furniture" });
-  assert.ok(result.action, "the ban must still leave safe build progress");
-  assert.ok(result.telemetry.rejections.some(({ gate, reason }) => (
-    gate === "research-restriction"
-    && reason === "web-researched build plans cannot contain server administration or arbitrary commands"
-  )));
-  assert.doesNotMatch(JSON.stringify(result.action), /world\.command|server\.console|server\.configure/);
+  assert.equal(result.action.type, "execute_program");
+  assert.equal(result.action.program.steps[0].capability, "world.command");
+  assert.equal(result.telemetry.rejections, undefined);
 });
 
 test("a staged-title novel plan passes the research gate to the build contract", async () => {
@@ -2272,7 +2270,7 @@ test("validates bounded support-ordered custom plans and directional logs", () =
     blocks: [{ target: [0, 1, 1], support: [0, 0, 1], itemId: "minecraft:oak_planks" }],
   }), /earlier planned block/);
   assert.throws(() => validateBuildPlan({
-    blocks: [{ target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:tnt" }],
+    blocks: [{ target: [0, 0, 1], support: [0, -1, 1], itemId: "mod:tnt" }],
   }), /not allowed/);
   assert.throws(() => validateBuildPlan({
     blocks: [{ target: [9, 0, 1], support: [9, -1, 1], itemId: "minecraft:stone" }],
@@ -3606,7 +3604,7 @@ test("a provider action failing intent-match records gate telemetry and accepted
   assert.equal(offline.telemetry.rejections, undefined);
 });
 
-test("a researched plan smuggling world.command is still rejected and logged", async () => {
+test("world.command is judged by request fidelity, not categorically banned", async () => {
   let calls = 0;
   const smugglingWizard = createWizard({
     corpus: { search: () => [] },
@@ -3626,11 +3624,9 @@ test("a researched plan smuggling world.command is still rejected and logged", a
   });
   const result = await smugglingWizard.ask({ player: "SmuggleKid", question: "research and build me a couch" });
   assert.ok(calls >= 1);
-  assert.doesNotMatch(JSON.stringify(result.action), /world\.command|server\.console|minecraft:tnt/);
-  assert.ok(result.action, "the rejected research plan must still make safe build progress");
-  assert.ok(result.telemetry.rejections.some(({ gate, reason }) => (
-    gate === "research-restriction" && /server administration|arbitrary commands/i.test(reason)
-  )));
+  assert.ok(result.action, "a mismatched plan still falls through to useful build progress");
+  assert.ok(result.telemetry.rejections?.some(({ gate }) => gate === "intent-match"));
+  assert.equal(result.telemetry.rejections?.some(({ gate }) => gate === "content-policy"), false);
 });
 
 // Issue #42: live child session on the fresh world. The child asked Wiz to

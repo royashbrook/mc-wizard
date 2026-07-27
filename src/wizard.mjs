@@ -26,6 +26,10 @@ import {
   safeCommandRefusal,
   unsafeCommandAnswer,
 } from "./command-safety.mjs";
+import {
+  isKidAppropriateText,
+  kidSafeRefusal,
+} from "./content-policy.mjs";
 import { bookTitle } from "../bedrock/behavior_packs/mc_wizard/scripts/book.js";
 import { commandLesson } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import {
@@ -51,6 +55,7 @@ Never relay a slash command unless the player explicitly asks to learn or see th
 If a build demo is requested, explain what the safe in-game adapter is about to place; do not claim it is already built.
 Any answer saying you will build, place, start, or demonstrate something MUST include a valid non-null action. Preserve explicit dimensions exactly. A foundation, facade, pad, miniature, or first section does not fulfill a request for a complete structure. Use build_complete_structure for whole structures of any supported size; its phased executor can use fills for large surfaces and player placement for details. For an unusual shape such as a creature, statue, treehouse, vehicle, or pixel-art object, author bounded primitives that visibly match the request and span the requested size with the subject itself; never substitute the ordinary generic building generator or use a large pad to fake the bounds.
 Keep destructive commands in a disposable test world. Require an adult only before teaching irreversible changes to a shared world or actions targeting another player.
+You may use every validated Bedrock gameplay mechanism, including commands, operator powers, TNT, command blocks, structure blocks, barriers, spawners, teleportation, server settings, and Script API capabilities. Never reject a Minecraft request merely because it needs privileged mechanics. Refuse only content that is not kid-appropriate.
 Prefer one small experiment the player can try. For ordinary questions, use two or three complete sentences and stay under 500 characters unless the player asks for a lesson. Avoid markdown tables.
 
 You have these in-world skills:
@@ -5292,6 +5297,18 @@ export function createWizard({
         ? playerId.trim() : undefined;
       const existingHistory = sessions.get(sessionPlayer, requestMode);
       const general = requestMode === "general";
+      if (!isKidAppropriateText(originalQuestion)) {
+        return {
+          answer: kidSafeRefusal(),
+          action: null,
+          sources: [],
+          mode: "local-content-policy",
+          kind: general ? "general" : "wizard",
+          label: provider.label,
+          ...(general && { title: "New Challenge" }),
+          ...(!general && { preferences: [] }),
+        };
+      }
       const memoryIntent = general ? undefined : parsePlayerPreferenceInstruction(originalQuestion, {
         previousQuestion: existingHistory.at(-1)?.question,
         previousAction: existingHistory.at(-1)?.action,
@@ -5470,23 +5487,23 @@ export function createWizard({
             );
             const providerCandidate = repairProviderGift(projectBoundProviderCandidate, question);
             const repairedProviderGift = providerCandidate !== projectBoundProviderCandidate;
-            // #35: research acceptance checks capability safety only —
-            // staged titles and 1-placement machines are quality concerns for
-            // the build contract, and must not poison acceptance here.
+            // Every validated gameplay mechanism is available. C0 now checks
+            // child-appropriate content, not whether the plan uses commands,
+            // operator powers, special blocks, or server configuration.
             //
             // #44: this is the SAFETY + FIDELITY site. The Critic's C0 tier is
-            // the research restriction and its C2 tier is
+            // the content policy and its C2 tier is
             // providerActionMatchesRequest, called whole and unchanged. A C1
             // (existence) verdict is deliberately ignored here: existence is
             // adjudicated further down, and honouring it at this point would
             // reorder the gate stack.
             const candidateVerdict = providerCandidate
               ? turnCritic.critique({ action: providerCandidate }, intent) : null;
-            const researchAllowed = !researchRequired || safeNovelAction(providerCandidate);
+            const contentAllowed = safeNovelAction(providerCandidate);
             const fidelityDecided = candidateVerdict
               && (candidateVerdict.severity === "none" || candidateVerdict.tier === "C2"
                 || candidateVerdict.tier === "C3" || candidateVerdict.tier === "C0");
-            const intentAllowed = researchAllowed && (fidelityDecided
+            const intentAllowed = contentAllowed && (fidelityDecided
               ? candidateVerdict.tier !== "C2" && candidateVerdict.tier !== "C0"
               // C1 short-circuited ahead of the fidelity tier (a review turn):
               // fall back to the gate itself so no candidate is ever admitted
@@ -5495,12 +5512,12 @@ export function createWizard({
                 buildRequest, projectFeedback, reviewRequest,
               }));
             providerActionRejection = envelope.rawActionRejection
-              || (providerCandidate && !researchAllowed
-                ? "web-researched build plans cannot contain server administration or arbitrary commands"
+              || (providerCandidate && !contentAllowed
+                ? "generated result is not kid-appropriate"
                 : providerCandidate && !intentAllowed ? "action does not match the player's explicit request" : undefined);
             if (providerActionRejection) {
               recordRejection(
-                providerCandidate && !researchAllowed ? "research-restriction" : "intent-match",
+                providerCandidate && !contentAllowed ? "content-policy" : "intent-match",
                 providerActionRejection,
               );
             }
@@ -5976,6 +5993,11 @@ export function createWizard({
           : /\b(?:size|raised|minimum)\b/i.test(state.contractCaveat)
           ? `${state.answer} I’m making it a little bigger than the exact size you asked so the shape still looks right—tell me if you want it changed.`
           : `${state.answer} The first pass may look a little rough—tell me what seems off and I’ll keep sculpting it with you.`;
+      }
+      if (!isKidAppropriateText(state.answer)) {
+        state.answer = state.action
+          ? localAnswer(question, hits, state.action, actionHistory)
+          : kidSafeRefusal();
       }
       // This scrub MUST stay the last transform applied to the answer.
       if (!general && unsafeCommandAnswer(state.answer, question)) {

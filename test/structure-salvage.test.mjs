@@ -49,11 +49,11 @@ test("salvages a scrambled dragon with an out-of-bounds wing instead of rejectin
   assert.ok(indices.every((index, position) => !position || indices[position - 1] <= index));
 });
 
-test("maps an unknown inert vanilla material to the primary material with a warning", () => {
+test("preserves uncommon vanilla materials with a warning", () => {
   const validated = validateBuildStructurePlan(plan(dragonPrimitives.map((primitive, index) => (
     index === 3 ? { ...primitive, blockId: "minecraft:mud" } : primitive
   ))));
-  assert.equal(validated.primitives[3].blockId, "minecraft:green_concrete");
+  assert.equal(validated.primitives[3].blockId, "minecraft:mud");
   assert.ok(validated.salvage.warnings.some((warning) => /minecraft:mud/.test(warning)));
   assert.deepEqual(validated.salvage.dropped, []);
 });
@@ -154,8 +154,8 @@ test("non-minecraft-namespace blockIds always drop, never map", () => {
   }
 });
 
-test("command_block, structure_block, mob_spawner, barrier, and tnt are always dropped, never repaired", () => {
-  for (const banned of [
+test("operator and destructive blocks are preserved as requested", () => {
+  for (const powerful of [
     "minecraft:command_block",
     "minecraft:repeating_command_block",
     "minecraft:chain_command_block",
@@ -166,12 +166,11 @@ test("command_block, structure_block, mob_spawner, barrier, and tnt are always d
   ]) {
     const validated = validateBuildStructurePlan(plan([
       ...dragonPrimitives,
-      { shape: "box", phase: "details", blockId: banned, from: [1, 1, 1], to: [1, 1, 1] },
+      { shape: "box", phase: "details", blockId: powerful, from: [1, 1, 1], to: [1, 1, 1] },
     ]));
-    assert.equal(validated.primitives.length, 4, banned);
-    assert.ok(validated.primitives.every(({ blockId }) => blockId !== banned));
-    assert.deepEqual(validated.salvage.dropped, [{ index: 4, reason: "primitives[4].blockId is not allowed" }]);
-    assert.ok(validated.salvage.warnings.every((warning) => !warning.includes(banned)));
+    assert.equal(validated.primitives.length, 5, powerful);
+    assert.ok(validated.primitives.some(({ blockId }) => blockId === powerful));
+    assert.deepEqual(validated.salvage.dropped, []);
   }
 });
 

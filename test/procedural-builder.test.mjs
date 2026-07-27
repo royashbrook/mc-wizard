@@ -217,17 +217,17 @@ test("oversized explicit requests are clamped and stay under the primitive cap",
   assert.ok(checked.dimensions.height <= STRUCTURE_LIMITS.height);
 });
 
-test("disallowed material overrides coerce to the nearest allowed block", () => {
+test("valid namespaced material overrides are preserved", () => {
   const wool = compose("build me a dog", { material: "minecraft:pink_wool" });
-  assert.equal(wool.materials.primary, "minecraft:pink_concrete");
+  assert.equal(wool.materials.primary, "minecraft:pink_wool");
   validateBuildStructurePlan(wool);
   const mud = compose("build me a dog", { material: "minecraft:mud" });
-  assert.equal(mud.materials.primary, "minecraft:brown_concrete");
+  assert.equal(mud.materials.primary, "minecraft:mud");
   validateBuildStructurePlan(mud);
-  const banned = compose("build me a dog", { material: "minecraft:command_block" });
-  assert.notEqual(banned.materials.primary, "minecraft:command_block");
-  assert.ok(!banned.primitives.some(({ blockId }) => blockId === "minecraft:command_block"));
-  validateBuildStructurePlan(banned);
+  const command = compose("build me a dog", { material: "minecraft:command_block" });
+  assert.equal(command.materials.primary, "minecraft:command_block");
+  assert.ok(command.primitives.some(({ blockId }) => blockId === "minecraft:command_block"));
+  validateBuildStructurePlan(command);
 });
 
 test("compound nouns like doghouse resolve to the house template, not an animal", () => {
