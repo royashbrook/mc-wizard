@@ -21,5 +21,5 @@ test("offers a physical requester-scoped command acceptance scope", async () => 
   assert.match(pack, /bystander\.getEffect\("night_vision"\)/);
   assert.match(pack, /eight nearby torches placed through the visible Wizard player/);
   assert.match(runner, /E2E_SCOPE" != "commands"/);
-  assert.match(installer, /"machines", "commands", "arbitrary"/);
+  assert.match(installer, /"machines", "commands", "terrain", "arbitrary"/);
 });

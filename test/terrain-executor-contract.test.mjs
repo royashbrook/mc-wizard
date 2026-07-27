@@ -41,3 +41,18 @@ test("terrain work uses the build lifecycle so disconnect rolls it back", async 
   assert.match(terrain, /clearBuild\(token\)/);
   assert.match(source, /clearBuild\(abandonedToken, true\)/);
 });
+
+test("offers a live terrain scope that proves ground anchoring, exact clearing, and undo", async () => {
+  const packageJson = JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8"));
+  const e2e = await readFile(new URL(
+    "../bedrock/behavior_packs/mc_wizard/scripts/e2e.js",
+    import.meta.url,
+  ), "utf8");
+  assert.equal(
+    packageJson.scripts["test:e2e:terrain"],
+    "MC_WIZARD_E2E_SCOPE=terrain sh scripts/run-e2e-container.sh",
+  );
+  assert.match(e2e, /runTerrainAcceptance\(kid\)/);
+  assert.match(e2e, /ground anchor, exact clearing, and persistent transaction undo verified/);
+  assert.match(e2e, /terrain undo to restore both the tree and hill/);
+});
