@@ -162,17 +162,19 @@ async function daemon(onStarted) {
   if ((await daemonPids()).some((pid) => pid !== process.pid)) return;
   await mkdir(RUNTIME, { recursive: true });
   await writeFile(PID_FILE, `${process.pid}\n`, { mode: 0o600 });
-  const log = await open(LOG_FILE, "w", 0o600);
+  // Preserve the preceding outage and restart evidence instead of erasing it
+  // every time the stack is recovered.
+  const log = await open(LOG_FILE, "a", 0o600);
   const children = new Map();
   let stopping = false;
   let finish;
   const finished = new Promise((resolve) => { finish = resolve; });
 
-  function supervise(name, script, enabled = true) {
+  function supervise(name, script, healthUrl, enabled = true) {
     if (!enabled) return;
     let failures = 0;
     const launch = () => {
-      if (stopping) return;
+      if (stopping || children.has(name)) return;
       const child = spawn(process.execPath, [script], {
         cwd: ROOT,
         env: process.env,
@@ -184,16 +186,29 @@ async function daemon(onStarted) {
         if (stopping) return;
         failures += 1;
         const delay = Math.min(30_000, 1_000 * (2 ** Math.min(failures - 1, 5)));
-        setTimeout(launch, delay);
+        setTimeout(async () => {
+          // Another foreground service may already own the endpoint (the
+          // provider bridge commonly survives a prior supervisor). Adopt it
+          // rather than hammering EADDRINUSE forever.
+          if (!(await probe(healthUrl)).ok) launch();
+        }, delay);
       });
     };
     launch();
   }
 
   const localProvider = usesLocalProvider();
-  supervise("provider", path.join(ROOT, "scripts", "local-ai-bridge.mjs"), localProvider);
-  supervise("brain", path.join(ROOT, "src", "server.mjs"));
-  await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
+  const providerUrl = `http://127.0.0.1:${process.env.MTOK_PORT || 8790}/health`;
+  const brainUrl = `http://${process.env.HOST || "127.0.0.1"}:${process.env.PORT || 3000}/health`;
+  if (localProvider && !(await probe(providerUrl)).ok) {
+    supervise("provider", path.join(ROOT, "scripts", "local-ai-bridge.mjs"), providerUrl);
+  }
+  if (!(await probe(brainUrl)).ok) {
+    supervise("brain", path.join(ROOT, "src", "server.mjs"), brainUrl);
+  }
+  if (!(await containerRunning("mc-wizard-bedrock"))) {
+    await run("sh", [path.join(ROOT, "scripts", "start-bedrock-container.sh")], { stdio: ["ignore", log.fd, log.fd] });
+  }
 
   const shutdown = async () => {
     if (stopping) return;
@@ -206,12 +221,19 @@ async function daemon(onStarted) {
   };
   process.on("SIGTERM", shutdown);
   process.on("SIGINT", shutdown);
+  process.on("SIGHUP", shutdown);
   // Recreate only when the container has actually stopped, and only after two
   // consecutive misses so a transient `container list` hiccup or an in-progress
   // boot never triggers a delete/recreate loop (see issue #38).
   let downChecks = 0;
   setInterval(async () => {
     if (stopping) return;
+    if (!(await probe(brainUrl)).ok && !children.has("brain")) {
+      supervise("brain", path.join(ROOT, "src", "server.mjs"), brainUrl);
+    }
+    if (localProvider && !(await probe(providerUrl)).ok && !children.has("provider")) {
+      supervise("provider", path.join(ROOT, "scripts", "local-ai-bridge.mjs"), providerUrl);
+    }
     if (await containerRunning("mc-wizard-bedrock")) { downChecks = 0; return; }
     downChecks += 1;
     if (downChecks < 2) return;

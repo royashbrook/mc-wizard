@@ -1930,6 +1930,33 @@ async function runRemoteGiftAcceptance(kid) {
   }
 }
 
+async function runOfflineGiftAcceptance(kid) {
+  try {
+    const requests = [
+      ["give me 1 dirt", "minecraft:dirt"],
+      ["give me an emerald", "minecraft:emerald"],
+      ["give me a command block", "minecraft:command_block"],
+    ];
+    for (const [message, itemId] of requests) {
+      const before = playerAndDroppedItemAmount(kid, itemId);
+      await new Promise((resolve, reject) => {
+        sendWizardRequest(kid, message, `offline ${itemId} gift`, resolve, (detail) => reject(new Error(detail)));
+      });
+      await waitFor(
+        () => playerAndDroppedItemAmount(kid, itemId) === before + 1,
+        400,
+        `${itemId} to be physically delivered without a brain turn`,
+      );
+      report("CHECK", "offline-gift", `${message}: delivered exactly one ${itemId}`);
+    }
+    report("PASS", "offline-gift-pipeline", "three common child gifts were physically delivered through the local capability path");
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    report("FAIL", "offline-gift-pipeline", String(error));
+    try { kid.disconnect(); } catch {}
+  }
+}
+
 function recipeDisplayIsComplete(kid, station) {
   const min = { x: station.x - 16, y: station.y, z: station.z - 16 };
   const max = { x: station.x + 16, y: station.y + 5, z: station.z + 16 };
@@ -3348,7 +3375,7 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "mc_wizard_e2e_run is required");
     return;
   }
-  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "terrain" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "local-travel" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp" && scope !== "delivery") {
+  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "terrain" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "local-travel" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp" && scope !== "delivery" && scope !== "offline-gift") {
     report("FAIL", "configuration", `unsupported mc_wizard_e2e_scope: ${scope}`);
     return;
   }
@@ -3382,7 +3409,8 @@ export async function startE2E(callbacks) {
           : scope === "feedback" ? "feedback-refinement"
           : scope === "farms" ? "common-farm-pipeline"
             : scope === "kelp" ? "kelp-farm-pipeline"
-              : scope === "delivery" ? "remote-gift-pipeline" : "visible-player-t-flip-flop";
+              : scope === "delivery" ? "remote-gift-pipeline"
+                : scope === "offline-gift" ? "offline-gift-pipeline" : "visible-player-t-flip-flop";
   report("START", startCheck);
   try {
     const dimension = world.getDimension("overworld");
@@ -3463,6 +3491,10 @@ export async function startE2E(callbacks) {
     }
     if (scope === "delivery") {
       system.runTimeout(() => void runRemoteGiftAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "offline-gift") {
+      system.runTimeout(() => void runOfflineGiftAcceptance(kid), 80);
       return;
     }
     system.runTimeout(async () => {
