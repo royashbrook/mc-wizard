@@ -20,8 +20,8 @@
 // is edited or widened by this work. The only safety surface it touches is the
 // one it must pass: every candidate is re-validated through allowedWizardAction
 // and the planner returns THAT value, never the raw object it authored. The
-// emitted commands are `fill <box> air` and nothing else — no command block, no
-// tnt, no lava, no entity selector, no second command.
+// emitted action is a typed terrain_work contract. Bedrock resolves the actual
+// ground anchor, snapshots the world, performs the fill, and owns rollback.
 //
 // GEOMETRY. The footprint is centred on the player (`~` relative coordinates,
 // which the pack resolves per-player via `execute as @a[tag=...] at @s run`).
@@ -38,18 +38,15 @@
 // validated action, so the caveat rides on terrainIntent(question).caveat.
 
 // Bedrock refuses a /fill whose box exceeds this many blocks.
-export const FILL_BLOCK_CAP = 32768;
-// src/skills.mjs caps a run_commands action at 8 commands.
-export const MAX_COMMANDS = 8;
 // Largest footprint edge the wizard will clear in one turn.
 export const MAX_FOOTPRINT = 64;
 // Footprint used when the child names no size ("flatten this hill").
 export const DEFAULT_FOOTPRINT = 16;
 // Vertical window: feet (~0) up to ~+11, i.e. 12 layers.
 export const DEFAULT_HEIGHT = 12;
-// Tallest vertical window, chosen so the worst-case footprint (65x65 = 4225
-// blocks per layer, 7 layers per command) still fits in MAX_COMMANDS.
+// Tallest vertical window supported by the typed executor.
 export const MAX_HEIGHT = 32;
+export const LEVEL_FILL_DEPTH = 4;
 
 const TERRAIN_VERBS = "clear|level|flatten|remove|dig|excavate|smooth|demolish|erase|wipe";
 const IMPERATIVE_TERRAIN_VERB = new RegExp(`^(${TERRAIN_VERBS})\\b`, "i");
@@ -138,22 +135,12 @@ function clampHeight(value) {
   return { height, clamped: false };
 }
 
-function sliceLayers(perLayer, height) {
-  const layersPerCommand = Math.max(1, Math.floor(FILL_BLOCK_CAP / perLayer));
-  const slices = [];
-  for (let low = 0; low < height && slices.length < MAX_COMMANDS; low += layersPerCommand) {
-    slices.push({ low, high: Math.min(height - 1, low + layersPerCommand - 1) });
-  }
-  const reachable = slices.length ? slices.at(-1).high + 1 : 0;
-  return { slices, truncated: reachable < height, reachable };
-}
-
-function caveatFor({ footprintClamped, requested, width, depth, heightClamped, height, truncated }) {
+function caveatFor({ footprintClamped, requested, width, depth, heightClamped, height }) {
   const notes = [];
   if (footprintClamped) {
     notes.push(`${requested.width} by ${requested.depth} is a bigger patch than my wand can safely sweep in one spell, so I am clearing the biggest safe ${width} by ${depth} piece around you`);
   }
-  if (heightClamped || truncated) {
+  if (heightClamped) {
     notes.push(`I am taking it ${height} blocks up from your feet this time`);
   }
   if (!notes.length) return undefined;
@@ -217,20 +204,15 @@ export function createTerrainPlanner(deps = {}) {
 
     const width = widthClamp.edge;
     const depth = depthClamp.edge;
-    const halfWidth = Math.floor(width / 2);
-    const halfDepth = Math.floor(depth / 2);
-    const perLayer = (2 * halfWidth + 1) * (2 * halfDepth + 1);
-    const { slices, truncated, reachable } = sliceLayers(perLayer, heightClamp.height);
-    const height = truncated ? reachable : heightClamp.height;
+    const height = heightClamp.height;
 
     return {
       mode: LEVELLING_VERB.test(found.verb) ? "level" : "clear",
       width,
       depth,
       height,
-      halfWidth,
-      halfDepth,
-      slices,
+      fillDepth: LEVELLING_VERB.test(found.verb) ? LEVEL_FILL_DEPTH : 0,
+      overLimit: widthClamp.clamped || depthClamp.clamped || heightClamp.clamped,
       caveat: caveatFor({
         footprintClamped: widthClamp.clamped || depthClamp.clamped,
         requested: { width: requestedWidth, depth: requestedDepth },
@@ -238,7 +220,6 @@ export function createTerrainPlanner(deps = {}) {
         depth,
         heightClamped: heightClamp.clamped,
         height,
-        truncated,
       }),
     };
   }
@@ -260,13 +241,16 @@ export function createTerrainPlanner(deps = {}) {
   // Never the raw candidate: the allowlist has the last word on every field.
   function terrainAction(question) {
     const terrain = plan(question);
-    if (!terrain || !terrain.slices.length) return null;
-    const { halfWidth: hx, halfDepth: hz } = terrain;
-    const commands = terrain.slices.map(({ low, high }) => (
-      `fill ~${-hx} ~${low} ~${-hz} ~${hx} ~${high} ~${hz} air`
-    ));
-    if (commands.length > MAX_COMMANDS) return null;
-    return allowedWizardAction({ type: "run_commands", version: 1, commands });
+    if (!terrain || terrain.overLimit) return null;
+    return allowedWizardAction({
+      type: "terrain_work",
+      version: 1,
+      mode: terrain.mode,
+      width: terrain.width,
+      depth: terrain.depth,
+      height: terrain.height,
+      fillDepth: terrain.fillDepth,
+    });
   }
 
   return { terrainIntent, terrainAction };

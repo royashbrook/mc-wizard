@@ -3773,8 +3773,9 @@ test("the reported live terrain session produces real in-world work", async () =
     });
     const result = await wizard.ask({ player: "LiveKid", question });
     assert.ok(result.action, `no action for the live turn: ${question}`);
-    assert.equal(result.action.type, "run_commands");
-    assert.deepEqual(result.action.commands, ["fill ~-25 ~0 ~-25 ~25 ~11 ~25 air"]);
+    assert.equal(result.action.type, "terrain_work");
+    assert.equal(result.action.width, 50);
+    assert.equal(result.action.depth, 50);
     // The deterministic rung answers it outright, so the turn costs nothing.
     assert.equal(providerCalls, 0, `terrain turn consulted the provider: ${question}`);
     assert.ok(!result.answer.includes(providerAnswer));
@@ -3852,7 +3853,7 @@ test("the never-empty floor stays silent on superseded and failed-review turns",
 // 50x50 clear and got nothing both times, because classifyAction had no terrain
 // rung at all. Every phrasing below was verified against the shipped code as a
 // no-action turn before this rung existed.
-test("terrain work orders compile to a validated fill-with-air action", () => {
+test("terrain work orders compile to a validated ground-anchored action", () => {
   const phrasings = [
     "clear a 50x50 area around me, starting at the ground beneath this tree",
     "just level the ground, remove all blocks in a 50x50 area",
@@ -3864,23 +3865,20 @@ test("terrain work orders compile to a validated fill-with-air action", () => {
   for (const question of phrasings) {
     const action = classifyAction(question);
     assert.ok(action, `no action for terrain request: ${question}`);
-    assert.equal(action.type, "run_commands", `wrong action type for: ${question}`);
-    assert.ok(action.commands.length >= 1 && action.commands.length <= 8);
-    for (const command of action.commands) {
-      assert.match(command, /^fill ~-\d+ ~\d+ ~-\d+ ~\d+ ~\d+ ~\d+ air$/);
-      assert.ok(command.length <= 500);
-      assert.ok(!/[\r\n\0]/.test(command));
-      // No selector, no second command, no guarded block ever appears.
-      assert.ok(!/@[aeprs]\b|command_block|tnt|lava|structure_block|mob_spawner/i.test(command));
-    }
+    assert.equal(action.type, "terrain_work", `wrong action type for: ${question}`);
+    assert.ok(["clear", "level"].includes(action.mode));
+    assert.ok(action.width <= 64 && action.depth <= 64 && action.height <= 32);
   }
-  // "flatten this hill" names no size, so the default footprint carries it.
   const defaulted = classifyAction("flatten this hill please");
-  assert.deepEqual(defaulted.commands, ["fill ~-8 ~0 ~-8 ~8 ~11 ~8 air"]);
-  // A 50x50 footprint is 51x51 = 2601 blocks a layer; 12 layers is 31212,
-  // under Bedrock's 32768 per-fill cap, so it stays ONE command.
+  assert.deepEqual(defaulted, {
+    type: "terrain_work", version: 1, mode: "level",
+    width: 16, depth: 16, height: 12, fillDepth: 4,
+  });
   const fifty = classifyAction("clear a 50x50 area around me");
-  assert.deepEqual(fifty.commands, ["fill ~-25 ~0 ~-25 ~25 ~11 ~25 air"]);
+  assert.deepEqual(fifty, {
+    type: "terrain_work", version: 1, mode: "clear",
+    width: 50, depth: 50, height: 12, fillDepth: 0,
+  });
 });
 
 // Negative half: the rung must not steal a turn that already belongs to another
@@ -3897,8 +3895,8 @@ test("the terrain rung never steals a build, a lesson, a recipe or a question", 
   // "make this flat" was pinned null here only because that was the behaviour
   // before the rung existed, and that behaviour IS the do-nothing outcome the
   // rung exists to remove. It is a levelling order with a pronoun in place of a
-  // noun, so it now reaches a fill like any other terrain request.
-  assert.equal(classifyAction("make this flat")?.type, "run_commands");
+  // noun, so it now reaches typed terrain work.
+  assert.equal(classifyAction("make this flat")?.type, "terrain_work");
   // The build-delivery form must still belong to the build path.
   assert.equal(classifyAction("make me a flat roof house")?.type, "build_structure");
   assert.equal(classifyAction("how do I craft a hopper")?.type, "show_recipe");

@@ -17,6 +17,10 @@ import {
   normalizeRuntimeStep,
   runtimeProgramHasEvidence,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/capability-runtime.js";
+import {
+  TERRAIN_WORK_LIMITS,
+  validateTerrainWorkAction,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/terrain-work.js";
 
 const RECIPE_ITEM_IDS = new Set(recipeItemIds());
 
@@ -124,6 +128,14 @@ export const WIZARD_SKILLS = [
     name: "execute_minecraft_commands",
     description: "Execute ordinary Bedrock commands to produce an immediate in-world result when no narrower skill covers it. Commands omit the leading slash and use @s for the requesting player. Never merely explain a command when the child asked for the result.",
     action: { type: "run_commands", version: 1, commands: ["effect @s night_vision 999999 0 true"] },
+  },
+  {
+    name: "reshape_nearby_terrain",
+    description: `Clear or level the exact nearby footprint from the real ground beneath the requester, skipping trees and foliage while finding the anchor. The operation is transactional and undoable. Maximum footprint is ${TERRAIN_WORK_LIMITS.width} by ${TERRAIN_WORK_LIMITS.depth}, maximum clear height is ${TERRAIN_WORK_LIMITS.height}, and level mode fills holes up to ${TERRAIN_WORK_LIMITS.fillDepth} blocks deep.`,
+    action: {
+      type: "terrain_work", version: 1, mode: "clear",
+      width: 16, depth: 16, height: 12, fillDepth: 0,
+    },
   },
   {
     name: "build_complete_structure",
@@ -278,6 +290,13 @@ export function allowedWizardAction(value) {
     && value.commands.length >= 1 && value.commands.length <= 8) {
     const commands = value.commands.map(allowedCommand);
     return commands.every(Boolean) ? { type: "run_commands", version: 1, commands } : null;
+  }
+  if (value?.type === "terrain_work" && value.version === 1) {
+    try {
+      return validateTerrainWorkAction(value);
+    } catch {
+      return null;
+    }
   }
   if (value?.type === "place_area_torches" && value.version === 1) {
     return { type: "place_area_torches", version: 1 };

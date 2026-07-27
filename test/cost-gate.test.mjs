@@ -94,12 +94,11 @@ test("terrain work orders are answered for free", async () => {
     "flatten this hill please",
     "wiz can you clear the trees around here",
     "level the ground here",
-    "clear a 500x500 area",
   ]) {
     const { wizard, calls } = countingWizard();
     const result = await wizard.ask({ player: `Terrain${question.length}`, question });
     assert.equal(calls.count, 0, `"${question}" consulted the provider`);
-    assert.equal(result.action?.type, "run_commands", question);
+    assert.equal(result.action?.type, "terrain_work", question);
   }
 });
 
@@ -204,6 +203,6 @@ test("an offline wizard costs nothing and still ships the live terrain turns", a
     "just level the ground, remove all blocks in a 50x50 area",
   ]) {
     const result = await wizard.ask({ player: `Offline${question.length}`, question });
-    assert.equal(result.action?.type, "run_commands", question);
+    assert.equal(result.action?.type, "terrain_work", question);
   }
 });

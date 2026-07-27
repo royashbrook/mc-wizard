@@ -263,6 +263,7 @@ test("JSON response schema exposes goal, travel, and command contracts", async (
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "dimension_travel"));
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "local_travel"));
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "run_commands"));
+  assert.ok(actions.some((entry) => entry.properties?.type?.const === "terrain_work"));
   assert.ok(actions.some((entry) => entry.properties?.type?.const === "place_area_torches"));
   const program = actions.find((entry) => entry.properties?.type?.const === "execute_program");
   assert.equal(program.properties.program.properties.steps.maxItems, 48);

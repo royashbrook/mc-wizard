@@ -2354,16 +2354,12 @@ function localAnswer(question, hits, action, history = []) {
     const changes = [action.time && `make it ${action.time}`, action.weather && weather].filter(Boolean).join(" and ");
     return `One flick of the wand—I’ll ${changes} now.`;
   }
-  if (action?.type === "run_commands") {
-    // #44: terrain work gets its own honest line — the size, the depth, and any
-    // clamp the planner had to apply. The generic line below said nothing about
-    // what was about to happen to the ground a child is standing on.
+  if (action?.type === "terrain_work") {
     const terrain = terrainIntent(question);
-    if (terrain) {
-      const verb = terrain.mode === "level" ? "level" : "clear";
-      const opening = `Stand back—I’m about to ${verb} a ${terrain.width} by ${terrain.depth} patch around you, ${terrain.height} blocks up from your feet, so you get open ground to build on.`;
-      return terrain.caveat ? `${opening} ${terrain.caveat}` : opening;
-    }
+    const verb = terrain?.mode === "level" ? "level" : "clear";
+    return `Stand back—I’m about to ${verb} the exact ${action.width} by ${action.depth} patch from the real ground beneath you, ${action.height} blocks upward. I’ll save the old terrain so you can undo it.`;
+  }
+  if (action?.type === "run_commands") {
     // #44: an effect grant says which effect, and — where the wand cannot do
     // literally what was asked ("make me fly") — says what it is casting
     // instead. The generic line below never told the child either.
@@ -3847,13 +3843,13 @@ function providerActionMatchesRequest(action, question, history = [], {
 const MAX_AUTOMATIC_GOAL_ACTIONS = 6;
 const EXECUTOR_VERIFIED_ACTION_TYPES = new Set([
   "dimension_travel", "local_travel", "give_items", "place_area_torches",
-  "potion_rain", "run_commands", "world_control",
+  "potion_rain", "run_commands", "terrain_work", "world_control",
 ]);
 const GOAL_REVIEW_FEEDBACK = "Fix this same active build so every success criterion is observable in the world.";
 const RETRYABLE_ACTION_TYPES = new Set([
   "place_blueprint", "build_machine", "build_structure", "build_plan",
   "dimension_travel", "local_travel", "world_control", "potion_rain", "give_items",
-  "run_commands", "place_area_torches", "show_recipe", "command_lesson", "execute_program",
+  "run_commands", "terrain_work", "place_area_torches", "show_recipe", "command_lesson", "execute_program",
 ]);
 
 const isAutomaticGoalQuestion = (question) => /^(?:The last attempt failed:|Review the completed in-world attempt|Fix this same active build)/i
@@ -5729,7 +5725,7 @@ export function createWizard({
       const nonBuildIntentOwns = (candidate) => {
         const type = candidate?.type;
         if (!type) return false;
-        if (intent.terrainIntent && type === "run_commands") return true;
+        if (intent.terrainIntent && type === "terrain_work") return true;
         if (intent.effectIntent && type === "run_commands") return true;
         if (intent.travelIntent && (type === "local_travel" || type === "dimension_travel")) return true;
         if (intent.giftIntent && type === "give_items") return true;

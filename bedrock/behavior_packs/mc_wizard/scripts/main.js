@@ -1,10 +1,12 @@
 import {
+  BlockVolume,
   BlockPermutation,
   Direction,
   EnchantmentTypes,
   EquipmentSlot,
   GameMode,
   ItemStack,
+  StructureSaveMode,
   system,
   world,
 } from "@minecraft/server";
@@ -41,6 +43,11 @@ import { newestProjectRecord, normalizeRuntimeStep, runtimeProgramHasEvidence } 
 // Kept as a separate import: contract tests assert the exact line above.
 import { synthesizeRuntimeEvidence } from "./capability-runtime.js";
 import { legacyPropertySuffix, stablePropertySuffix } from "./project-memory-key.js";
+import {
+  findTerrainAnchor,
+  terrainWorkBounds,
+  validateTerrainWorkAction,
+} from "./terrain-work.js";
 
 const PREFIX = "§d[MC Wizard]§r ";
 const WIZARD_NAME = "MC Wizard";
@@ -1781,8 +1788,64 @@ function beginTransaction(playerId, token, dimension, expectedBlocks) {
   return transaction;
 }
 
+function terrainHitsProtectedSpawn(dimension, bounds) {
+  const protectedRadius = Number(variable("mc_wizard_protected_spawn_radius", 0)) || 0;
+  if (protectedRadius <= 0 || dimension.id !== "minecraft:overworld") return false;
+  const spawn = world.getDefaultSpawnLocation();
+  return bounds.from.x <= spawn.x + protectedRadius
+    && bounds.to.x >= spawn.x - protectedRadius
+    && bounds.from.z <= spawn.z + protectedRadius
+    && bounds.to.z >= spawn.z - protectedRadius;
+}
+
+function beginTerrainTransaction(playerId, token, dimension, bounds) {
+  if (terrainHitsProtectedSpawn(dimension, bounds.snapshot)) {
+    throw new Error("that terrain work would enter the protected spawn area");
+  }
+  const structureId = `mcwizard:terrain_${system.currentTick}_${token}`;
+  world.structureManager.createFromWorld(
+    structureId,
+    dimension,
+    bounds.snapshot.from,
+    bounds.snapshot.to,
+    {
+      includeBlocks: true,
+      includeEntities: false,
+      saveMode: StructureSaveMode.World,
+    },
+  );
+  const transaction = {
+    playerId,
+    token,
+    dimensionId: dimension.id,
+    structureId,
+    origin: bounds.snapshot.from,
+  };
+  world.setDynamicProperty(TRANSACTION_JOURNAL, JSON.stringify({
+    dimensionId: dimension.id,
+    structureId,
+    origin: bounds.snapshot.from,
+  }));
+  activeTransaction = transaction;
+  return transaction;
+}
+
+function deleteTransactionBackup(transaction) {
+  if (!transaction?.structureId) return;
+  try {
+    world.structureManager.delete(transaction.structureId);
+  } catch (error) {
+    console.warn(`[MC Wizard] could not delete terrain undo snapshot ${transaction.structureId}: ${error}`);
+  }
+}
+
 function restoreSnapshots(transaction) {
   const dimension = world.getDimension(transaction.dimensionId);
+  if (transaction.structureId) {
+    world.structureManager.place(transaction.structureId, dimension, transaction.origin);
+    deleteTransactionBackup(transaction);
+    return;
+  }
   for (const snapshot of transaction.snapshots) {
     dimension.getBlock(snapshot.location)?.setPermutation(
       BlockPermutation.resolve(snapshot.typeId, snapshot.states || {}),
@@ -1800,6 +1863,7 @@ function rollbackTransaction(token) {
 function commitTransaction(token) {
   if (!activeTransaction || activeTransaction.token !== token) return;
   const transaction = activeTransaction;
+  deleteTransactionBackup(lastUndo.get(transaction.playerId));
   lastUndo.set(transaction.playerId, {
     ...transaction,
     expiresTick: system.currentTick + UNDO_RETENTION_TICKS,
@@ -1811,6 +1875,7 @@ function commitTransaction(token) {
 function undoLastBuild(player) {
   const transaction = lastUndo.get(player.id);
   if (!transaction || transaction.expiresTick <= system.currentTick) {
+    deleteTransactionBackup(transaction);
     lastUndo.delete(player.id);
     speak(player, "I don’t have a recent build to undo.");
     return false;
@@ -5703,6 +5768,62 @@ function runCommandsForPlayer(player, commands, report = beginImmediateAction(pl
   }
 }
 
+function applyTerrainWork(player, rawAction) {
+  if (buildInProgress || buildPreparing) {
+    queueBuild(
+      player,
+      (current) => applyTerrainWork(current, rawAction),
+      40,
+      "I’ve queued that ground spell and will reshape this exact area as soon as my hands are free.",
+    );
+    return;
+  }
+  const token = ++nextBuildToken;
+  activeBuildToken = token;
+  buildInProgress = true;
+  if (!bindBuildAction(player, token)) {
+    clearBuild(token);
+    return;
+  }
+  try {
+    const action = validateTerrainWorkAction(rawAction);
+    const dimension = player.dimension;
+    const anchor = findTerrainAnchor(dimension, player.location);
+    const bounds = terrainWorkBounds(anchor, action);
+    const ground = dimension.getBlock(anchor)?.permutation
+      || BlockPermutation.resolve(anchor.typeId || "minecraft:grass_block");
+    beginTerrainTransaction(player.id, token, dimension, bounds);
+    const bot = bringWizardTo(player, true, true);
+    if (bot) {
+      bot.lookAtBlock(anchor, LookDuration.UntilMove);
+      equipWizard();
+    }
+    if (bounds.level) {
+      dimension.fillBlocks(new BlockVolume(bounds.level.from, bounds.level.to), ground);
+    }
+    dimension.fillBlocks(new BlockVolume(bounds.clear.from, bounds.clear.to), "minecraft:air");
+    commitTransaction(token);
+    lastBuildTick.set(player.id, system.currentTick);
+    const verb = action.mode === "level" ? "levelled" : "cleared";
+    speak(
+      player,
+      `Done—I ${verb} the exact ${action.width} by ${action.depth} patch from the real ground beneath you. Say “wizard undo” within ten minutes if you want it restored.`,
+    );
+    endBuildAction(
+      token,
+      "completed",
+      `${verb} ${action.width}x${action.depth} terrain from ground y=${anchor.y} through y=${anchor.y + action.height}`,
+    );
+  } catch (error) {
+    rollbackTransaction(token);
+    console.warn(`[MC Wizard] terrain work failed: ${error}`);
+    speak(player, `That ground spell hit a real limit: ${String(error).replace(/^Error:\s*/, "").slice(0, 120)}.`);
+    endBuildAction(token, "failed", `terrain work failed: ${String(error).slice(0, 160)}`);
+  } finally {
+    clearBuild(token);
+  }
+}
+
 function nearbyTorchTargets(player) {
   const dimension = player.dimension;
   const base = {
@@ -6334,6 +6455,8 @@ function applyResponse(playerId, payload, question) {
     void giveItemsAsWizard(player, action.items || [], undefined, action.recipient);
   } else if (action?.type === "run_commands" && action.version === 1) {
     runCommandsForPlayer(player, action.commands || []);
+  } else if (action?.type === "terrain_work" && action.version === 1) {
+    applyTerrainWork(player, action);
   } else if (action?.type === "execute_program" && action.version === 1) {
     void executeCapabilityProgram(player, action.program, {
       allowRequesterTeleport: directTravelRequest(question),
