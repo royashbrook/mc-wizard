@@ -30,6 +30,7 @@ import { bookTitle } from "../bedrock/behavior_packs/mc_wizard/scripts/book.js";
 import { commandLesson } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import {
   isAllowedStructureMaterial,
+  STRUCTURE_CHUNK_LIMIT,
   STRUCTURE_LIMITS,
   STRUCTURE_PRIMITIVE_LIMIT,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/build-structure.js";
@@ -909,20 +910,23 @@ const requestsVillagerAddition = (question) => (
   || /\bsome\s+villagers?\b/i.test(question)
 );
 
+const structureContractDimensions = (plan) => plan?.chunk?.projectDimensions || plan?.dimensions;
+
 function structurePlanSatisfiesRequest(plan, question, { allowRaisedDimensions = false } = {}) {
   if (!plan) return false;
+  const dimensions = structureContractDimensions(plan);
   const requestedDimensions = parseRequestedDimensions(question);
   if (requestedDimensions) {
-    const mismatched = (requestedDimensions.width !== undefined && plan.dimensions?.width !== requestedDimensions.width)
-      || (requestedDimensions.depth !== undefined && plan.dimensions?.depth !== requestedDimensions.depth)
-      || (requestedDimensions.height !== undefined && plan.dimensions?.height !== requestedDimensions.height);
+    const mismatched = (requestedDimensions.width !== undefined && dimensions?.width !== requestedDimensions.width)
+      || (requestedDimensions.depth !== undefined && dimensions?.depth !== requestedDimensions.depth)
+      || (requestedDimensions.height !== undefined && dimensions?.height !== requestedDimensions.height);
     if (mismatched) {
       // #35 review: a procedural silhouette may raise explicit dimensions to
       // its template minimum; the caller opts into tolerating raised-only
       // dimensions and surfaces a caveat. Shrinking stays a hard mismatch.
       const raisedOnly = allowRaisedDimensions
         && ["width", "depth", "height"].every((axis) => (
-          requestedDimensions[axis] === undefined || plan.dimensions?.[axis] >= requestedDimensions[axis]
+          requestedDimensions[axis] === undefined || dimensions?.[axis] >= requestedDimensions[axis]
         ));
       if (!raisedOnly) return false;
     }
@@ -2444,6 +2448,14 @@ function localAnswer(question, hits, action, history = []) {
   }
   if (action?.type === "build_structure") {
     const { width, depth, height } = action.plan.dimensions;
+    if (action.plan.chunk) {
+      const chunk = action.plan.chunk;
+      const full = chunk.projectDimensions;
+      const position = chunk.index === 1 ? "the foundation and lower section"
+        : chunk.index === chunk.count ? "the final upper section"
+          : `section ${chunk.index}`;
+      return `I mapped the full ${full.width} by ${full.depth} by ${full.height} ${action.plan.kind}. I’m building piece ${chunk.index} of ${chunk.count} now: ${position}, exactly ${width} by ${depth} by ${height}, on the same site.`;
+    }
     if (action.plan.mode === "modify") {
       if (requestsRainbowColorCorrection(question)) {
         return `I’ll repaint this same ${action.plan.kind} now with all seven rainbow colors. I’ll keep its size, location, rooms, and inhabitants exactly where they are.`;
@@ -2955,6 +2967,115 @@ function proceduralCityRevisionAction(value, previous, question) {
   }) || undefined;
 }
 
+function structurePrimitiveBoxes(primitive) {
+  if (primitive.shape !== "hollow_box") return [primitive];
+  if (!Array.isArray(primitive.from) || primitive.from.length !== 3
+    || !Array.isArray(primitive.to) || primitive.to.length !== 3) return [primitive];
+  const first = primitive.from.map(Number);
+  const second = primitive.to.map(Number);
+  if ([...first, ...second].some((coordinate) => !Number.isInteger(coordinate))) return [primitive];
+  const [x0, y0, z0] = first.map((coordinate, axis) => Math.min(coordinate, second[axis]));
+  const [x1, y1, z1] = first.map((coordinate, axis) => Math.max(coordinate, second[axis]));
+  if ([x1 - x0, y1 - y0, z1 - z0].some((span) => span < 2)) return [primitive];
+  const box = (from, to) => ({ ...primitive, shape: "box", from, to });
+  return [
+    box([x0, y0, z0], [x1, y0, z1]),
+    box([x0, y1, z0], [x1, y1, z1]),
+    box([x0, y0 + 1, z0], [x0, y1 - 1, z1]),
+    box([x1, y0 + 1, z0], [x1, y1 - 1, z1]),
+    box([x0 + 1, y0 + 1, z0], [x1 - 1, y1 - 1, z0]),
+    box([x0 + 1, y0 + 1, z1], [x1 - 1, y1 - 1, z1]),
+  ];
+}
+
+function compileOversizedStructureAction(value, question = "") {
+  if (value?.type !== "build_structure" || value.version !== 1
+    || !value.plan || value.plan.mode || !Array.isArray(value.plan.primitives)) return value;
+  const requested = parseRequestedDimensions(question);
+  const dimensions = value.plan.dimensions;
+  if (!requested || !dimensions || ["width", "depth", "height"].some((axis) => (
+    !Number.isInteger(Number(dimensions[axis])) || Number(dimensions[axis]) < 1
+  ))) return value;
+  const projectDimensions = Object.fromEntries(["width", "depth", "height"]
+    .map((axis) => [axis, Number(dimensions[axis])]));
+  const explicitlyOversized = ["width", "depth", "height"].some((axis) => (
+    requested[axis] !== undefined
+    && requested[axis] === projectDimensions[axis]
+    && requested[axis] > STRUCTURE_LIMITS[axis]
+  ));
+  if (!explicitlyOversized) return value;
+  const counts = [
+    Math.ceil(projectDimensions.width / STRUCTURE_LIMITS.width),
+    Math.ceil(projectDimensions.height / STRUCTURE_LIMITS.height),
+    Math.ceil(projectDimensions.depth / STRUCTURE_LIMITS.depth),
+  ];
+  const count = counts.reduce((product, size) => product * size, 1);
+  if (count < 2 || count > STRUCTURE_CHUNK_LIMIT) return value;
+  const primitives = value.plan.primitives.flatMap(structurePrimitiveBoxes);
+  if (!primitives.length || primitives.some((primitive) => (
+    !["box", "line"].includes(primitive?.shape)
+    || !Array.isArray(primitive.from) || primitive.from.length !== 3
+    || !Array.isArray(primitive.to) || primitive.to.length !== 3
+    || [...primitive.from, ...primitive.to].some((coordinate) => !Number.isInteger(Number(coordinate)))
+  ))) return value;
+  const chunks = [];
+  for (let y = 0; y < counts[1]; y += 1) {
+    for (let z = 0; z < counts[2]; z += 1) {
+      for (let x = 0; x < counts[0]; x += 1) {
+        const offset = [
+          x * STRUCTURE_LIMITS.width,
+          y * STRUCTURE_LIMITS.height,
+          z * STRUCTURE_LIMITS.depth,
+        ];
+        const size = [
+          Math.min(STRUCTURE_LIMITS.width, projectDimensions.width - offset[0]),
+          Math.min(STRUCTURE_LIMITS.height, projectDimensions.height - offset[1]),
+          Math.min(STRUCTURE_LIMITS.depth, projectDimensions.depth - offset[2]),
+        ];
+        const maximum = offset.map((coordinate, axis) => coordinate + size[axis] - 1);
+        const clipped = primitives.flatMap((primitive) => {
+          const from = primitive.from.map(Number);
+          const to = primitive.to.map(Number);
+          const low = from.map((coordinate, axis) => Math.min(coordinate, to[axis]));
+          const high = from.map((coordinate, axis) => Math.max(coordinate, to[axis]));
+          if (low.some((coordinate, axis) => coordinate > maximum[axis] || high[axis] < offset[axis])) return [];
+          return [{
+            ...primitive,
+            from: low.map((coordinate, axis) => Math.max(coordinate, offset[axis]) - offset[axis]),
+            to: high.map((coordinate, axis) => Math.min(coordinate, maximum[axis]) - offset[axis]),
+          }];
+        });
+        if (!clipped.length || clipped.length > STRUCTURE_PRIMITIVE_LIMIT) return value;
+        const entities = (value.plan.entities || []).flatMap((entity) => {
+          if (!Array.isArray(entity?.location) || entity.location.length !== 3) return [];
+          const location = entity.location.map(Number);
+          return location.every((coordinate, axis) => (
+            Number.isInteger(coordinate) && coordinate >= offset[axis] && coordinate <= maximum[axis]
+          )) ? [{ ...entity, location: location.map((coordinate, axis) => coordinate - offset[axis]) }] : [];
+        });
+        const suffix = ` part ${chunks.length + 1} of ${count}`;
+        const title = String(value.plan.title || value.plan.kind || "Structure");
+        chunks.push({
+          ...value.plan,
+          title: `${title.slice(0, 32 - suffix.length)}${suffix}`,
+          ...(chunks.length ? { mode: "modify" } : { mode: undefined }),
+          dimensions: { width: size[0], height: size[1], depth: size[2] },
+          primitives: clipped,
+          ...(entities.length ? { entities } : { entities: undefined }),
+          chunk: {
+            index: chunks.length + 1,
+            count,
+            offset,
+            projectDimensions,
+          },
+        });
+      }
+    }
+  }
+  const [plan, ...plans] = chunks;
+  return { type: "build_structure", version: 1, plan, continuation: { plans } };
+}
+
 function normalizeProviderAction(value, question = "") {
   if (!value || typeof value !== "object" || Array.isArray(value)) return value;
   if (value.type === "execute_program" && Array.isArray(value.program?.steps)) {
@@ -3149,7 +3270,10 @@ function plannerActionLabel(action) {
 function wizardEnvelope(text, question = "") {
   const value = responseEnvelope(text);
   if (!value) return undefined;
-  const rawAction = normalizeProviderAction(serializedJson(value.actionJson ?? value.action), question);
+  const rawAction = compileOversizedStructureAction(
+    normalizeProviderAction(serializedJson(value.actionJson ?? value.action), question),
+    question,
+  );
   const rawGoal = normalizeProviderGoal(serializedJson(value.goalJson ?? value.goal));
   const action = allowedWizardAction(rawAction);
   return {
@@ -3322,7 +3446,7 @@ function actionCompletesBuildRequest(action, question, history = []) {
   const requested = parseRequestedDimensions(question);
   let clampedDimensions = false;
   if (requested) {
-    const dimensions = action.plan.dimensions;
+    const dimensions = structureContractDimensions(action.plan);
     const exact = (requested.width === undefined || dimensions.width === requested.width)
       && (requested.depth === undefined || dimensions.depth === requested.depth)
       && (requested.height === undefined || dimensions.height === requested.height);
@@ -3339,6 +3463,12 @@ function actionCompletesBuildRequest(action, question, history = []) {
       if (!clampedUp) return false;
       clampedDimensions = true;
     }
+  }
+  if (action.plan.chunk) {
+    return {
+      complete: false,
+      warning: `the full build is split into ${action.plan.chunk.count} bounded pieces and this is piece ${action.plan.chunk.index}`,
+    };
   }
   if (!ordinaryGeneratedKind && !authoredSubjectGeometry(action.plan)) {
     // #35 tri-state: every hard requirement (subject, size, material, features,
@@ -4964,7 +5094,8 @@ export function createWizard({
       if (terminalRecovery) outcome = { ...outcome, updated: true, recovered: true };
       const history = sessions.get(sessionPlayer, "wizard");
       const actionTurn = history.findLast((turn) => turn.requestId === requestId);
-      if (!allowedWizardAction(actionTurn?.action)) return remember(outcome);
+      const completedAction = allowedWizardAction(actionTurn?.action);
+      if (!completedAction) return remember(outcome);
       const goalId = actionTurn.goalId || actionTurn.requestId;
       const existingCompletion = terminalRecovery && status === "completed" && history.find((turn) => (
         !turn.action && turn.goalId === goalId
@@ -5024,6 +5155,51 @@ export function createWizard({
           && EXECUTOR_VERIFIED_ACTION_TYPES.has(actionTurn.action.type);
         const completedActions = history.filter((turn) => ["completed", "partial"].includes(turn.status)
           && (turn.goalId || turn.requestId) === goalId).length;
+        const continuationPlans = !partialCompletion && completedAction.type === "build_structure"
+          ? completedAction.continuation?.plans || [] : [];
+        if (continuationPlans.length && completedActions < MAX_AUTOMATIC_GOAL_ACTIONS) {
+          const [plan, ...plans] = continuationPlans;
+          const nextAction = allowedWizardAction({
+            type: "build_structure",
+            version: 1,
+            plan,
+            ...(plans.length ? { continuation: { plans } } : {}),
+          });
+          if (nextAction) {
+            const nextRequestId = randomUUID();
+            const contract = originalGoalContract(history, goalId, actionTurn);
+            const nextQuestion = contract?.question || actionTurn.question;
+            const answer = localAnswer(nextQuestion, [], nextAction, history);
+            const replan = {
+              answer,
+              action: nextAction,
+              goal,
+              sources: [],
+              mode: "local-build-continuation",
+              kind: "wizard",
+              label: provider.label,
+              requestId: nextRequestId,
+              goalId,
+            };
+            const continuationTurn = {
+              question: nextQuestion,
+              answer,
+              action: nextAction,
+              goal,
+              goalId,
+              requestId: nextRequestId,
+              retryOfRequestId: requestId,
+              status: "pending",
+              responseMode: "local-build-continuation",
+            };
+            if (typeof sessions.append === "function") {
+              await sessions.append(sessionPlayer, "wizard", continuationTurn);
+            } else {
+              await sessions.set(sessionPlayer, "wizard", [...history, continuationTurn]);
+            }
+            return remember({ ...outcome, replan });
+          }
+        }
         if (!executorVerified && completedActions >= MAX_AUTOMATIC_GOAL_ACTIONS) {
           return remember({ ...outcome, reviewLimitReached: true });
         }
@@ -5795,7 +5971,9 @@ export function createWizard({
         // #35: in-character caveat for accept-with-warning plans. A clamped
         // size gets an honest "a bit bigger" note; rough geometry keeps the
         // sculpting caveat. The goal stays active either way.
-        state.answer = /\b(?:size|raised|minimum)\b/i.test(state.contractCaveat)
+        state.answer = /\b(?:bounded pieces|piece \d+)\b/i.test(state.contractCaveat)
+          ? `${state.answer} I’ll move straight to the next piece after this one verifies.`
+          : /\b(?:size|raised|minimum)\b/i.test(state.contractCaveat)
           ? `${state.answer} I’m making it a little bigger than the exact size you asked so the shape still looks right—tell me if you want it changed.`
           : `${state.answer} The first pass may look a little rough—tell me what seems off and I’ll keep sculpting it with you.`;
       }

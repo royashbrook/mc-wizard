@@ -8,6 +8,7 @@ import {
   primitiveStructureOperations,
   validateBuildStructurePlan,
 } from "../bedrock/behavior_packs/mc_wizard/scripts/build-structure.js";
+import { createMemorySessionStore } from "../src/sessions.mjs";
 import { classifyAction, createWizard } from "../src/wizard.mjs";
 
 const customPlan = {
@@ -422,6 +423,88 @@ test("rejects an oversized provider plan outright and falls back safely", async 
   // no gate complains about missing primitives.
   assert.match(result.telemetry.rejections[0].reason, /width must be an integer from 1-128/);
   assert.ok(result.telemetry.rejections.every((entry) => !/no authored primitives/i.test(entry.reason)));
+});
+
+// #46: the 64-block height limit bounds one undoable action, not the whole
+// thing a child may request. An explicitly requested 100-block tower is split
+// before allowedWizardAction validates it, then the existing action-result
+// loop dispatches the next bounded piece without another model call.
+test("chunks an explicitly requested 100-block authored tower and continues it locally", async () => {
+  const sessions = createMemorySessionStore();
+  const tower = {
+    title: "Wizard Moon Tower",
+    kind: "tower",
+    dimensions: { width: 9, depth: 9, height: 100 },
+    materials: {
+      primary: "minecraft:purple_concrete",
+      accent: "minecraft:light_blue_concrete",
+      roof: "minecraft:polished_blackstone_bricks",
+    },
+    features: ["floor", "walls", "roof", "lighting", "decorations"],
+    phases: ["foundation", "shell", "roof", "details"],
+    primitives: [
+      { shape: "box", phase: "foundation", blockId: "minecraft:polished_blackstone_bricks", from: [0, 0, 0], to: [8, 0, 8] },
+      { shape: "hollow_box", phase: "shell", blockId: "minecraft:purple_concrete", from: [0, 0, 0], to: [8, 95, 8] },
+      { shape: "box", phase: "roof", blockId: "minecraft:polished_blackstone_bricks", from: [0, 96, 0], to: [8, 99, 8] },
+      { shape: "line", phase: "details", blockId: "minecraft:glowstone", from: [4, 0, 4], to: [4, 99, 4] },
+    ],
+  };
+  let providerCalls = 0;
+  const wizard = createWizard({
+    corpus: { search: () => [] },
+    sessions,
+    env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "model", AI_STYLE: "chat" },
+    fetchImpl: async () => {
+      providerCalls += 1;
+      return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
+        answer: "I mapped the full wizard tower and I am starting now.",
+        action: { type: "build_structure", version: 1, plan: tower },
+        goal: {
+          objective: "Build a 100-block wizard tower",
+          successCriteria: "A wizardy tower stands 100 blocks tall",
+          status: "active",
+        },
+      }) } }] }), { status: 200 });
+    },
+  });
+
+  const first = await wizard.ask({
+    player: "TowerKid",
+    question: "Build a wizard tower 100 blocks tall at least. Make sure it is wizardy.",
+  });
+  assert.equal(providerCalls, 1);
+  assert.equal(first.mode, "chat:model");
+  assert.deepEqual(first.action.plan.chunk, {
+    index: 1,
+    count: 2,
+    offset: [0, 0, 0],
+    projectDimensions: { width: 9, depth: 9, height: 100 },
+  });
+  assert.match(first.action.plan.title, /part 1 of 2$/);
+  assert.ok(first.action.plan.dimensions.height <= 64);
+  assert.equal(first.action.continuation.plans.length, 1);
+  assert.deepEqual(first.action.continuation.plans[0].chunk, {
+    index: 2,
+    count: 2,
+    offset: [0, 64, 0],
+    projectDimensions: { width: 9, depth: 9, height: 100 },
+  });
+  assert.match(first.action.continuation.plans[0].title, /part 2 of 2$/);
+  assert.doesNotThrow(() => validateBuildStructurePlan(first.action.plan));
+  assert.doesNotThrow(() => validateBuildStructurePlan(first.action.continuation.plans[0]));
+  assert.match(first.answer, /100 blocks|piece 1 of 2/i);
+
+  const continued = await wizard.recordActionResult({
+    player: "TowerKid",
+    requestId: first.requestId,
+    status: "completed",
+    detail: "first bounded piece verified",
+  });
+  assert.equal(providerCalls, 1, "the bounded continuation should not consult the model again");
+  assert.equal(continued.replan.action.plan.chunk.index, 2);
+  assert.equal(continued.replan.action.plan.mode, "modify");
+  assert.equal(continued.replan.goalId, first.goalId);
+  assert.match(continued.replan.answer, /piece 2 of 2|top.*tower/i);
 });
 
 // #35: a generic full-envelope room named as the subject is accepted with a

@@ -2,7 +2,7 @@
 
 Written 2026-07-27 for an incoming assistant picking this up mid-flight.
 
-Repo: `royashbrook/mc-wizard` (PRIVATE). Branch `main` at `2288e5f`. Suite: **788 tests, 788 passing**, runs fully offline with no container and no network. Working tree clean.
+Repo: `royashbrook/mc-wizard` (PUBLIC). Branch `main`; use `git log` for the current revision. The full suite runs offline with no container and no network.
 
 ---
 
@@ -29,6 +29,13 @@ child chat in Bedrock
 
 The measurable symptom that started this work: quality was bimodal. Preprogrammed capabilities graded 5/5, anything unprogrammed graded 1/5.
 
+Capability policy clarified by the owner on 2026-07-27: Wiz may use every normal
+Minecraft, operator, Script API, and server-console capability. Safety policy is
+content-based (kid-appropriate), not a categorical ban on TNT, command blocks,
+spawners, barriers, teleportation, or administration. Per-action execution
+bounds, rollback, request fidelity, and narrowly chosen consent checks still
+belong in the action contract. Issue #47 tracks the remaining old-policy bans.
+
 ---
 
 ## 2. THE most important thing to understand
@@ -54,7 +61,7 @@ So when you see a bad result, the first question is **not** "how do we make the 
 
 There is telemetry for exactly this. Every rejection records a gate name and reason.
 
-**Corollary the owner articulated and I agree with:** limits like 128x128x64 bound ONE undoable placement. They are execution and rollback constraints. They are NOT statements about what a child may ask for. We have been leaking execution limits up into the planning layer, which forces the model to either refuse or produce something we then reject. This is the root cause of issue #46 and is the single most valuable thing left to fix.
+**Corollary the owner articulated and I agree with:** limits like 128x128x64 bound ONE undoable placement. They are execution and rollback constraints. They are NOT statements about what a child may ask for. We were leaking execution limits up into the planning layer, which forced the model to either refuse or produce something we then rejected. That was the root cause of issue #46.
 
 ---
 
@@ -87,20 +94,26 @@ The last rung is a bound offer naming ONE concrete step, phrased so a following 
 
 ---
 
-## 4. Safety boundaries that must NOT be weakened
+## 4. Execution boundaries that must NOT be weakened
 
 These are enumerated with file and line in the survey artifact (see section 8). The short list:
 
 - `allowedWizardAction` (`src/skills.mjs`) is the single action allowlist.
-- `command_block`, `structure_block`, `mob_spawner`, `barrier`, `tnt` are always rejected by name.
-- The research restriction banning `world.command` / `server.*` in research-derived plans, including its verbatim message.
+- The old hard bans on `command_block`, `structure_block`, `mob_spawner`,
+  `barrier`, `tnt`, and command-backed researched plans contradict the current
+  content-only policy. Remove them consistently under issue #47; do not mistake
+  tests that encode the old policy for current product requirements.
 - Subject fidelity: a request for a dragon must never become a house.
 - `unsafeCommandAnswer`: model prose never leaks slash commands to a child.
 - Privacy: player names are HMAC pseudonymized, telemetry is stripped from client responses and kept only in the local interaction log.
 - Teleport consent and the opted-out-player guard in the pack.
 - Per-action geometry caps. **`test/arbitrary-structure.test.mjs` "rejects an oversized provider plan outright" exists specifically to catch a softened bounds check.** I tried to soften it and backed out. Do not weaken it; chunk before the validator instead.
 
-A useful distinction learned the hard way: widening DETECTION (recognizing more of what a child means) is good and safe. Widening AUTHORITY (what the system is permitted to do) is not. Every detector added routes through the same validated builder for exactly this reason.
+A useful distinction learned the hard way: capability authority is intentionally
+broad, while every concrete action still needs bounded arguments, observable
+success, rollback where applicable, and fidelity to what the child requested.
+Content appropriateness is judged from the request/result, not from a hardcoded
+list of Minecraft blocks or commands.
 
 ---
 
@@ -127,7 +140,19 @@ Verified live on the running server after each: enchanted netherite set delivers
 
 ## 6. Open issues, most valuable first
 
-- **#46 chunk oversized builds instead of shrinking or refusing.** The big one, and the owner's own diagnosis. A 100-block tower should be planned in full, split into buildable chunks, and worked in order. The goal loop already supports continuation (6 automatic actions, goal lineage preserved). The terrain rung already does exactly this pattern for a 100x100 sweep ("say the word and I will do the next piece"). Structures never learned it. **Chunk BEFORE the validator so each chunk is legitimately in bounds and the safety test stays untouched.**
+- **#46 chunk oversized builds instead of shrinking or refusing.** Implemented
+  locally on 2026-07-27: an explicitly requested authored structure is compiled
+  before validation into up to six bounded actions, each continuation reuses one
+  root project anchor, and the existing action-result loop dispatches the next
+  piece without another model call. The exact 100-block wizard-tower live probe
+  produced 64-block and 36-block pieces on one goal. Close the issue only after
+  the implementation commit is published.
+- **#47 replace gameplay capability bans with kid-appropriate content policy.**
+  The code still contains old categorical bans that the owner explicitly
+  rejected. Migrate every validator and research gate consistently.
+- **#48 add a staged-content privacy guard for the public repository.** Keep
+  runtime identity, logs, world data, and secrets out of publication; run the
+  same dependency-free check locally and in CI.
 - **#43 no terrain capability.** Partly addressed by the terrain rung, but there is still no typed, undoable `clear_area` / `level_ground` action. Currently done with `run_commands` fill-with-air.
 - **#40 material-bearing novel builds.** "giant mushroom house" degrades to a plain house when the planner's geometry does not use the named material. Same discard-instead-of-repair pattern.
 - **#45 `run_commands` and `potion_rain` still take catalogue defaults when malformed.** A malformed action silently becomes the catalogue EXAMPLE action instead of being rejected. I fixed the `give_items` case. The principled fix (catalogue resolves id-keyed skills only) turned 10 tests red because the effect route depends on borrowing `run_commands` defaults, so it needs the effect route to build its own payload first.

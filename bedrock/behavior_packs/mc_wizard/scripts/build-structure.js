@@ -6,6 +6,8 @@ export const STRUCTURE_PRIMITIVE_LIMIT = 96;
 
 export const STRUCTURE_ENTITY_LIMIT = 8;
 
+export const STRUCTURE_CHUNK_LIMIT = 6;
+
 const MATERIALS = new Set([
   "minecraft:cobblestone",
   "minecraft:stone",
@@ -152,6 +154,41 @@ function clampedDimension(value, name, notes) {
     return STRUCTURE_LIMITS[name];
   }
   return number;
+}
+
+function validateStructureChunk(value, dimensions, mode) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new Error("chunk must be an object");
+  }
+  const index = Number(value.index);
+  const count = Number(value.count);
+  if (!Number.isInteger(index) || !Number.isInteger(count)
+    || index < 1 || count < 2 || count > STRUCTURE_CHUNK_LIMIT || index > count) {
+    throw new Error(`chunk index/count must describe 2-${STRUCTURE_CHUNK_LIMIT} ordered pieces`);
+  }
+  if ((index === 1 && mode !== undefined) || (index > 1 && mode !== "modify")) {
+    throw new Error("only the first structure chunk may start a new build");
+  }
+  const offset = Array.isArray(value.offset) && value.offset.length === 3
+    ? value.offset.map(Number) : [];
+  if (offset.length !== 3 || offset.some((coordinate) => (
+    !Number.isInteger(coordinate) || coordinate < 0 || coordinate > 30_000_000
+  ))) {
+    throw new Error("chunk offset must be a non-negative x,y,z vector");
+  }
+  const projectDimensions = Object.fromEntries(["width", "depth", "height"].map((name) => {
+    const number = Number(value.projectDimensions?.[name]);
+    if (!Number.isSafeInteger(number) || number < 1 || number > 30_000_000) {
+      throw new Error(`chunk projectDimensions.${name} must be a positive bounded integer`);
+    }
+    return [name, number];
+  }));
+  const local = [dimensions.width, dimensions.height, dimensions.depth];
+  const project = [projectDimensions.width, projectDimensions.height, projectDimensions.depth];
+  if (offset.some((coordinate, axis) => coordinate + local[axis] > project[axis])) {
+    throw new Error("chunk bounds must fit inside projectDimensions");
+  }
+  return { index, count, offset, projectDimensions };
 }
 
 function vector(value, name, dimensions, horizontalMargin = 0) {
@@ -538,6 +575,7 @@ export function validateBuildStructurePlan(value) {
     offset = salvaged.offset;
   }
   if (value.entities !== undefined) plan.entities = validateEntities(value.entities, plan.dimensions, offset);
+  if (value.chunk !== undefined) plan.chunk = validateStructureChunk(value.chunk, plan.dimensions, mode);
   // City-quality geometry is advisory after #35: shortfalls become warnings.
   try {
     validateCityGeometry(plan);

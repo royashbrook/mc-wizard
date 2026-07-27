@@ -561,6 +561,7 @@ function validStructureVector(value, vertical = false) {
 function validatedStoredStructure(stored) {
   if (!stored || typeof stored.dimensionId !== "string"
     || !validStructureVector(stored.origin, true)
+    || (stored.projectOrigin !== undefined && !validStructureVector(stored.projectOrigin, true))
     || !validStructureVector(stored.forward)
     || !validStructureVector(stored.right)) return undefined;
   return { ...stored, plan: validateBuildStructurePlan(stored.plan) };
@@ -857,6 +858,7 @@ function rememberLastStructure(player, record) {
   const saved = {
     dimensionId: record.dimensionId,
     origin: { ...record.origin },
+    ...(record.projectOrigin ? { projectOrigin: { ...record.projectOrigin } } : {}),
     forward: { ...record.forward },
     right: { ...record.right },
     plan: record.plan,
@@ -3062,7 +3064,8 @@ function structureOrigin(player, plan, forward, right, distance = 7, lateral = 0
     y: standingBlockY(player.location),
     z: Math.floor(player.location.z),
   };
-  return offset(base, forward, right, distance, lateral - Math.floor((plan.dimensions.width - 1) / 2));
+  const projectWidth = plan.chunk?.projectDimensions.width || plan.dimensions.width;
+  return offset(base, forward, right, distance, lateral - Math.floor((projectWidth - 1) / 2));
 }
 
 function structureSiteIsClear(player, plan, origin, forward, right) {
@@ -3093,11 +3096,21 @@ function findStructureSite(player, plan, forward, right) {
 function findModificationSite(player, plan) {
   const previous = structureFor(player, plan.kind);
   if (!previous || previous.dimensionId !== player.dimension.id) return undefined;
-  const oldDimensions = previous.plan.dimensions;
-  const shiftX = Math.round((oldDimensions.width - plan.dimensions.width) / 2);
-  const shiftZ = Math.round((oldDimensions.depth - plan.dimensions.depth) / 2);
+  const oldDimensions = previous.plan.chunk?.projectDimensions || previous.plan.dimensions;
+  const nextDimensions = plan.chunk?.projectDimensions || plan.dimensions;
+  const shiftX = Math.round((oldDimensions.width - nextDimensions.width) / 2);
+  const shiftZ = Math.round((oldDimensions.depth - nextDimensions.depth) / 2);
+  const projectOrigin = customLocation(
+    previous.projectOrigin || previous.origin,
+    previous.forward,
+    previous.right,
+    [shiftX, 0, shiftZ],
+  );
   return {
-    origin: customLocation(previous.origin, previous.forward, previous.right, [shiftX, 0, shiftZ]),
+    origin: plan.chunk
+      ? customLocation(projectOrigin, previous.forward, previous.right, plan.chunk.offset)
+      : projectOrigin,
+    projectOrigin,
     forward: previous.forward,
     right: previous.right,
     clear: false,
@@ -3158,6 +3171,23 @@ async function prepareStructureArea(player, plan, origin, forward, right, clear,
     } catch {}
   }, 12_000);
   await system.waitTicks(5);
+  if (plan.chunk?.index > 1) {
+    // A continuation owns only this bounded slice. Clear that slice at the
+    // shared project offset. Horizontal ground-level slices get normal support;
+    // upper slices never get a floating "ground", and no continuation runs
+    // ordinary expansion cleanup against an earlier slice.
+    if (plan.chunk.offset[1] === 0) {
+      const ground = worldStructureBox(origin, forward, right, structureBox(
+        "preparation",
+        plan.materials.primary,
+        [0, -1, 0],
+        [width - 1, -1, depth - 1],
+      ));
+      for (const slice of splitWorldFill(ground)) runRawFill(dimension, slice);
+    }
+    for (const slice of splitWorldFill(worldBox)) runRawFill(dimension, slice);
+    return;
+  }
   if (previousPlan) {
     const ground = worldStructureBox(origin, forward, right, structureBox(
       "preparation",
@@ -3586,12 +3616,13 @@ async function buildStructure(player, value) {
   let operations;
   let previousOperations = [];
   let cleanupOperations = [];
+  const chunkContinuation = Boolean(plan.chunk?.index > 1);
   try {
     operations = structurePlanOperations(plan, modificationSite?.previous?.plan);
-    previousOperations = modifying
+    previousOperations = modifying && !chunkContinuation
       ? structurePlanOperations(modificationSite.previous.plan, undefined, { reconstructing: true })
       : [];
-    cleanupOperations = modifying
+    cleanupOperations = modifying && !chunkContinuation
       ? obsoleteExpansionOperations(modificationSite.previous.plan, plan, previousOperations)
       : [];
   } catch (error) {
@@ -3601,7 +3632,9 @@ async function buildStructure(player, value) {
     failPendingAction(player, `structure plan validation failed: ${String(error?.message || error).slice(0, 1600)}`);
     return;
   }
-  speak(player, modifying
+  speak(player, plan.chunk
+    ? `I’m building piece ${plan.chunk.index} of ${plan.chunk.count} for the same ${plan.chunk.projectDimensions.height}-block-tall ${plan.kind}.`
+    : modifying
     ? `I found your last ${plan.kind}. I’m improving it in place—same center and direction, with the requested rooms, floors, details, and inhabitants.`
     : `I mapped “${plan.title}” at exactly ${plan.dimensions.width} by ${plan.dimensions.depth} by ${plan.dimensions.height}. I’m building the whole thing here in four visible phases.`);
   // Reserve the single Wizard body before yielding to workshop preparation.
@@ -3613,6 +3646,7 @@ async function buildStructure(player, value) {
   const structureRecord = {
     dimensionId: player.dimension.id,
     origin: site.origin,
+    projectOrigin: modificationSite?.projectOrigin || site.origin,
     forward,
     right,
     plan,
@@ -3649,7 +3683,7 @@ async function buildStructure(player, value) {
     forward,
     right,
     structureRecord.inhabitantTag,
-    modifying ? modificationSite.previous.plan.entities || [] : [],
+    modifying && !chunkContinuation ? modificationSite.previous.plan.entities || [] : [],
   );
   const physical = cleanupOperations.length
     || (modifying && operations.some(({ blockId }) => blockId === "minecraft:air"))

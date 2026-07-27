@@ -1,5 +1,9 @@
 import { buildPlanSchemaPrompt, validateBuildPlan } from "../bedrock/behavior_packs/mc_wizard/scripts/build-plan.js";
-import { buildStructureSchemaPrompt, validateBuildStructurePlan } from "../bedrock/behavior_packs/mc_wizard/scripts/build-structure.js";
+import {
+  STRUCTURE_CHUNK_LIMIT,
+  buildStructureSchemaPrompt,
+  validateBuildStructurePlan,
+} from "../bedrock/behavior_packs/mc_wizard/scripts/build-structure.js";
 import { machinePlanSchemaPrompt, validateMachinePlan } from "../bedrock/behavior_packs/mc_wizard/scripts/machine-plan.js";
 import { COMMAND_LESSONS, commandLessonPrompt } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import { recipeItemIds } from "../bedrock/behavior_packs/mc_wizard/scripts/recipe-display.js";
@@ -274,7 +278,32 @@ export function allowedWizardAction(value) {
   }
   if (value?.type === "build_structure" && value.version === 1) {
     try {
-      return { type: "build_structure", version: 1, plan: validateBuildStructurePlan(value.plan) };
+      const plan = validateBuildStructurePlan(value.plan);
+      if (value.continuation === undefined) {
+        return { type: "build_structure", version: 1, plan };
+      }
+      if (!plan.chunk || !value.continuation || typeof value.continuation !== "object"
+        || Array.isArray(value.continuation)
+        || Object.keys(value.continuation).some((key) => key !== "plans")
+        || !Array.isArray(value.continuation.plans)
+        || value.continuation.plans.length < 1
+        || value.continuation.plans.length > STRUCTURE_CHUNK_LIMIT - 1
+        || value.continuation.plans.length !== plan.chunk.count - plan.chunk.index) return null;
+      const plans = value.continuation.plans.map((entry) => validateBuildStructurePlan(entry));
+      const project = JSON.stringify(plan.chunk.projectDimensions);
+      if (plans.some((entry, position) => (
+        !entry.chunk
+        || entry.kind !== plan.kind
+        || entry.chunk.index !== plan.chunk.index + position + 1
+        || entry.chunk.count !== plan.chunk.count
+        || JSON.stringify(entry.chunk.projectDimensions) !== project
+      ))) return null;
+      return {
+        type: "build_structure",
+        version: 1,
+        plan,
+        continuation: { plans },
+      };
     } catch {
       return null;
     }

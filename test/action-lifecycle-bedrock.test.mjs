@@ -59,6 +59,32 @@ test("named structure refinements reuse the matching completed structure, not me
   );
 });
 
+test("oversized structure pieces share one root anchor and clear only their own slice", () => {
+  const finder = packScript.slice(
+    packScript.indexOf("function findModificationSite"),
+    packScript.indexOf("function runRawFill"),
+  );
+  assert.match(finder, /previous\.projectOrigin \|\| previous\.origin/);
+  assert.match(finder, /plan\.chunk[\s\S]*plan\.chunk\.offset/);
+
+  const preparation = packScript.slice(
+    packScript.indexOf("async function prepareStructureArea"),
+    packScript.indexOf("function phaseMessage"),
+  );
+  assert.match(preparation, /if \(plan\.chunk\?\.index > 1\)/);
+  assert.ok(
+    preparation.indexOf("if (plan.chunk?.index > 1)")
+      < preparation.indexOf("if (previousPlan)"),
+  );
+
+  const build = packScript.slice(
+    packScript.indexOf("async function buildStructure"),
+    packScript.indexOf("function findBlueprintSite"),
+  );
+  assert.match(build, /projectOrigin: modificationSite\?\.projectOrigin \|\| site\.origin/);
+  assert.match(build, /modifying && !chunkContinuation/);
+});
+
 test("project persistence keys resist known FNV collisions and migrate legacy records", () => {
   const first = "collisionkid\u0000green house annex sky village";
   const second = "collisionkid\u0000crystal monument park cedar statue";
