@@ -26,6 +26,10 @@ import {
   safeCommandRefusal,
   unsafeCommandAnswer,
 } from "./command-safety.mjs";
+import {
+  isKidAppropriateText,
+  kidSafeRefusal,
+} from "./content-policy.mjs";
 import { bookTitle } from "../bedrock/behavior_packs/mc_wizard/scripts/book.js";
 import { commandLesson } from "../bedrock/behavior_packs/mc_wizard/scripts/command-lessons.js";
 import {
@@ -51,6 +55,7 @@ Never relay a slash command unless the player explicitly asks to learn or see th
 If a build demo is requested, explain what the safe in-game adapter is about to place; do not claim it is already built.
 Any answer saying you will build, place, start, or demonstrate something MUST include a valid non-null action. Preserve explicit dimensions exactly. A foundation, facade, pad, miniature, or first section does not fulfill a request for a complete structure. Use build_complete_structure for whole structures of any supported size; its phased executor can use fills for large surfaces and player placement for details. For an unusual shape such as a creature, statue, treehouse, vehicle, or pixel-art object, author bounded primitives that visibly match the request and span the requested size with the subject itself; never substitute the ordinary generic building generator or use a large pad to fake the bounds.
 Keep destructive commands in a disposable test world. Require an adult only before teaching irreversible changes to a shared world or actions targeting another player.
+You may use every validated Bedrock gameplay mechanism, including commands, operator powers, TNT, command blocks, structure blocks, barriers, spawners, teleportation, server settings, and Script API capabilities. Never reject a Minecraft request merely because it needs privileged mechanics. Refuse only content that is not kid-appropriate.
 Prefer one small experiment the player can try. For ordinary questions, use two or three complete sentences and stay under 500 characters unless the player asks for a lesson. Avoid markdown tables.
 
 You have these in-world skills:
@@ -583,6 +588,8 @@ function structureKind(question, history = []) {
 
 function requestedMaterialBlock(question) {
   const target = question.match(/\b(?:out\s+of|made\s+of|with|using|to)\s+([^,.!?]{1,48})/i)?.[1] || question;
+  const explicitId = target.match(/\bminecraft:([a-z0-9_]+)\b/)?.[0];
+  if (explicitId && isAllowedStructureMaterial(explicitId)) return explicitId;
   const concrete = target.match(/\b(black|blue|brown|cyan|gray|green|light blue|light gray|lime|magenta|orange|pink|purple|red|white|yellow)?\s*concrete\b/i)?.[1]
     ?.toLowerCase().replace(/\s+/g, "_") || (/\bconcrete\b/i.test(target)
       && !/\bconcrete\s+(?:action|answer|detail|example|idea|plan|step)\b/i.test(target) ? "white" : undefined);
@@ -590,6 +597,12 @@ function requestedMaterialBlock(question) {
   const requests = [
     ["minecraft:red_mushroom_block", /\b(?:red\s+)?mushroom(?:\s+blocks?)?\b/i],
     ["minecraft:brown_mushroom_block", /\bbrown\s+mushroom(?:\s+blocks?)?\b/i],
+    ["minecraft:amethyst_block", /\bamethyst(?:\s+blocks?)?\b/i],
+    ["minecraft:honey_block", /\bhoney(?:\s+blocks?)?\b/i],
+    ["minecraft:slime_block", /\bslime(?:\s+blocks?)?\b/i],
+    ["minecraft:magma", /\bmagma(?:\s+blocks?)?\b/i],
+    ["minecraft:calcite", /\bcalcite\b/i],
+    ["minecraft:mud", /\bmud(?:\s+blocks?)?\b/i],
     ["minecraft:polished_blackstone_bricks", /\b(?:polished\s+)?blackstone(?:\s+bricks?)?\b/i],
     ["minecraft:dark_prismarine", /\bdark\s+prismarine\b/i],
     ["minecraft:prismarine_bricks", /\bprismarine(?:\s+bricks?)?\b/i],
@@ -614,6 +627,40 @@ function requestedMaterialBlock(question) {
     ["minecraft:emerald_block", /\bemerald\b/i],
   ];
   return requests.find(([, pattern]) => pattern.test(target))?.[0];
+}
+
+function applyRequestedMaterialAction(action, question) {
+  const requested = requestedMaterialBlock(question);
+  if (!requested || action?.type !== "build_structure" || !action.plan) return action;
+  const roofOnly = /\broof\b/i.test(question);
+  const role = roofOnly ? "roof" : "primary";
+  const original = action.plan.materials?.[role];
+  const relevantPhases = roofOnly ? new Set(["roof"]) : new Set(["foundation", "shell"]);
+  let replaced = false;
+  const primitives = Array.isArray(action.plan.primitives)
+    ? action.plan.primitives.map((primitive) => {
+      if (primitive.blockId === "minecraft:air" || !relevantPhases.has(primitive.phase)) return primitive;
+      if (primitive.blockId === original) {
+        replaced = true;
+        return { ...primitive, blockId: requested };
+      }
+      return primitive;
+    })
+    : undefined;
+  if (primitives && !replaced) {
+    const index = primitives.findIndex((primitive) => (
+      primitive.blockId !== "minecraft:air" && relevantPhases.has(primitive.phase)
+    ));
+    if (index >= 0) primitives[index] = { ...primitives[index], blockId: requested };
+  }
+  return allowedWizardAction({
+    ...action,
+    plan: {
+      ...action.plan,
+      materials: { ...action.plan.materials, [role]: requested },
+      ...(primitives && { primitives }),
+    },
+  });
 }
 
 function materialPalette(question, kind) {
@@ -1931,7 +1978,18 @@ export function instantConversationAnswer(question) {
 function normalizeActionRequest(question) {
   return String(question)
     .replace(/\btakeme\b/gi, "take me")
-    .replace(/\bnetherportal\b/gi, "nether portal");
+    .replace(/\bnetherportal\b/gi, "nether portal")
+    // High-frequency child spellings belong at the input boundary so every
+    // deterministic capability sees the same corrected request.
+    .replace(/\b(?:telport|teleprot|telepot)\b/gi, "teleport")
+    .replace(/\b(?:giv|gve)\b/gi, "give")
+    .replace(/\b(?:dimond|dimonds)\b/gi, (word) => (
+      word.toLowerCase().endsWith("s") ? "diamonds" : "diamond"
+    ))
+    .replace(/\b(?:nite|night)\s*vison\b/gi, "night vision")
+    .replace(/\bcasle\b/gi, "castle")
+    .replace(/\bbloks\b/gi, "blocks")
+    .replace(/\b(?:pls|plz)\b/gi, "please");
 }
 
 function primaryBuildSubject(question) {
@@ -2349,16 +2407,12 @@ function localAnswer(question, hits, action, history = []) {
     const changes = [action.time && `make it ${action.time}`, action.weather && weather].filter(Boolean).join(" and ");
     return `One flick of the wand—I’ll ${changes} now.`;
   }
-  if (action?.type === "run_commands") {
-    // #44: terrain work gets its own honest line — the size, the depth, and any
-    // clamp the planner had to apply. The generic line below said nothing about
-    // what was about to happen to the ground a child is standing on.
+  if (action?.type === "terrain_work") {
     const terrain = terrainIntent(question);
-    if (terrain) {
-      const verb = terrain.mode === "level" ? "level" : "clear";
-      const opening = `Stand back—I’m about to ${verb} a ${terrain.width} by ${terrain.depth} patch around you, ${terrain.height} blocks up from your feet, so you get open ground to build on.`;
-      return terrain.caveat ? `${opening} ${terrain.caveat}` : opening;
-    }
+    const verb = terrain?.mode === "level" ? "level" : "clear";
+    return `Stand back—I’m about to ${verb} the exact ${action.width} by ${action.depth} patch from the real ground beneath you, ${action.height} blocks upward. I’ll save the old terrain so you can undo it.`;
+  }
+  if (action?.type === "run_commands") {
     // #44: an effect grant says which effect, and — where the wand cannot do
     // literally what was asked ("make me fly") — says what it is casting
     // instead. The generic line below never told the child either.
@@ -3842,13 +3896,13 @@ function providerActionMatchesRequest(action, question, history = [], {
 const MAX_AUTOMATIC_GOAL_ACTIONS = 6;
 const EXECUTOR_VERIFIED_ACTION_TYPES = new Set([
   "dimension_travel", "local_travel", "give_items", "place_area_torches",
-  "potion_rain", "run_commands", "world_control",
+  "potion_rain", "run_commands", "terrain_work", "world_control",
 ]);
 const GOAL_REVIEW_FEEDBACK = "Fix this same active build so every success criterion is observable in the world.";
 const RETRYABLE_ACTION_TYPES = new Set([
   "place_blueprint", "build_machine", "build_structure", "build_plan",
   "dimension_travel", "local_travel", "world_control", "potion_rain", "give_items",
-  "run_commands", "place_area_torches", "show_recipe", "command_lesson", "execute_program",
+  "run_commands", "terrain_work", "place_area_torches", "show_recipe", "command_lesson", "execute_program",
 ]);
 
 const isAutomaticGoalQuestion = (question) => /^(?:The last attempt failed:|Review the completed in-world attempt|Fix this same active build)/i
@@ -4081,10 +4135,10 @@ async function repairPlannerAction({
     const repairedEnvelope = wizardEnvelope(repairedProviderAnswer, question);
     lastEnvelope = repairedEnvelope;
     if (repairedEnvelope && !unusableWizardAnswer(repairedEnvelope.answer, question)) {
-      const repairedAction = bindProgramToActiveProject(
+      const repairedAction = applyRequestedMaterialAction(bindProgramToActiveProject(
         carryForwardStructurePrimitives(repairedEnvelope.action, history, question),
         projectFeedback, question, history,
-      );
+      ), question);
       const contract = (!researchRequired || reusableLearnedAction(repairedAction))
         && providerActionMatchesRequest(repairedAction, question, history, { buildRequest: true, projectFeedback })
         && repairedAction
@@ -5292,6 +5346,18 @@ export function createWizard({
         ? playerId.trim() : undefined;
       const existingHistory = sessions.get(sessionPlayer, requestMode);
       const general = requestMode === "general";
+      if (!isKidAppropriateText(originalQuestion)) {
+        return {
+          answer: kidSafeRefusal(),
+          action: null,
+          sources: [],
+          mode: "local-content-policy",
+          kind: general ? "general" : "wizard",
+          label: provider.label,
+          ...(general && { title: "New Challenge" }),
+          ...(!general && { preferences: [] }),
+        };
+      }
       const memoryIntent = general ? undefined : parsePlayerPreferenceInstruction(originalQuestion, {
         previousQuestion: existingHistory.at(-1)?.question,
         previousAction: existingHistory.at(-1)?.action,
@@ -5468,25 +5534,28 @@ export function createWizard({
             const projectBoundProviderCandidate = bindProgramToActiveProject(
               carriedProviderCandidate, projectFeedback, question, actionHistory,
             );
-            const providerCandidate = repairProviderGift(projectBoundProviderCandidate, question);
+            const providerCandidate = applyRequestedMaterialAction(
+              repairProviderGift(projectBoundProviderCandidate, question),
+              question,
+            );
             const repairedProviderGift = providerCandidate !== projectBoundProviderCandidate;
-            // #35: research acceptance checks capability safety only —
-            // staged titles and 1-placement machines are quality concerns for
-            // the build contract, and must not poison acceptance here.
+            // Every validated gameplay mechanism is available. C0 now checks
+            // child-appropriate content, not whether the plan uses commands,
+            // operator powers, special blocks, or server configuration.
             //
             // #44: this is the SAFETY + FIDELITY site. The Critic's C0 tier is
-            // the research restriction and its C2 tier is
+            // the content policy and its C2 tier is
             // providerActionMatchesRequest, called whole and unchanged. A C1
             // (existence) verdict is deliberately ignored here: existence is
             // adjudicated further down, and honouring it at this point would
             // reorder the gate stack.
             const candidateVerdict = providerCandidate
               ? turnCritic.critique({ action: providerCandidate }, intent) : null;
-            const researchAllowed = !researchRequired || safeNovelAction(providerCandidate);
+            const contentAllowed = safeNovelAction(providerCandidate);
             const fidelityDecided = candidateVerdict
               && (candidateVerdict.severity === "none" || candidateVerdict.tier === "C2"
                 || candidateVerdict.tier === "C3" || candidateVerdict.tier === "C0");
-            const intentAllowed = researchAllowed && (fidelityDecided
+            const intentAllowed = contentAllowed && (fidelityDecided
               ? candidateVerdict.tier !== "C2" && candidateVerdict.tier !== "C0"
               // C1 short-circuited ahead of the fidelity tier (a review turn):
               // fall back to the gate itself so no candidate is ever admitted
@@ -5495,12 +5564,12 @@ export function createWizard({
                 buildRequest, projectFeedback, reviewRequest,
               }));
             providerActionRejection = envelope.rawActionRejection
-              || (providerCandidate && !researchAllowed
-                ? "web-researched build plans cannot contain server administration or arbitrary commands"
+              || (providerCandidate && !contentAllowed
+                ? "generated result is not kid-appropriate"
                 : providerCandidate && !intentAllowed ? "action does not match the player's explicit request" : undefined);
             if (providerActionRejection) {
               recordRejection(
-                providerCandidate && !researchAllowed ? "research-restriction" : "intent-match",
+                providerCandidate && !contentAllowed ? "content-policy" : "intent-match",
                 providerActionRejection,
               );
             }
@@ -5712,7 +5781,7 @@ export function createWizard({
       const nonBuildIntentOwns = (candidate) => {
         const type = candidate?.type;
         if (!type) return false;
-        if (intent.terrainIntent && type === "run_commands") return true;
+        if (intent.terrainIntent && type === "terrain_work") return true;
         if (intent.effectIntent && type === "run_commands") return true;
         if (intent.travelIntent && (type === "local_travel" || type === "dimension_travel")) return true;
         if (intent.giftIntent && type === "give_items") return true;
@@ -5976,6 +6045,11 @@ export function createWizard({
           : /\b(?:size|raised|minimum)\b/i.test(state.contractCaveat)
           ? `${state.answer} I’m making it a little bigger than the exact size you asked so the shape still looks right—tell me if you want it changed.`
           : `${state.answer} The first pass may look a little rough—tell me what seems off and I’ll keep sculpting it with you.`;
+      }
+      if (!isKidAppropriateText(state.answer)) {
+        state.answer = state.action
+          ? localAnswer(question, hits, state.action, actionHistory)
+          : kidSafeRefusal();
       }
       // This scrub MUST stay the last transform applied to the answer.
       if (!general && unsafeCommandAnswer(state.answer, question)) {

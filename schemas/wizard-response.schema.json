@@ -380,6 +380,20 @@
         {
           "type": "object",
           "additionalProperties": false,
+          "required": ["type", "version", "mode", "width", "depth", "height", "fillDepth"],
+          "properties": {
+            "type": { "type": "string", "const": "terrain_work" },
+            "version": { "type": "integer", "const": 1 },
+            "mode": { "type": "string", "enum": ["clear", "level"] },
+            "width": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "depth": { "type": "integer", "minimum": 1, "maximum": 64 },
+            "height": { "type": "integer", "minimum": 1, "maximum": 32 },
+            "fillDepth": { "type": "integer", "minimum": 0, "maximum": 4 }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
           "required": ["type", "version"],
           "properties": {
             "type": { "type": "string", "const": "place_area_torches" },

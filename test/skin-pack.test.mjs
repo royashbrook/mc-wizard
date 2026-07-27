@@ -83,3 +83,16 @@ test("renders only the MC Wizard name with the original texture", () => {
     "Texture.wizard",
   );
 });
+
+test("ordinary players can never enter the Wizard-only third-person renderer", () => {
+  const controllers = playerEntity["minecraft:client_entity"].description.render_controllers;
+  const condition = (id) => controllers.find((entry) => entry[id])?.[id];
+  assert.equal(
+    condition("controller.render.player.third_person"),
+    "!variable.is_first_person && !variable.map_face_icon && !query.is_spectator && !query.is_name_any('MC Wizard')",
+  );
+  assert.equal(
+    condition("controller.render.mcwizard.third_person"),
+    "!variable.is_first_person && !variable.map_face_icon && !query.is_spectator && query.is_name_any('MC Wizard')",
+  );
+});

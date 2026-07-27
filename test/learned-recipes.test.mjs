@@ -345,7 +345,7 @@ test("an unfamiliar build retries an empty successful provider response", async 
   assert.equal(result.action.plan.kind, "furniture");
 });
 
-test("web-researched build plans cannot smuggle server administration", async () => {
+test("server administration is judged by fidelity rather than a research ban", async () => {
   let calls = 0;
   const privileged = { type: "execute_program", version: 1, program: {
     title: "Furniture and operator",
@@ -363,16 +363,13 @@ test("web-researched build plans cannot smuggle server administration", async ()
     },
   });
   const result = await wizard.ask({ player: "ResearchSafetyKid", question: "research and build furniture" });
-  // #35: the smuggled program is still rejected verbatim at the research gate,
-  // but the consultation gates now burn the two bounded repair rounds before
-  // engaging the local fallback: one ask plus two repairs.
+  // This operator-only program does not build the furniture the child asked
+  // for, so fidelity rejects it and the bounded repair loop makes progress.
   assert.equal(calls, 3);
-  assert.ok(result.action, "the rejected research plan must still make safe build progress");
+  assert.ok(result.action, "the mismatched plan must still leave useful build progress");
   assert.equal(result.action.type, "build_structure");
-  assert.ok(result.telemetry.rejections.some(({ gate, reason }) => (
-    gate === "research-restriction"
-    && reason === "web-researched build plans cannot contain server administration or arbitrary commands"
-  )));
+  assert.ok(result.telemetry.rejections.some(({ gate }) => gate === "intent-match"));
+  assert.equal(result.telemetry.rejections.some(({ gate }) => gate === "content-policy"), false);
   assert.doesNotMatch(JSON.stringify(result.action), /server\.console|server\.configure|world\.command|op \{\{requester\}\}/);
 });
 

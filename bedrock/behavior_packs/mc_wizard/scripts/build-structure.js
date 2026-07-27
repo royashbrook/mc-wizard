@@ -84,23 +84,11 @@ const PRIMITIVE_MATERIALS = new Set([
   "minecraft:redstone_lamp",
 ]);
 
-export function isAllowedStructureMaterial(blockId) {
-  return MATERIALS.has(blockId);
-}
-
-// Hard safety line: these are never repaired, mapped, or salvaged (#35).
-const FORBIDDEN_BLOCKS = new Set([
-  "minecraft:command_block",
-  "minecraft:repeating_command_block",
-  "minecraft:chain_command_block",
-  "minecraft:structure_block",
-  "minecraft:structure_void",
-  "minecraft:mob_spawner",
-  "minecraft:barrier",
-  "minecraft:tnt",
-]);
-
 const BLOCK_ID_PATTERN = /^minecraft:[a-z0-9_]+$/;
+
+export function isAllowedStructureMaterial(blockId) {
+  return blockId !== "minecraft:air" && BLOCK_ID_PATTERN.test(String(blockId || ""));
+}
 
 const FEATURES = new Set([
   "floor",
@@ -118,12 +106,6 @@ const FEATURES = new Set([
   "second_floor",
   "decorations",
   "rainbow",
-]);
-
-const ENTITY_TYPES = new Set([
-  "minecraft:villager_v2",
-  "minecraft:goat",
-  "minecraft:iron_golem",
 ]);
 
 const clean = (value, fallback, max) => String(value || fallback)
@@ -233,12 +215,11 @@ function parsePrimitive(primitive, index, dimensions, { partial, primaryMaterial
   const phaseIndex = STRUCTURE_PHASES.indexOf(primitive.phase);
   if (phaseIndex < 0) throw new Error(`primitives[${index}].phase is unsupported`);
   let blockId = String(primitive.blockId || "");
+  if (blockId !== "minecraft:air" && !BLOCK_ID_PATTERN.test(blockId)) {
+    throw new Error(`primitives[${index}].blockId is not allowed`);
+  }
   if (blockId !== "minecraft:air" && !PRIMITIVE_MATERIALS.has(blockId)) {
-    if (FORBIDDEN_BLOCKS.has(blockId) || !BLOCK_ID_PATTERN.test(blockId)) {
-      throw new Error(`primitives[${index}].blockId is not allowed`);
-    }
-    warnings.push(`primitives[${index}].blockId ${blockId} is not a known material; using ${primaryMaterial}`);
-    blockId = primaryMaterial;
+    warnings.push(`primitives[${index}].blockId ${blockId} is outside the common palette; preserving it`);
   }
   // New plans read raw integer coordinates so the whole solid set can be
   // renormalized to the origin later; modify patches keep the bounded margin.
@@ -446,7 +427,7 @@ function validateEntities(value, dimensions, offset = [0, 0, 0]) {
       throw new Error(`entities[${index}] must be an object`);
     }
     const typeId = String(entity.typeId || "");
-    if (!ENTITY_TYPES.has(typeId)) throw new Error(`entities[${index}].typeId is not allowed`);
+    if (!BLOCK_ID_PATTERN.test(typeId)) throw new Error(`entities[${index}].typeId is not allowed`);
     const location = Array.isArray(entity.location) && entity.location.length === 3
       ? entity.location.map((coordinate, axis) => coordinate - offset[axis])
       : entity.location;
@@ -542,7 +523,7 @@ export function validateBuildStructurePlan(value) {
   };
   const materials = Object.fromEntries(["primary", "accent", "roof"].map((name) => {
     const itemId = String(value.materials?.[name] || "");
-    if (!MATERIALS.has(itemId)) throw new Error(`materials.${name} is not allowed`);
+    if (!isAllowedStructureMaterial(itemId)) throw new Error(`materials.${name} is not allowed`);
     return [name, itemId];
   }));
   if (!Array.isArray(value.features) || !value.features.length) throw new Error("features must not be empty");
@@ -675,6 +656,6 @@ export function buildStructureSchemaPrompt() {
     + `A primitive is {"shape":"box|line|hollow_box","phase":"foundation|shell|roof|details","blockId":"minecraft:...","from":[x,y,z],"to":[x,y,z]}; coordinates are inclusive and zero-based. New structures must stay inside dimensions. A mode-modify primitive may extend x or z up to four blocks outside the existing footprint for an attached balcony, eave, bridge, moat, or exterior detail; y must always stay inside height. A hollow_box must be at least 3x3x3 and builds a one-block-thick floor, four walls, and ceiling around an empty interior. minecraft:air is allowed only as a primitive blockId, never counts toward a new structure's phases or bounds, and may be the only material only in mode modify. New structures need solid geometry in every phase spanning all requested bounds; modify primitives may be partial. Lines must be axis-aligned and stay in phase order. `
     + `Use hollow_box for every habitable building or room; never represent one as a solid box. Carve door and window openings with later minecraft:air box primitives, and add interior floors, dividing walls, lighting, or furnishings as details. A city must contain at least four separated habitable hollow_box buildings distributed across both axes with varied heights; give every building a two-block-tall exterior air doorway connected to a thin foundation path. Use two distinct paths no more than three blocks wide that cross and span at least 70% of x and z. Never use one giant slab, duplicate shells, one box, or one floating room as a city. `
     + `Example unusual plan addition for 7x7x5 dimensions: "primitives":[{"shape":"line","phase":"foundation","blockId":"minecraft:stone","from":[0,0,3],"to":[6,0,3]},{"shape":"box","phase":"shell","blockId":"minecraft:green_concrete","from":[2,1,0],"to":[4,2,6]},{"shape":"line","phase":"roof","blockId":"minecraft:green_concrete","from":[3,3,3],"to":[3,4,3]},{"shape":"box","phase":"details","blockId":"minecraft:white_concrete","from":[3,3,2],"to":[3,3,2]}]. `
-    + `Optional entities contains 0-${STRUCTURE_ENTITY_LIMIT} entries inside the dimensions. Supported typeId values are ${[...ENTITY_TYPES].join(", ")}. `
-    + `Allowed structural materials: ${[...MATERIALS].join(", ")}. Primitive-only blocks also include minecraft:lava, minecraft:redstone_block, and minecraft:redstone_lamp. Allowed features: ${[...FEATURES].join(", ")}.`;
+    + `Optional entities contains 0-${STRUCTURE_ENTITY_LIMIT} entries inside the dimensions and may use any namespaced vanilla Bedrock entity typeId. `
+    + `Materials and primitive blocks may use any namespaced vanilla Bedrock block ID. Common examples: ${[...MATERIALS].join(", ")}. Allowed features: ${[...FEATURES].join(", ")}.`;
 }

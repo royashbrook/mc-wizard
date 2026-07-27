@@ -2176,14 +2176,28 @@ async function runMachineAcceptance(kid) {
 }
 
 async function runCommandAcceptance(kid) {
+  let bystander;
   const fail = (request, detail) => {
     report("FAIL", "command-action-pipeline", `${request}: ${detail}`);
+    try { bystander?.disconnect(); } catch {}
     try { kid.disconnect(); } catch {}
   };
   let currentRequest = "fixture preparation";
   try {
     await system.waitTicks(20);
+    bystander = spawnSimulatedPlayer(
+      {
+        x: kid.location.x + 3,
+        y: kid.location.y,
+        z: kid.location.z,
+        dimension: kid.dimension,
+      },
+      `WizBystander-${runId.slice(0, 8)}`,
+      GameMode.Creative,
+    );
+    bystander.addTag(TEST_TAG);
     kid.removeEffect("night_vision");
+    bystander.removeEffect("night_vision");
     currentRequest = "give me night vision";
     const effectTransport = await routeWizardRequest(
       kid,
@@ -2195,6 +2209,9 @@ async function runCommandAcceptance(kid) {
       400,
       "night vision to be applied to the requesting simulated child",
     );
+    if (bystander.getEffect("night_vision")) {
+      throw new Error("requester-scoped night vision leaked to a nearby bystander");
+    }
     report("CHECK", "command-night-vision", `request via ${effectTransport}; effect verified on @s`);
 
     currentRequest = "light up this area";
@@ -2217,6 +2234,85 @@ async function runCommandAcceptance(kid) {
     );
     report("CHECK", "command-area-lighting", `request via ${lightTransport}; eight physical torches verified`);
     report("PASS", "command-action-pipeline", "requester-scoped effects and player-placed lighting executed through the live Wizard path");
+    try { bystander.disconnect(); } catch {}
+    try { kid.disconnect(); } catch {}
+  } catch (error) {
+    fail(currentRequest, String(error));
+  }
+}
+
+async function runTerrainAcceptance(kid) {
+  const fail = (request, detail) => {
+    report("FAIL", "terrain-work-pipeline", `${request}: ${detail}`);
+    try { kid.disconnect(); } catch {}
+  };
+  const station = {
+    x: Math.floor(kid.location.x),
+    y: Math.round(kid.location.y),
+    z: Math.floor(kid.location.z),
+  };
+  let currentRequest = "fixture preparation";
+  try {
+    await prepareAcceptanceStation(kid, station);
+    const dimension = kid.dimension;
+    for (let y = station.y; y <= station.y + 3; y += 1) {
+      dimension.setBlockType({ x: station.x, y, z: station.z }, "minecraft:oak_log");
+    }
+    dimension.setBlockType(
+      { x: station.x, y: station.y + 4, z: station.z },
+      "minecraft:oak_leaves",
+    );
+    dimension.runCommand(
+      `fill ${station.x + 3} ${station.y} ${station.z + 2} ${station.x + 5} ${station.y + 4} ${station.z + 4} stone replace`,
+    );
+    kid.teleport(
+      { x: station.x + 0.5, y: station.y + 5, z: station.z + 0.5 },
+      { dimension },
+    );
+    await system.waitTicks(10);
+
+    currentRequest = "clear a 12x12 area around me, starting at the ground beneath this tree";
+    const transport = await routeWizardRequest(kid, `wizard, ${currentRequest}`, "terrain-clear");
+    await waitFor(
+      () => {
+        for (let x = station.x - 5; x <= station.x + 6; x += 1) {
+          for (let z = station.z - 5; z <= station.z + 6; z += 1) {
+            for (let y = station.y; y <= station.y + 8; y += 1) {
+              if (dimension.getBlock({ x, y, z })?.typeId !== "minecraft:air") return false;
+            }
+          }
+        }
+        return dimension.getBlock({
+          x: station.x,
+          y: station.y - 1,
+          z: station.z,
+        })?.typeId === "minecraft:grass_block";
+      },
+      TIMEOUT_TICKS,
+      "the exact 12x12 patch to clear from ground under the tree",
+    );
+    if (!chatCallbacks.undoLastBuild(kid)) {
+      throw new Error("the terrain transaction was not available to undo");
+    }
+    await waitFor(
+      () => dimension.getBlock({
+        x: station.x,
+        y: station.y,
+        z: station.z,
+      })?.typeId === "minecraft:oak_log"
+        && dimension.getBlock({
+          x: station.x + 4,
+          y: station.y + 3,
+          z: station.z + 3,
+        })?.typeId === "minecraft:stone",
+      200,
+      "terrain undo to restore both the tree and hill",
+    );
+    report(
+      "PASS",
+      "terrain-work-pipeline",
+      `request via ${transport}; ground anchor, exact clearing, and persistent transaction undo verified`,
+    );
     try { kid.disconnect(); } catch {}
   } catch (error) {
     fail(currentRequest, String(error));
@@ -2535,6 +2631,9 @@ async function runFeedbackAcceptance(kid) {
     await teleportToStation(kid, station);
     prepareArbitraryStructureStation(kid, station);
     await system.waitTicks(20);
+    if (await chatCallbacks.routeFeedbackMessage(kid, "hello wizard")) {
+      throw new Error("ordinary chat was incorrectly consumed as grade feedback");
+    }
 
     currentRequest = "build a 12x12 castle right here";
     const beforeCastleCommit = chatCallbacks.buildCommitToken(kid.id);
@@ -3249,7 +3348,7 @@ export async function startE2E(callbacks) {
     report("FAIL", "configuration", "mc_wizard_e2e_run is required");
     return;
   }
-  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "local-travel" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp" && scope !== "delivery") {
+  if (scope !== "full" && scope !== "machines" && scope !== "commands" && scope !== "terrain" && scope !== "arbitrary" && scope !== "portal" && scope !== "travel-rollback" && scope !== "local-travel" && scope !== "city" && scope !== "child" && scope !== "refinement" && scope !== "feedback" && scope !== "farms" && scope !== "kelp" && scope !== "delivery") {
     report("FAIL", "configuration", `unsupported mc_wizard_e2e_scope: ${scope}`);
     return;
   }
@@ -3272,7 +3371,8 @@ export async function startE2E(callbacks) {
   }
   const startCheck = scope === "machines" ? "machine-action-pipeline"
     : scope === "commands" ? "command-action-pipeline"
-      : scope === "arbitrary" ? "arbitrary-exact-structure"
+      : scope === "terrain" ? "terrain-work-pipeline"
+        : scope === "arbitrary" ? "arbitrary-exact-structure"
       : scope === "portal" ? "portal-travel-pipeline"
         : scope === "travel-rollback" ? "dimension-travel-rollback"
         : scope === "local-travel" ? "local-travel-pipeline"
@@ -3315,6 +3415,10 @@ export async function startE2E(callbacks) {
     }
     if (scope === "commands") {
       system.runTimeout(() => void runCommandAcceptance(kid), 80);
+      return;
+    }
+    if (scope === "terrain") {
+      system.runTimeout(() => void runTerrainAcceptance(kid), 80);
       return;
     }
     if (scope === "arbitrary") {

@@ -254,14 +254,9 @@ test("the verbatim live turns produce validated in-world work under every provid
       const result = await wizard.ask({ player: `Live${cell}`, question });
       const where = `${behaviour} :: ${question}`;
       assert.ok(result.action, `no action on a live turn: ${where} (mode=${result.mode})`);
-      assert.equal(result.action.type, "run_commands", where);
-      assert.ok(result.action.commands.length >= 1 && result.action.commands.length <= 8, where);
-      for (const command of result.action.commands) {
-        assert.match(command, /^fill ~-\d+ ~\d+ ~-\d+ ~\d+ ~\d+ ~\d+ air$/, where);
-        assert.ok(command.length <= 500, where);
-        assert.ok(!/[\r\n\0]/.test(command), `command smuggled a newline: ${where}`);
-        assert.ok(!/@[aeprs]\b/.test(command), `command smuggled a selector: ${where}`);
-      }
+      assert.equal(result.action.type, "terrain_work", where);
+      assert.equal(result.action.width, 50, where);
+      assert.equal(result.action.depth, 50, where);
       // Deterministic rung: the turn is decided before the provider is reached,
       // so a broken provider cannot take the work away from the child.
       assert.equal(calls.count, 0, `a deterministic terrain turn consulted the provider: ${where}`);
@@ -287,7 +282,7 @@ test("a bound offer converges into real work within two turns", async () => {
 
   const second = await wizard.ask({ player: "OfferKid", question: "yes" });
   assert.ok(second.action, `a bare "yes" after an offer produced nothing: ${second.mode} / ${second.answer}`);
-  assert.equal(second.action.type, "run_commands");
+  assert.equal(second.action.type, "terrain_work");
   assert.deepEqual(allowedWizardAction(second.action), second.action);
   // Convergence, not a second clarification: the child is not asked again.
   assert.doesNotMatch(second.answer, /tell me exactly which one/i);
@@ -391,9 +386,9 @@ test("an unsafe command answer is still scrubbed on a newly reachable turn", asy
   assert.doesNotMatch(result.answer, /@e\b/, result.answer);
 });
 
-// A provider action carrying a banned block must be dropped on a NON-BUILD
-// actionable turn too, not merely on build turns.
-test("a forbidden block is rejected on an actionable non-build turn", async () => {
+// Powerful blocks are allowed, but an unrelated provider command still cannot
+// replace the exact typed terrain work the child requested.
+test("an unrelated powerful command cannot steal a terrain turn", async () => {
   for (const command of [
     "setblock ~ ~ ~ command_block",
     "setblock ~ ~ ~ tnt",
@@ -409,10 +404,8 @@ test("a forbidden block is rejected on an actionable non-build turn", async () =
       }),
     });
     const result = await wizard.ask({ player: `Ban${command.length}`, question: "clear a 20x20 area around me" });
-    assert.doesNotMatch(JSON.stringify(result.action), FORBIDDEN_BLOCKS, command);
-    // And the turn is still not empty-handed: the deterministic rung owns it.
     assert.ok(result.action, command);
-    assert.equal(result.action.type, "run_commands", command);
+    assert.equal(result.action.type, "terrain_work", command);
   }
 });
 
@@ -451,14 +444,14 @@ test("a terrain order mid-project is performed, not turned into a vague offer", 
     player: "SeqKid",
     question: "clear a 50x50 area around me, starting at the ground beneath this tree",
   });
-  assert.equal(first.action?.type, "run_commands");
+  assert.equal(first.action?.type, "terrain_work");
 
   const second = await wizard.ask({
     player: "SeqKid",
     question: "just level the ground, the mountains, and remove all blocks in a 50x50 area starting at the ground where this tree starts",
   });
-  assert.equal(second.action?.type, "run_commands", `mid-project terrain order produced: ${second.answer}`);
-  for (const command of second.action.commands) assert.match(command, /^fill .*air$/);
+  assert.equal(second.action?.type, "terrain_work", `mid-project terrain order produced: ${second.answer}`);
+  assert.equal(second.action.mode, "level");
 });
 
 // Negative half: genuine feedback on an active build is still feedback, and

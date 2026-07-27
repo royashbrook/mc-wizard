@@ -20,6 +20,7 @@ test("offers a physical feedback scope that refines the same completed structure
   assert.match(installer, /"refinement", "feedback", "farms"/);
   assert.match(pack, /runFeedbackAcceptance\(kid\)/);
   assert.match(pack, /routeFeedbackMessage\(kid, message\)/);
+  assert.match(pack, /ordinary chat was incorrectly consumed as grade feedback/);
   assert.match(pack, /grade 2: it is too dark, add more lights/);
   assert.match(pack, /lights >= lightsBefore \+ 8/);
   assert.match(pack, /addedFoundations\.length > 0/);

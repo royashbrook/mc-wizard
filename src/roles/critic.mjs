@@ -38,10 +38,7 @@
 export const CRITIC_SEVERITIES = Object.freeze(["fatal", "contract", "warning", "none"]);
 export const CRITIC_TIERS = Object.freeze(["C0", "C1", "C2", "C3"]);
 
-// Verbatim, byte-for-byte, from wizard.mjs:4998. The pack, the telemetry gate
-// names and the operator-facing rejection all key on this exact sentence.
-export const RESEARCH_RESTRICTION_REASON =
-  "web-researched build plans cannot contain server administration or arbitrary commands";
+export const CONTENT_POLICY_REASON = "generated result is not kid-appropriate";
 // Verbatim from wizard.mjs:4999.
 export const INTENT_MISMATCH_REASON = "action does not match the player's explicit request";
 export const REVIEW_VERDICT_REASON =
@@ -173,10 +170,10 @@ export function createCritic(dependencies = {}) {
           reason: ACTION_ALLOWLIST_REASON, subGate: "allowed-wizard-action",
         });
       }
-      if (intent.researchRequired && !safeNovelAction(action)) {
+      if (!safeNovelAction(action)) {
         return verdict({
-          severity: "fatal", tier: "C0", gate: "research-restriction",
-          reason: RESEARCH_RESTRICTION_REASON, subGate: "safe-novel-action",
+          severity: "fatal", tier: "C0", gate: "content-policy",
+          reason: CONTENT_POLICY_REASON, subGate: "kid-appropriate-action",
         });
       }
     }

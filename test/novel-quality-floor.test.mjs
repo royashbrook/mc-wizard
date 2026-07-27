@@ -425,11 +425,12 @@ test("a command-bearing novel plan is rejected and never reaches the executor", 
   assert.ok(result.action, "the rejection must still leave safe build progress");
   assert.equal(result.action.type, "build_structure");
   assert.doesNotMatch(JSON.stringify(result.action), /server\.console|server\.configure|world\.command|op \{\{requester\}\}/);
-  assert.ok(result.telemetry.rejections.some(({ gate }) => gate === "research-restriction"));
+  assert.ok(result.telemetry.rejections.some(({ gate }) => gate === "intent-match"));
+  assert.equal(result.telemetry.rejections.some(({ gate }) => gate === "content-policy"), false);
 });
 
-test("command_block and friends are rejected by every validator, never repaired", () => {
-  const banned = [
+test("command blocks and other powerful blocks pass every bounded validator", () => {
+  const powerful = [
     "minecraft:command_block",
     "minecraft:repeating_command_block",
     "minecraft:chain_command_block",
@@ -438,18 +439,16 @@ test("command_block and friends are rejected by every validator, never repaired"
     "minecraft:barrier",
     "minecraft:tnt",
   ];
-  for (const blockId of banned) {
-    // build-structure: the entry drops with a violation record
+  for (const blockId of powerful) {
     const structure = validateBuildStructurePlan({
       ...couchPlan,
       primitives: [...couchPlan.primitives, {
         shape: "box", phase: "details", blockId, from: [1, 1, 1], to: [1, 1, 1],
       }],
     });
-    assert.ok(structure.primitives.every((primitive) => primitive.blockId !== blockId), blockId);
-    assert.ok(structure.salvage.dropped.some(({ reason }) => /not allowed/.test(reason)), blockId);
+    assert.ok(structure.primitives.some((primitive) => primitive.blockId === blockId), blockId);
+    assert.deepEqual(structure.salvage.dropped, []);
 
-    // build-plan: the entry drops with a violation record
     const buildPlan = validateBuildPlan({
       title: "Smuggle test",
       blocks: [
@@ -457,10 +456,9 @@ test("command_block and friends are rejected by every validator, never repaired"
         { target: [0, 1, 0], itemId: blockId },
       ],
     });
-    assert.ok(buildPlan.blocks.every((block) => block.itemId !== blockId), blockId);
-    assert.ok(buildPlan.salvage.dropped.some(({ reason }) => /not allowed/.test(reason)), blockId);
+    assert.ok(buildPlan.blocks.some((block) => block.itemId === blockId), blockId);
+    assert.deepEqual(buildPlan.salvage.dropped, []);
 
-    // machine-plan: the placement drops with a violation record
     const machine = validateMachinePlan({
       title: "Smuggle machine",
       kind: "test machine",
@@ -472,8 +470,8 @@ test("command_block and friends are rejected by every validator, never repaired"
       ],
       interactions: [],
     });
-    assert.ok(machine.placements.every((placement) => placement.itemId !== blockId), blockId);
-    assert.ok(machine.dropped.some(({ reason }) => /not allowed/.test(reason)), blockId);
+    assert.ok(machine.placements.some((placement) => placement.itemId === blockId), blockId);
+    assert.equal(machine.dropped, undefined);
   }
 });
 

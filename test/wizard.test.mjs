@@ -526,16 +526,17 @@ test("safeNovelAction accepts quality-poor but capability-safe novel builds", ()
     steps: [{ id: "step", capability, arguments: { commands: ["op {{requester}}"] }, expect: "done" }],
   } });
   assert.equal(safeNovelAction(program("player.place-blocks")), true);
-  assert.equal(safeNovelAction(program("world.command")), false);
-  assert.equal(safeNovelAction(program("server.console")), false);
-  assert.equal(safeNovelAction(program("server.configure")), false);
+  assert.equal(safeNovelAction(program("world.command")), true);
+  assert.equal(safeNovelAction(program("server.console")), true);
+  assert.equal(safeNovelAction(program("server.configure")), true);
   const offAllowlist = structuredClone(stagedTitle);
   offAllowlist.plan.materials.primary = "minecraft:command_block";
-  assert.equal(safeNovelAction(offAllowlist), false);
-  assert.equal(safeNovelAction({ type: "run_commands", version: 1, commands: ["/say hi"] }), false);
+  assert.equal(safeNovelAction(offAllowlist), true);
+  assert.equal(safeNovelAction({ type: "run_commands", version: 1, commands: ["/say hi"] }), true);
+  assert.equal(safeNovelAction({ type: "build_plan", plan: { title: "Nude body statue" } }), false);
 });
 
-test("a world.command research plan is rejected with the unchanged ban message", async () => {
+test("a world.command research plan may execute when it matches the request", async () => {
   let calls = 0;
   const banWizard = createWizard({
     corpus: { search: () => [] }, logger: { warn() {} },
@@ -557,12 +558,9 @@ test("a world.command research plan is rejected with the unchanged ban message",
     },
   });
   const result = await banWizard.ask({ player: "CommandBanKid", question: "research and build furniture" });
-  assert.ok(result.action, "the ban must still leave safe build progress");
-  assert.ok(result.telemetry.rejections.some(({ gate, reason }) => (
-    gate === "research-restriction"
-    && reason === "web-researched build plans cannot contain server administration or arbitrary commands"
-  )));
-  assert.doesNotMatch(JSON.stringify(result.action), /world\.command|server\.console|server\.configure/);
+  assert.equal(result.action.type, "execute_program");
+  assert.equal(result.action.program.steps[0].capability, "world.command");
+  assert.equal(result.telemetry.rejections, undefined);
 });
 
 test("a staged-title novel plan passes the research gate to the build contract", async () => {
@@ -669,6 +667,12 @@ test("supervises Bedrock, brain, provider, and corpus without secrets in status"
   assert.match(supervisorScript, /start-bedrock-container\.sh/);
   assert.match(supervisorScript, /stop-bedrock-container\.sh/);
   assert.doesNotMatch(supervisorScript, /container", \["stop", "--time", "60"/);
+  assert.match(supervisorScript, /waitForHealthy/);
+  assert.match(supervisorScript, /result\.healthy/);
+  assert.doesNotMatch(supervisorScript, /detached:\s*true/);
+  assert.doesNotMatch(adminServiceScript, /detached:\s*true/);
+  assert.match(supervisorScript, /Leave this command running/);
+  assert.match(supervisorScript, /orphaned services and Bedrock were stopped/);
 });
 
 test("navigates into player reach for every placement and verifies scaffold removal", () => {
@@ -2103,7 +2107,7 @@ test("requires provider gifts to match the child's requested quantity", async ()
 
 test("accepts a rich large delivery to an exact named connected player", async () => {
   const action = {
-    type: "give_items", version: 1, recipient: "enti1ty303",
+    type: "give_items", version: 1, recipient: "RedstonePal",
     items: [{
       itemId: "minecraft:diamond_sword", amount: 256, nameTag: "Star Cutter",
       enchantments: [{ id: "minecraft:sharpness", level: 5 }],
@@ -2113,19 +2117,19 @@ test("accepts a rich large delivery to an exact named connected player", async (
     corpus: { search: () => [] },
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
     fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
-      answer: "I’ll carry 256 enchanted Star Cutters to enti1ty303.", action, goal: {
+      answer: "I’ll carry 256 enchanted Star Cutters to RedstonePal.", action, goal: {
         objective: "Deliver the named enchanted swords",
-        successCriteria: "enti1ty303 receives all 256 swords with the requested name and enchantment",
+        successCriteria: "RedstonePal receives all 256 swords with the requested name and enchantment",
         status: "active",
       },
     }) } }] }), { status: 200 }),
   });
   const result = await wizard.ask({
-    player: "alt3rname",
-    question: "Give enti1ty303 256 enchanted diamond swords named Star Cutter",
+    player: "BlockKid42",
+    question: "Give RedstonePal 256 enchanted diamond swords named Star Cutter",
   });
   assert.deepEqual(result.action, action);
-  assert.match(result.answer, /enti1ty303/i);
+  assert.match(result.answer, /RedstonePal/i);
 
   const punctuatedAction = {
     ...action,
@@ -2136,12 +2140,12 @@ test("accepts a rich large delivery to an exact named connected player", async (
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
     fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
       answer: "I’ll deliver Mr. Jones.", action: punctuatedAction,
-      goal: { objective: "Deliver Mr. Jones", successCriteria: "The named sword reaches enti1ty303", status: "active" },
+      goal: { objective: "Deliver Mr. Jones", successCriteria: "The named sword reaches RedstonePal", status: "active" },
     }) } }] }), { status: 200 }),
   });
   assert.equal((await punctuated.ask({
-    player: "alt3rname",
-    question: "Give enti1ty303 256 enchanted diamond swords named \"Mr. Jones\"",
+    player: "BlockKid42",
+    question: "Give RedstonePal 256 enchanted diamond swords named \"Mr. Jones\"",
   })).action.items[0].nameTag, "Mr. Jones");
 });
 
@@ -2266,7 +2270,7 @@ test("validates bounded support-ordered custom plans and directional logs", () =
     blocks: [{ target: [0, 1, 1], support: [0, 0, 1], itemId: "minecraft:oak_planks" }],
   }), /earlier planned block/);
   assert.throws(() => validateBuildPlan({
-    blocks: [{ target: [0, 0, 1], support: [0, -1, 1], itemId: "minecraft:tnt" }],
+    blocks: [{ target: [0, 0, 1], support: [0, -1, 1], itemId: "mod:tnt" }],
   }), /not allowed/);
   assert.throws(() => validateBuildPlan({
     blocks: [{ target: [9, 0, 1], support: [9, -1, 1], itemId: "minecraft:stone" }],
@@ -3600,7 +3604,7 @@ test("a provider action failing intent-match records gate telemetry and accepted
   assert.equal(offline.telemetry.rejections, undefined);
 });
 
-test("a researched plan smuggling world.command is still rejected and logged", async () => {
+test("world.command is judged by request fidelity, not categorically banned", async () => {
   let calls = 0;
   const smugglingWizard = createWizard({
     corpus: { search: () => [] },
@@ -3620,11 +3624,9 @@ test("a researched plan smuggling world.command is still rejected and logged", a
   });
   const result = await smugglingWizard.ask({ player: "SmuggleKid", question: "research and build me a couch" });
   assert.ok(calls >= 1);
-  assert.doesNotMatch(JSON.stringify(result.action), /world\.command|server\.console|minecraft:tnt/);
-  assert.ok(result.action, "the rejected research plan must still make safe build progress");
-  assert.ok(result.telemetry.rejections.some(({ gate, reason }) => (
-    gate === "research-restriction" && /server administration|arbitrary commands/i.test(reason)
-  )));
+  assert.ok(result.action, "a mismatched plan still falls through to useful build progress");
+  assert.ok(result.telemetry.rejections?.some(({ gate }) => gate === "intent-match"));
+  assert.equal(result.telemetry.rejections?.some(({ gate }) => gate === "content-policy"), false);
 });
 
 // Issue #42: live child session on the fresh world. The child asked Wiz to
@@ -3771,8 +3773,9 @@ test("the reported live terrain session produces real in-world work", async () =
     });
     const result = await wizard.ask({ player: "LiveKid", question });
     assert.ok(result.action, `no action for the live turn: ${question}`);
-    assert.equal(result.action.type, "run_commands");
-    assert.deepEqual(result.action.commands, ["fill ~-25 ~0 ~-25 ~25 ~11 ~25 air"]);
+    assert.equal(result.action.type, "terrain_work");
+    assert.equal(result.action.width, 50);
+    assert.equal(result.action.depth, 50);
     // The deterministic rung answers it outright, so the turn costs nothing.
     assert.equal(providerCalls, 0, `terrain turn consulted the provider: ${question}`);
     assert.ok(!result.answer.includes(providerAnswer));
@@ -3850,7 +3853,7 @@ test("the never-empty floor stays silent on superseded and failed-review turns",
 // 50x50 clear and got nothing both times, because classifyAction had no terrain
 // rung at all. Every phrasing below was verified against the shipped code as a
 // no-action turn before this rung existed.
-test("terrain work orders compile to a validated fill-with-air action", () => {
+test("terrain work orders compile to a validated ground-anchored action", () => {
   const phrasings = [
     "clear a 50x50 area around me, starting at the ground beneath this tree",
     "just level the ground, remove all blocks in a 50x50 area",
@@ -3862,23 +3865,20 @@ test("terrain work orders compile to a validated fill-with-air action", () => {
   for (const question of phrasings) {
     const action = classifyAction(question);
     assert.ok(action, `no action for terrain request: ${question}`);
-    assert.equal(action.type, "run_commands", `wrong action type for: ${question}`);
-    assert.ok(action.commands.length >= 1 && action.commands.length <= 8);
-    for (const command of action.commands) {
-      assert.match(command, /^fill ~-\d+ ~\d+ ~-\d+ ~\d+ ~\d+ ~\d+ air$/);
-      assert.ok(command.length <= 500);
-      assert.ok(!/[\r\n\0]/.test(command));
-      // No selector, no second command, no guarded block ever appears.
-      assert.ok(!/@[aeprs]\b|command_block|tnt|lava|structure_block|mob_spawner/i.test(command));
-    }
+    assert.equal(action.type, "terrain_work", `wrong action type for: ${question}`);
+    assert.ok(["clear", "level"].includes(action.mode));
+    assert.ok(action.width <= 64 && action.depth <= 64 && action.height <= 32);
   }
-  // "flatten this hill" names no size, so the default footprint carries it.
   const defaulted = classifyAction("flatten this hill please");
-  assert.deepEqual(defaulted.commands, ["fill ~-8 ~0 ~-8 ~8 ~11 ~8 air"]);
-  // A 50x50 footprint is 51x51 = 2601 blocks a layer; 12 layers is 31212,
-  // under Bedrock's 32768 per-fill cap, so it stays ONE command.
+  assert.deepEqual(defaulted, {
+    type: "terrain_work", version: 1, mode: "level",
+    width: 16, depth: 16, height: 12, fillDepth: 4,
+  });
   const fifty = classifyAction("clear a 50x50 area around me");
-  assert.deepEqual(fifty.commands, ["fill ~-25 ~0 ~-25 ~25 ~11 ~25 air"]);
+  assert.deepEqual(fifty, {
+    type: "terrain_work", version: 1, mode: "clear",
+    width: 50, depth: 50, height: 12, fillDepth: 0,
+  });
 });
 
 // Negative half: the rung must not steal a turn that already belongs to another
@@ -3895,8 +3895,8 @@ test("the terrain rung never steals a build, a lesson, a recipe or a question", 
   // "make this flat" was pinned null here only because that was the behaviour
   // before the rung existed, and that behaviour IS the do-nothing outcome the
   // rung exists to remove. It is a levelling order with a pronoun in place of a
-  // noun, so it now reaches a fill like any other terrain request.
-  assert.equal(classifyAction("make this flat")?.type, "run_commands");
+  // noun, so it now reaches typed terrain work.
+  assert.equal(classifyAction("make this flat")?.type, "terrain_work");
   // The build-delivery form must still belong to the build path.
   assert.equal(classifyAction("make me a flat roof house")?.type, "build_structure");
   assert.equal(classifyAction("how do I craft a hopper")?.type, "show_recipe");
@@ -4132,7 +4132,7 @@ test("wiring the gift detector widens no allowlist and no quantity bound", async
   }
   // Detail the local builder cannot express is left for the model rather than
   // spent on a plain substitute, so the deterministic rung stays quiet.
-  assert.equal(classifyAction("give enti1ty303 256 enchanted diamond swords named Star Cutter"), null);
+  assert.equal(classifyAction("give RedstonePal 256 enchanted diamond swords named Star Cutter"), null);
   // ... and the floor still hands over the plain item rather than nothing.
   const offline = await quietWizard().ask({ player: "EnchantKid", question: "hand me an enchanted pickaxe" });
   assert.deepEqual(offline.action.items, [{ itemId: "minecraft:iron_pickaxe", amount: 1 }]);
@@ -4234,15 +4234,22 @@ test("a gift, a trip, an effect or a weather change mid-project is performed, no
 });
 
 // A malformed action must be REFUSED, never silently replaced by an example
-// action from the skill catalogue. allowedWizardAction's catalogue fallback
-// matched give_items on (type, id undefined === undefined, version), so an
-// empty or oversized items array returned the deliver_items example and a
-// child received an iron pickaxe they never asked for.
+// action from the skill catalogue. Catalogue fallback used to match payload
+// actions on (type, id undefined === undefined, version), so malformed values
+// silently became unrelated examples.
 test("a malformed typed action is refused rather than swapped for a catalogue example", () => {
   const malformed = [
     { type: "give_items", version: 1, items: [] },
     { type: "give_items", version: 1, items: Array.from({ length: 17 }, () => ({ itemId: "minecraft:stone", amount: 1 })) },
     { type: "give_items", version: 1, items: [{ itemId: "minecraft:stone" }, { amount: 4 }] },
+    { type: "run_commands", version: 1 },
+    { type: "run_commands", version: 1, commands: [] },
+    { type: "potion_rain", version: 1 },
+    { type: "potion_rain", version: 1, radius: 8 },
+    { type: "potion_rain", version: 1, durationSeconds: 8 },
+    { type: "build_structure", version: 1 },
+    { type: "build_machine", version: 1 },
+    { type: "build_plan", version: 1 },
   ];
   for (const value of malformed) {
     assert.equal(allowedWizardAction(value), null, `malformed action was accepted: ${JSON.stringify(value)}`);
@@ -4251,6 +4258,18 @@ test("a malformed typed action is refused rather than swapped for a catalogue ex
   assert.deepEqual(
     allowedWizardAction({ type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 16 }] }),
     { type: "give_items", version: 1, items: [{ itemId: "minecraft:torch", amount: 16 }] },
+  );
+  assert.deepEqual(
+    allowedWizardAction({ type: "run_commands", version: 1, commands: ["effect @s night_vision 60"] }),
+    { type: "run_commands", version: 1, commands: ["effect @s night_vision 60"] },
+  );
+  assert.deepEqual(
+    allowedWizardAction({ type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 }),
+    { type: "potion_rain", version: 1, radius: 8, durationSeconds: 8 },
+  );
+  assert.deepEqual(
+    allowedWizardAction({ type: "place_area_torches", version: 1 }),
+    { type: "place_area_torches", version: 1 },
   );
   assert.equal(
     allowedWizardAction({ type: "place_blueprint", id: "copper_bulb_t_flip_flop", version: 1 })?.id,
