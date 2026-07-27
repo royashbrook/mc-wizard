@@ -31,3 +31,9 @@ test("keeps an unusually long single sentence whole", () => {
   const sentence = `A ${"very ".repeat(60)}long sentence.`;
   assert.deepEqual(splitMessage(sentence, 40), [sentence]);
 });
+
+test("does not mistake decimals, commas, or unfinished clauses for chat boundaries", () => {
+  const sentence = "Set the repeater to 0.4 seconds, then watch the lamp turn on";
+  assert.deepEqual(splitMessage(sentence, 24), [sentence]);
+  assert.ok(splitMessage("Ready?!   \n\n", 5).every(Boolean));
+});

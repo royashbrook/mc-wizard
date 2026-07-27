@@ -151,3 +151,10 @@ test("offers a focused live child-action acceptance scope", () => {
     "MC_WIZARD_E2E_SCOPE=delivery sh scripts/run-e2e-container.sh",
   );
 });
+
+test("unknown and malformed recipe ids cannot produce a plausible-looking display", () => {
+  for (const itemId of [undefined, "", "hopper", "minecraft:", "minecraft:not_a_real_recipe"]) {
+    assert.equal(recipeFor(itemId), undefined);
+    assert.throws(() => createRecipeDisplay(itemId), /unsupported recipe/);
+  }
+});

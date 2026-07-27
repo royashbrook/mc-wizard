@@ -175,3 +175,9 @@ test("automatic smelter links input, fuel, and output through a furnace", () => 
   assert.match(smelter.success, /raw iron and coal/i);
   assertSupportOrder(smelter);
 });
+
+test("item sorters reject malformed and non-Minecraft filter identifiers", () => {
+  for (const itemId of [null, "diamond", "minecraft:", "minecraft:Diamond", "minecraft:diamond minecart"]) {
+    assert.throws(() => createItemSorterBlueprint(itemId), /normal minecraft item id/);
+  }
+});

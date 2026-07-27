@@ -127,3 +127,35 @@ test("default or short bridge tokens are refused for a non-loopback brain URL", 
     await rm(guardedRoot, { recursive: true, force: true });
   }
 });
+
+test("missing worlds and traversal-shaped world names are refused before installation", async () => {
+  const guardedRoot = await mkdtemp(path.join(tmpdir(), "mc-wizard-install-path-"));
+  try {
+    await mkdir(path.join(guardedRoot, "worlds"), { recursive: true });
+    for (const worldName of ["Missing World", "../outside"]) {
+      await assert.rejects(
+        run(process.execPath, ["scripts/install-pack.mjs", guardedRoot, worldName], {
+          cwd: repo,
+          env: {
+            ...process.env,
+            MC_WIZARD_LAN_IP: "",
+            WIZARD_URL: "",
+            BRIDGE_TOKEN: "test-only-bridge-token-0123456789abcdef",
+          },
+        }),
+        (error) => {
+          assert.notEqual(error.code, 0);
+          assert.match(
+            String(error.stderr),
+            worldName === "Missing World"
+              ? /World directory does not exist/
+              : /World name must be a folder directly inside/,
+          );
+          return true;
+        },
+      );
+    }
+  } finally {
+    await rm(guardedRoot, { recursive: true, force: true });
+  }
+});

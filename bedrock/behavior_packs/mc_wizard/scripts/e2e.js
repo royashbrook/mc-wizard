@@ -2176,14 +2176,28 @@ async function runMachineAcceptance(kid) {
 }
 
 async function runCommandAcceptance(kid) {
+  let bystander;
   const fail = (request, detail) => {
     report("FAIL", "command-action-pipeline", `${request}: ${detail}`);
+    try { bystander?.disconnect(); } catch {}
     try { kid.disconnect(); } catch {}
   };
   let currentRequest = "fixture preparation";
   try {
     await system.waitTicks(20);
+    bystander = spawnSimulatedPlayer(
+      {
+        x: kid.location.x + 3,
+        y: kid.location.y,
+        z: kid.location.z,
+        dimension: kid.dimension,
+      },
+      `WizBystander-${runId.slice(0, 8)}`,
+      GameMode.Creative,
+    );
+    bystander.addTag(TEST_TAG);
     kid.removeEffect("night_vision");
+    bystander.removeEffect("night_vision");
     currentRequest = "give me night vision";
     const effectTransport = await routeWizardRequest(
       kid,
@@ -2195,6 +2209,9 @@ async function runCommandAcceptance(kid) {
       400,
       "night vision to be applied to the requesting simulated child",
     );
+    if (bystander.getEffect("night_vision")) {
+      throw new Error("requester-scoped night vision leaked to a nearby bystander");
+    }
     report("CHECK", "command-night-vision", `request via ${effectTransport}; effect verified on @s`);
 
     currentRequest = "light up this area";
@@ -2217,6 +2234,7 @@ async function runCommandAcceptance(kid) {
     );
     report("CHECK", "command-area-lighting", `request via ${lightTransport}; eight physical torches verified`);
     report("PASS", "command-action-pipeline", "requester-scoped effects and player-placed lighting executed through the live Wizard path");
+    try { bystander.disconnect(); } catch {}
     try { kid.disconnect(); } catch {}
   } catch (error) {
     fail(currentRequest, String(error));
@@ -2535,6 +2553,9 @@ async function runFeedbackAcceptance(kid) {
     await teleportToStation(kid, station);
     prepareArbitraryStructureStation(kid, station);
     await system.waitTicks(20);
+    if (await chatCallbacks.routeFeedbackMessage(kid, "hello wizard")) {
+      throw new Error("ordinary chat was incorrectly consumed as grade feedback");
+    }
 
     currentRequest = "build a 12x12 castle right here";
     const beforeCastleCommit = chatCallbacks.buildCommitToken(kid.id);

@@ -81,3 +81,10 @@ test("a failed action's bounded replan is scheduled for the same live player", (
   assert.match(reporter, /applyResponse\(player\.id, replan, status === "failed"/);
   assert.match(reporter, /kept our project active[\s\S]*tell me what to change/);
 });
+
+test("failed and abandoned work can never become the remembered modification target", () => {
+  const outcome = sourceBetween("function endBuildAction", "function structurePlayerKey");
+  assert.match(outcome, /\["completed", "partial"\]\.includes\(status\)/);
+  assert.doesNotMatch(outcome, /\["completed", "partial", "failed"\]\.includes\(status\)/);
+  assert.doesNotMatch(outcome, /status === "failed"[\s\S]{0,120}rememberLastProject/);
+});

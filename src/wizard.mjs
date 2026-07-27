@@ -1978,7 +1978,18 @@ export function instantConversationAnswer(question) {
 function normalizeActionRequest(question) {
   return String(question)
     .replace(/\btakeme\b/gi, "take me")
-    .replace(/\bnetherportal\b/gi, "nether portal");
+    .replace(/\bnetherportal\b/gi, "nether portal")
+    // High-frequency child spellings belong at the input boundary so every
+    // deterministic capability sees the same corrected request.
+    .replace(/\b(?:telport|teleprot|telepot)\b/gi, "teleport")
+    .replace(/\b(?:giv|gve)\b/gi, "give")
+    .replace(/\b(?:dimond|dimonds)\b/gi, (word) => (
+      word.toLowerCase().endsWith("s") ? "diamonds" : "diamond"
+    ))
+    .replace(/\b(?:nite|night)\s*vison\b/gi, "night vision")
+    .replace(/\bcasle\b/gi, "castle")
+    .replace(/\bbloks\b/gi, "blocks")
+    .replace(/\b(?:pls|plz)\b/gi, "please");
 }
 
 function primaryBuildSubject(question) {

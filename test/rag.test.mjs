@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -117,6 +117,19 @@ test("loadCorpus flags base-only corpora and warns once naming sync-docs", async
   assert.equal(corpus.baseOnly, true);
   assert.equal(warn.mock.callCount(), 1);
   assert.match(warn.mock.calls[0].arguments[0], /scripts\/sync-docs\.mjs/);
+});
+
+test("a fresh clone's exact six-card corpus degrades loudly but remains usable", async (t) => {
+  const warn = t.mock.method(console, "warn", () => {});
+  const cards = (await readdir(KNOWLEDGE_DIR)).filter((name) => name.endsWith(".md"));
+  const corpus = await loadCorpus({
+    roots: [{ dir: KNOWLEDGE_DIR, kind: "mechanic-card", id: "knowledge" }],
+  });
+  assert.equal(cards.length, 6);
+  assert.ok(corpus.size >= cards.length);
+  assert.equal(corpus.baseOnly, true);
+  assert.equal(warn.mock.callCount(), 1);
+  assert.ok(corpus.search("tame a cat").length > 0);
 });
 
 test("loadCorpus with a synthetic synced release sets baseOnly false and stays quiet", async (t) => {

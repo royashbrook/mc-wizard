@@ -16,7 +16,7 @@ const FILTER_FILLER_NAME = "Wizard Filter - Leave Here";
  * briefly unlocks the chest-feeding hopper below the filter.
  */
 export function createItemSorterBlueprint(filterItem = "minecraft:iron_ingot") {
-  if (typeof filterItem !== "string" || !filterItem.startsWith("minecraft:")) {
+  if (typeof filterItem !== "string" || !/^minecraft:[a-z0-9_]+$/.test(filterItem)) {
     throw new Error("item sorter needs a normal minecraft item id");
   }
   const filterSlots = [
