@@ -110,7 +110,7 @@ test("capability programs derive admin authority and reject unsafe or ambiguous 
     steps: [{
       id: "allow_owner",
       capability: "server.console",
-      arguments: { command: "allowlist add alt3rname" },
+      arguments: { command: "allowlist add BlockKid42" },
       expect: "The owner remains allowed to join.",
     }],
   });
@@ -209,7 +209,7 @@ test("the full Wizard turn keeps operator intent out of generic build fallback",
 
 test("rich item delivery supports exact connected recipients, names, enchantments, and large amounts", () => {
   const action = {
-    type: "give_items", version: 1, recipient: "enti1ty303",
+    type: "give_items", version: 1, recipient: "RedstonePal",
     items: [{
       itemId: "minecraft:diamond_sword", amount: 256, nameTag: "Star Cutter",
       enchantments: [{ id: "minecraft:sharpness", level: 5 }],

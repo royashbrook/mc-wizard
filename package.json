@@ -13,6 +13,7 @@
     "admin:stop": "node --env-file-if-exists=.env scripts/admin-service.mjs stop",
     "admin:status": "node --env-file-if-exists=.env scripts/admin-service.mjs status",
     "hooks:install": "git config core.hooksPath .githooks",
+    "check:publication": "node scripts/check-publication.mjs --all",
     "dev": "node --env-file-if-exists=.env --watch src/server.mjs",
     "ask": "node --env-file-if-exists=.env scripts/ask.mjs",
     "eval:dialogue": "node --env-file-if-exists=.env scripts/eval-dialogue.mjs",

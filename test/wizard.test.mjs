@@ -2103,7 +2103,7 @@ test("requires provider gifts to match the child's requested quantity", async ()
 
 test("accepts a rich large delivery to an exact named connected player", async () => {
   const action = {
-    type: "give_items", version: 1, recipient: "enti1ty303",
+    type: "give_items", version: 1, recipient: "RedstonePal",
     items: [{
       itemId: "minecraft:diamond_sword", amount: 256, nameTag: "Star Cutter",
       enchantments: [{ id: "minecraft:sharpness", level: 5 }],
@@ -2113,19 +2113,19 @@ test("accepts a rich large delivery to an exact named connected player", async (
     corpus: { search: () => [] },
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
     fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
-      answer: "I’ll carry 256 enchanted Star Cutters to enti1ty303.", action, goal: {
+      answer: "I’ll carry 256 enchanted Star Cutters to RedstonePal.", action, goal: {
         objective: "Deliver the named enchanted swords",
-        successCriteria: "enti1ty303 receives all 256 swords with the requested name and enchantment",
+        successCriteria: "RedstonePal receives all 256 swords with the requested name and enchantment",
         status: "active",
       },
     }) } }] }), { status: 200 }),
   });
   const result = await wizard.ask({
-    player: "alt3rname",
-    question: "Give enti1ty303 256 enchanted diamond swords named Star Cutter",
+    player: "BlockKid42",
+    question: "Give RedstonePal 256 enchanted diamond swords named Star Cutter",
   });
   assert.deepEqual(result.action, action);
-  assert.match(result.answer, /enti1ty303/i);
+  assert.match(result.answer, /RedstonePal/i);
 
   const punctuatedAction = {
     ...action,
@@ -2136,12 +2136,12 @@ test("accepts a rich large delivery to an exact named connected player", async (
     env: { AI_BASE_URL: "http://model/v1", AI_MODEL: "planner", AI_STYLE: "chat" },
     fetchImpl: async () => new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({
       answer: "I’ll deliver Mr. Jones.", action: punctuatedAction,
-      goal: { objective: "Deliver Mr. Jones", successCriteria: "The named sword reaches enti1ty303", status: "active" },
+      goal: { objective: "Deliver Mr. Jones", successCriteria: "The named sword reaches RedstonePal", status: "active" },
     }) } }] }), { status: 200 }),
   });
   assert.equal((await punctuated.ask({
-    player: "alt3rname",
-    question: "Give enti1ty303 256 enchanted diamond swords named \"Mr. Jones\"",
+    player: "BlockKid42",
+    question: "Give RedstonePal 256 enchanted diamond swords named \"Mr. Jones\"",
   })).action.items[0].nameTag, "Mr. Jones");
 });
 
@@ -4132,7 +4132,7 @@ test("wiring the gift detector widens no allowlist and no quantity bound", async
   }
   // Detail the local builder cannot express is left for the model rather than
   // spent on a plain substitute, so the deterministic rung stays quiet.
-  assert.equal(classifyAction("give enti1ty303 256 enchanted diamond swords named Star Cutter"), null);
+  assert.equal(classifyAction("give RedstonePal 256 enchanted diamond swords named Star Cutter"), null);
   // ... and the floor still hands over the plain item rather than nothing.
   const offline = await quietWizard().ask({ player: "EnchantKid", question: "hand me an enchanted pickaxe" });
   assert.deepEqual(offline.action.items, [{ itemId: "minecraft:iron_pickaxe", amount: 1 }]);

@@ -87,7 +87,9 @@ AI tuning is stored in ignored `runtime/admin/settings.json` and read on every r
 
 The desk intentionally binds only to loopback. It is not available to iPads or other LAN devices. Change that only after adding authentication and TLS.
 
-Commits are issue-driven. The tracked `commit-msg` hook rejects messages without a reference to an existing issue in this repository. Use a message such as `Improve dialogue sessions (Refs #8)`.
+Commits are issue-driven. The tracked `commit-msg` hook rejects messages without a reference to an existing issue in this repository. A tracked pre-commit hook also rejects staged environment files, runtime/session data, world data, generated books, logs, credential-like values, and suspicious plaintext gamertags. Use a message such as `Improve dialogue sessions (Refs #8)`.
+
+Run `npm run check:publication` to apply the same dependency-free scan to every tracked file. CI runs that command on every pull request and push to `main`. The guard is intentionally conservative but cannot prove that content is anonymous, and it does not replace GitHub secret scanning or manual review. Add only clearly fictional test identities to the reviewed allowlist in `scripts/check-publication.mjs`, with a test explaining the addition. For a local false-positive investigation only, `PUBLICATION_GUARD_REVIEWED=1 git commit` bypasses the local hook; CI still rejects the repository until the finding is removed or the reviewed rule is corrected.
 
 In a second terminal:
 

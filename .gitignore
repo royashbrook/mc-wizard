@@ -1,5 +1,6 @@
 .cache/
-.env
+.env*
+!.env.example
 node_modules/
 __pycache__/
 runtime/
@@ -7,4 +8,6 @@ graphify-out/
 .headroom-cache/
 dist/
 *.log
+*.mcworld
+*.mctemplate
 .DS_Store
