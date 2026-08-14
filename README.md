@@ -2,6 +2,8 @@
 
 A Bedrock-first spike for an AI Minecraft teacher that can answer questions from versioned sources and act as an all-capable Wizard in a trusted private family world.
 
+> **Project status (2026-08-13): tabled.** The stack is shut down and active development/testing has stopped because open-ended play remained too inconsistent for children. The implementation is preserved as a research spike, not a usable product. See [SPIKE_STATUS.md](SPIKE_STATUS.md) for the postmortem and restart criteria.
+
 The intended vertical slice is:
 
 ```text
@@ -304,7 +306,7 @@ npm run test:e2e:farms
 npm run test:e2e:kelp
 ```
 
-The arbitrary run verifies an unusual exact-size structure rather than a canned prototype. The local-travel run rescues Test Kid from underground, reaches a generated village and woodland mansion, crosses dimensions to a generated Nether fortress, and then reaches a generated underground ancient city with the visible Wizard. The child run verifies a sized house, an in-place castle upgrade, working chicken, wool, and naturally harvested kelp farms, bounded splash-potion rain, contextual time and weather, physical item delivery, and an in-world recipe lesson. The refinement run keeps rooms, villagers, a balcony, enlargement, and a moat on the same castle. The farm run requires fresh sugar cane, bamboo, and cactus growth to reach the output chest; the kelp run isolates the same natural-growth-to-chest proof for its observer/piston circuit.
+The arbitrary run verifies an unusual exact-size structure rather than a canned prototype. The local-travel run rescues Test Kid from underground, reaches a generated village and woodland mansion, crosses dimensions to a generated Nether fortress, and then reaches a generated underground ancient city with the visible Wizard. The child run verifies a sized house, an in-place castle upgrade, working chicken, wool, and naturally harvested kelp farms, bounded splash-potion rain, contextual time and weather, physical item delivery, and an in-world recipe lesson. The refinement run keeps rooms, villagers, a balcony, enlargement, and a moat on the same castle. The farm run requires fresh sugar cane, bamboo, and cactus growth to reach the output chest; the kelp run isolates the same natural-growth-to-chest proof for its observer/piston circuit. The offline-gift run proves three common item requests are physically delivered without entering the brain ask route.
 
 It bootstraps a fresh Beta-APIs world under a unique `runtime/e2e/<run-id>` data root, launches a unique Apple container with no published port, and always stops/deletes that container. A passing world is deleted; a failing world is retained for diagnosis. Raw BDS output is saved to ignored `runtime/e2e-last.log`.
 

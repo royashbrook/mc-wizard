@@ -42,6 +42,7 @@ import { splitMessage } from "./chat.js";
 import { newestProjectRecord, normalizeRuntimeStep, runtimeProgramHasEvidence } from "./capability-runtime.js";
 // Kept as a separate import: contract tests assert the exact line above.
 import { synthesizeRuntimeEvidence } from "./capability-runtime.js";
+import { offlineGiftRequest } from "./offline-gift.js";
 import { legacyPropertySuffix, stablePropertySuffix } from "./project-memory-key.js";
 import {
   findTerrainAnchor,
@@ -54,6 +55,9 @@ const WIZARD_NAME = "MC Wizard";
 const WIZARD_TAG = "mcwizard:bot";
 // Keep the native form implementation available, but use non-blocking chat grading for now.
 const FEEDBACK_FORMS_ENABLED = false;
+const BACKEND_HEALTH_TIMEOUT_SECONDS = 4;
+const BACKEND_REQUEST_TIMEOUT_SECONDS = 120;
+const BACKEND_AUX_TIMEOUT_SECONDS = 10;
 const SAFE_SPACE = new Set([
   "minecraft:air",
   "minecraft:short_grass",
@@ -228,6 +232,7 @@ const AUTHORIZATION = secret("mc_wizard_authorization");
 async function executeServerConsole(player, commands) {
   const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/server-commands"))
     .setMethod(HttpRequestMethod.Post)
+    .setTimeout(BACKEND_AUX_TIMEOUT_SECONDS)
     .setBody(JSON.stringify({ player: player.name, commands }))
     .addHeader("Content-Type", "application/json");
   if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
@@ -246,6 +251,7 @@ async function executeServerConsole(player, commands) {
 async function configureServer(player, settings) {
   const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/server-control"))
     .setMethod(HttpRequestMethod.Post)
+    .setTimeout(BACKEND_AUX_TIMEOUT_SECONDS)
     .setBody(JSON.stringify({ player: player.name, settings }))
     .addHeader("Content-Type", "application/json");
   if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
@@ -321,7 +327,8 @@ async function postActionResult(report, status, detail) {
     try {
       const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/action-result"))
         .setMethod(HttpRequestMethod.Post)
-          .setBody(JSON.stringify({
+        .setTimeout(BACKEND_AUX_TIMEOUT_SECONDS)
+        .setBody(JSON.stringify({
             player: report.playerName,
             ...(report.playerId ? { playerId: report.playerId } : {}),
             requestId: report.requestId,
@@ -1032,6 +1039,7 @@ async function loadPlayerPreferences(player) {
   try {
     const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/preferences"))
       .setMethod(HttpRequestMethod.Post)
+      .setTimeout(BACKEND_HEALTH_TIMEOUT_SECONDS)
       .setBody(JSON.stringify({ player: player.name, playerId: player.id }))
       .addHeader("Content-Type", "application/json");
     if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
@@ -1352,6 +1360,7 @@ async function submitFeedback(prompt, grade, feedback) {
   try {
     const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/feedback"))
       .setMethod(HttpRequestMethod.Post)
+      .setTimeout(BACKEND_AUX_TIMEOUT_SECONDS)
       .setBody(JSON.stringify({
           player: prompt.playerName,
           playerId: prompt.playerId,
@@ -5159,6 +5168,7 @@ async function waitForTravelChunk(dimension, anchor) {
 async function requestStructureLocation(player, anchor, structure, dimension) {
   const request = new HttpRequest(WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/v1/locate"))
     .setMethod(HttpRequestMethod.Post)
+    .setTimeout(BACKEND_AUX_TIMEOUT_SECONDS)
     .setBody(JSON.stringify({
       player: player.name,
       origin: { x: anchor.x, z: anchor.z },
@@ -6515,6 +6525,7 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
   }
 
   try {
+      await requireHealthyBackend();
       const requestBody = {
       player: player.name,
       playerId: player.id,
@@ -6529,6 +6540,7 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
     for (let attempt = 0; attempt < 4; attempt += 1) {
       const request = new HttpRequest(WIZARD_URL)
         .setMethod(HttpRequestMethod.Post)
+        .setTimeout(BACKEND_REQUEST_TIMEOUT_SECONDS)
         .setBody(JSON.stringify(requestBody))
         .addHeader("Content-Type", "application/json");
       if (AUTHORIZATION) request.addHeader("Authorization", AUTHORIZATION);
@@ -6588,13 +6600,43 @@ async function askBackend(playerId, question, mode = "wizard", planningAttempt =
       const current = playerById(playerId);
       if (!current) return;
       if (mode === "general") current.sendMessage("§b[AI]§r I can’t reach the model right now.");
-      else speak(current, "I can’t reach my knowledge service right now. Ask an adult to check the MC Wizard server.");
+      else speak(current, "My far-away spellbook connection flickered. I can still do quick local spells—ask for an item, time, weather, or for me to follow you while it reconnects.");
     });
   }
 }
 
 function cancelPendingQuestion(player, mode = "wizard") {
   pendingQuestions.delete(`${player.id}:${mode}`);
+}
+
+let backendHealthProbe;
+let backendUnavailableUntilTick = 0;
+
+async function requireHealthyBackend() {
+  if (system.currentTick < backendUnavailableUntilTick) {
+    throw new Error("brain health circuit is open");
+  }
+  if (!backendHealthProbe) {
+    backendHealthProbe = (async () => {
+      const healthUrl = WIZARD_URL.replace(/\/v1\/ask(?:\?.*)?$/, "/health");
+      const request = new HttpRequest(healthUrl)
+        .setMethod(HttpRequestMethod.Get)
+        .setTimeout(BACKEND_HEALTH_TIMEOUT_SECONDS);
+      const response = await http.request(request);
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`brain health returned HTTP ${response.status}`);
+      }
+    })();
+  }
+  try {
+    await backendHealthProbe;
+    backendUnavailableUntilTick = 0;
+  } catch (error) {
+    backendUnavailableUntilTick = system.currentTick + 200;
+    throw error;
+  } finally {
+    backendHealthProbe = undefined;
+  }
 }
 
 function handleLocalCommand(player, question) {
@@ -6623,6 +6665,12 @@ function handleLocalCommand(player, question) {
   if (/^(?:thanks|thank you|thx)(?:\s+(?:wiz|wizard))?[!.?]*$/i.test(simple)) {
     cancelPendingQuestion(player);
     speak(player, "You’re welcome! I’m ready for the next idea.");
+    return true;
+  }
+  const localGift = offlineGiftRequest(simple);
+  if (localGift) {
+    cancelPendingQuestion(player);
+    void giveItemsAsWizard(player, [localGift]);
     return true;
   }
   if (/\b(?:tell me (?:a )?joke|minecraft joke)\b/i.test(simple)) {

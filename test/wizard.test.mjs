@@ -666,6 +666,11 @@ test("supervises Bedrock, brain, provider, and corpus without secrets in status"
   assert.doesNotMatch(supervisorScript, /BRIDGE_TOKEN.*console|AI_API_KEY.*console/);
   assert.match(supervisorScript, /start-bedrock-container\.sh/);
   assert.match(supervisorScript, /stop-bedrock-container\.sh/);
+  assert.match(supervisorScript, /open\(LOG_FILE, "a"/);
+  assert.match(supervisorScript, /process\.on\("SIGHUP", shutdown\)/);
+  assert.match(supervisorScript, /if \(!\(await containerRunning\("mc-wizard-bedrock"\)\)\)/);
+  assert.match(supervisorScript, /if \(!\(await probe\(brainUrl\)\)\.ok\)/);
+  assert.match(supervisorScript, /await probe\(providerUrl\)/);
   assert.doesNotMatch(supervisorScript, /container", \["stop", "--time", "60"/);
   assert.match(supervisorScript, /waitForHealthy/);
   assert.match(supervisorScript, /result\.healthy/);
