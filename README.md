@@ -2,6 +2,8 @@
 
 A Bedrock-first spike for an AI Minecraft teacher that can answer questions from versioned sources and act as an all-capable Wizard in a trusted private family world.
 
+> **Project status (2026-08-13): tabled.** The stack is shut down and active development/testing has stopped because open-ended play remained too inconsistent for children. The implementation is preserved as a research spike, not a usable product. See [SPIKE_STATUS.md](SPIKE_STATUS.md) for the postmortem and restart criteria.
+
 The intended vertical slice is:
 
 ```text
